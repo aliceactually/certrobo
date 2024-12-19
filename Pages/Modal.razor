@@ -1,0 +1,6 @@
+﻿<RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">@((MarkupString)@Message)</RadzenText>
+
+    @code {
+    [CascadingParameter] BlazoredModalInstance BlazoredModal { get; set; } = default!;
+    [Parameter] public string Message { get; set; } = "";
+}

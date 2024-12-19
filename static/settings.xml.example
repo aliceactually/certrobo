@@ -1,0 +1,13 @@
+<CertRobo>
+	<Server>ca.contoso.com\Contoso Certificate Authority</Server>
+	<Template>WebServerV3</Template>
+	<Group>CONTOSO\CertRobo Certificate Issuers</Group>
+	<Defaults>
+		<Country>US</Country>
+		<StateOrProvince>Washington</StateOrProvince>
+		<Locality>Redmond</Locality>
+		<Organization>Contoso Corporation</Organization>
+		<OrganizationalUnit>IT</OrganizationalUnit>
+		<EmailAddress>it@contoso.com</EmailAddress>
+	</Defaults>
+</CertRobo>

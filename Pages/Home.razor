@@ -1,0 +1,459 @@
+﻿@page "/"
+@using Microsoft.AspNetCore.Components.Authorization
+@using Microsoft.AspNetCore.Mvc
+@using Org.BouncyCastle.Asn1.X509
+@using Org.BouncyCastle.X509
+@using System.Globalization
+@using System.IO
+@using System.Security.Claims
+@using System.Security.Principal
+@using System.Text
+@using System.Text.RegularExpressions
+@using System.Xml.Linq
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject IJSRuntime JS
+
+<PageTitle>CertRobo</PageTitle>
+
+<div class="container-fluid">
+    <div class="row">
+        <div class="col" style="width:624px;min-width:624px;max-width:624px">
+            <RadzenCard>
+                <div class="row" style="margin:0 auto">
+                    <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Private key</RadzenText>
+                    <RadzenTextArea Cols="64" Rows="8" MaxLength="8192" Style="font-family:Courier New, Courier, monospace;font-size:small" @bind-Value=@privateKey TValue="string" />
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row" style="margin:0 auto">
+                    <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Public key</RadzenText>
+                    <RadzenTextArea Cols="64" Rows="8" MaxLength="2048" Style="font-family:Courier New, Courier, monospace;font-size:small" @bind-Value=@publicKey TValue="string" />
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row" style="margin:0 auto">
+                    <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Key strength</RadzenText>
+                </div>
+                <div class="row" style="margin:0 auto">
+                    <RadzenRadioButtonList @bind-Value=@keyBits TValue="int?">
+                        <Items>
+                            <RadzenRadioButtonListItem Text="ECDSA 384" Value="384" TValue="int?" />
+                            <RadzenRadioButtonListItem Text="ECDSA 256" Value="256" TValue="int?" />
+                            <RadzenRadioButtonListItem Text="RSA 4096" Value="4096" TValue="int?" />
+                            <RadzenRadioButtonListItem Text="RSA 2048" Value="2048" TValue="int?" />
+                        </Items>
+                    </RadzenRadioButtonList>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row" style="margin:0 auto">
+                    <div class="col" style="width:50%">
+                        <RadzenButton Text="Generate key pair" Style="width:100%" Click="@GenerateClick" />
+                    </div>
+                    <div class="col" style="width:50%">
+                        <RadzenButton Text="Derive public key" Style="width:100%" Click=@DeriveClick />
+                    </div>
+                </div>
+            </RadzenCard>
+        </div>
+        <div class="col" style="width:624px;min-width:624px;max-width:624px">
+            <RadzenCard>
+                <div class="row">
+                    <div class="col" style="width:208px;min-width:208px;max-width:208px">
+                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Common Name</RadzenText>
+                    </div>
+                    <div class="col" style="width:100%">
+                        <RadzenTextBox @bind-Value=@commonName TValue="string" Class="w-100" />
+                    </div>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row">
+                    <div class="col" style="width:208px;min-width:208px;max-width:208px">
+                    </div>
+                    <div class="col" style="width:100%">
+                        <RadzenButton Text="Autofill remaining" Style="width:100%" Click="@AutofillClick" />
+                    </div>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row">
+                    <div class="col" style="width:208px;min-width:208px;max-width:208px">
+                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Subject Alternative Name(s)</RadzenText>
+                    </div>
+                    <div class="col" style="width:100%">
+                        <RadzenTextBox @bind-Value=@subjectAlternativeNames TValue="string" Class="w-100" />
+                    </div>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row">
+                    <div class="col" style="width:208px;min-width:208px;max-width:208px">
+                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Country</RadzenText>
+                    </div>
+                    <div class="col" style="width:100%">
+                        <RadzenTextBox @bind-Value=@country TValue="string" Class="w-100" />
+                    </div>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row">
+                    <div class="col" style="width:208px;min-width:208px;max-width:208px">
+                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">State or Province</RadzenText>
+                    </div>
+                    <div class="col" style="width:100%">
+                        <RadzenTextBox @bind-Value=@stateOrProvince TValue="string" Class="w-100" />
+                    </div>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row">
+                    <div class="col" style="width:208px;min-width:208px;max-width:208px">
+                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Locality</RadzenText>
+                    </div>
+                    <div class="col" style="width:100%">
+                        <RadzenTextBox @bind-Value=@locality TValue="string" Class="w-100" />
+                    </div>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row">
+                    <div class="col" style="width:208px;min-width:208px;max-width:208px">
+                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Organization</RadzenText>
+                    </div>
+                    <div class="col" style="width:100%">
+                        <RadzenTextBox @bind-Value=@organization TValue="string" Class="w-100" />
+                    </div>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row">
+                    <div class="col" style="width:208px;min-width:208px;max-width:208px">
+                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Organizational Unit</RadzenText>
+                    </div>
+                    <div class="col" style="width:100%">
+                        <RadzenTextBox @bind-Value=@organizationalUnit TValue="string" Class="w-100" />
+                    </div>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row">
+                    <div class="col" style="width:208px;min-width:208px;max-width:208px">
+                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Email Address</RadzenText>
+                    </div>
+                    <div class="col" style="width:100%">
+                        <RadzenTextBox @bind-Value=@emailAddress TValue="string" Class="w-100" />
+                    </div>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row">
+                    <div class="col" style="width:100%">
+                        <RadzenButton Text="Generate Certificate Signing Request" Style="width:100%" Click="@CSRClick" />
+                    </div>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row">
+                    <div class="col" style="width:100%">
+                        <RadzenButton Text="Request certificate from CA" Style="width:100%" Click="@RequestClick" />
+                    </div>
+                </div>
+                <div class="row" style="height: 6px" />
+                <div class="row">
+                    <div class="col" style="width:100%">
+                        <RadzenButton Text="Export" Style="width:100%" Click="@ExportClick" />
+                    </div>
+                </div>
+            </RadzenCard>
+        </div>
+    </div>
+    <div class="row" style="height: 24px" />
+    <div class="row">
+        <div class="col" style="width:624px;min-width:624px;max-width:624px">
+            <RadzenCard>
+                <div class="row" style="margin:0 auto">
+                    <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Certificate Signing Request</RadzenText>
+                    <RadzenTextArea Cols="64" Rows="8" MaxLength="4096" Style="font-family:Courier New, Courier, monospace;font-size:small" @bind-Value=@csr TValue="string" />
+                </div>
+            </RadzenCard>
+        </div>
+        <div class="col" style="width:624px;min-width:624px;max-width:624px">
+            <RadzenCard>
+                <div class="row" style="margin:0 auto">
+                    <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Certificate</RadzenText>
+                    <RadzenTextArea Cols="64" Rows="8" MaxLength="4096" Style="font-family:Courier New, Courier, monospace;font-size:small" @bind-Value=@certificate TValue="string" />
+                </div>
+            </RadzenCard>
+        </div>
+    </div>
+</div>
+
+@code {
+    [CascadingParameter] public IModalService Modal { get; set; } = default!;
+
+    private CryptoFactory crypto = new CryptoFactory();
+    private int? keyBits = null;
+    private string privateKey = "";
+    private string publicKey = "";
+    private string commonName = "";
+    private string country = "";
+    private string stateOrProvince = "";
+    private string locality = "";
+    private string organization = "";
+    private string organizationalUnit = "";
+    private string emailAddress = "";
+    private string subjectAlternativeNames = "";
+    private string csr = "";
+    private string certificate = "";
+    private readonly XDocument settings = XDocument.Load("static/settings.xml");
+
+    void GenerateClick()
+    {
+        ModalParameters modalParam = new ModalParameters();
+        if (!keyBits.HasValue)
+        {
+            modalParam.Add("Message", "You must select key strength before generating a key pair");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+        KeyPair key = crypto.KeyGen((int)keyBits);
+        privateKey = key.Private;
+        publicKey = key.Public;
+    }
+
+    void DeriveClick()
+    {
+        ModalParameters modalParam = new ModalParameters();
+        try { publicKey = crypto.DerivePublicKey(privateKey); }
+        catch (Exception x)
+        {
+            modalParam.Add("Message", x.Message);
+            Modal.Show<Modal>("Error", modalParam);
+            publicKey = "";
+        }
+    }
+
+    void AutofillClick()
+    {
+        ModalParameters modalParam = new ModalParameters();
+        // Determine if the Common Name field contains Unicode, and attempt to convert to Punycode (RFC 3490). This could produce garbage but it'll get validated further.
+        if (!ASCIIEncoding.GetEncoding(0).GetString(ASCIIEncoding.GetEncoding(0).GetBytes(commonName)).Equals(commonName))
+        {
+            IdnMapping idn = new IdnMapping();
+            commonName = idn.GetAscii(commonName);
+        }
+        // Check for illegal characters per RFC 1035
+        if (commonName.Except("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~").Any())
+        { modalParam.Add("Message", "Common Name contains illegal characters"); }
+        // Filter out IP addresses and anything malformed
+        else if ((Uri.CheckHostName(commonName) != UriHostNameType.Dns))
+        { modalParam.Add("Message", "Common Name is not a valid DNS name"); }
+        subjectAlternativeNames = commonName;
+
+        XElement root = settings.Root ?? new XElement("null");
+        if (root.Value.Equals("null")) { modalParam.Add("Message", "Could not parse settings.xml"); }
+        
+        if (modalParam.Count() > 0)
+        {
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+    
+        country = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Country"), new XElement("null")).Value;
+        stateOrProvince = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("StateOrProvince"), new XElement("null")).Value;
+        locality = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Locality"), new XElement("null")).Value;
+        organization = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Organization"), new XElement("null")).Value;
+        organizationalUnit = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("OrganizationalUnit"), new XElement("null")).Value;
+        emailAddress = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("EmailAddress"), new XElement("null")).Value;
+    }
+
+    private bool ValidateFQDN(string input)
+    {
+        if ((Uri.CheckHostName(input) == UriHostNameType.Dns)) { if (input.Split('.').Count() > 2) { return true; } }
+        return false;
+    }
+
+    private string UTF8Encode(string input) 
+    {
+        try { return (Encoding.UTF8.GetString(Encoding.Default.GetBytes(input))); }
+        catch { throw new ArgumentException("Could not encode string as UTF-8"); }
+    }
+
+    private static bool IsValidEmail(string email)
+    {
+        if (string.IsNullOrWhiteSpace(email)) { return false; }
+        try
+        {
+            email = Regex.Replace(email, @"(@)(.+)$", DomainMapper, RegexOptions.None, TimeSpan.FromMilliseconds(200));
+
+            string DomainMapper(Match match)
+            {
+                IdnMapping idn = new();
+                string domainName = idn.GetAscii(match.Groups[2].Value);
+                return match.Groups[1].Value + domainName;
+            }
+        }
+        catch (RegexMatchTimeoutException) { return false; }
+        catch (ArgumentException) { return false; }
+        try { return Regex.IsMatch(email, @"^[^@\s]+@[^@\s]+\.[^@\s]+$", RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(250)); }
+        catch (RegexMatchTimeoutException) { return false; }
+    }
+
+    void CSRClick()
+    {
+        ModalParameters modalParam = new ModalParameters();
+        KeyPair kp;
+        try { kp = new KeyPair(publicKey, privateKey); }
+        catch (ArgumentException x)
+        {
+            modalParam.Add("Message", x.Message);
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+        if (kp.Public.Equals(string.Empty) || kp.Private.Equals(string.Empty))
+        {
+            modalParam.Add("Message", "Key pair is not valid");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+
+        if (!ValidateFQDN(commonName))
+        {
+            modalParam.Add("Message", "Common Name is not a valid DNS name");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+
+        // Stripping whitespace and updating the field. A little passive-aggressive reminder for the user...
+        subjectAlternativeNames = String.Concat(subjectAlternativeNames.Where(c => !Char.IsWhiteSpace(c)));
+        List<string> sanArray = new();
+        foreach (string san in subjectAlternativeNames.Split(','))
+        {
+            if ((Uri.CheckHostName(san) != UriHostNameType.Dns))
+            {
+                modalParam.Add("Message", "Subject Alternative Name(s) contains at least one invalid DNS name");
+                Modal.Show<Modal>("Error", modalParam);
+                return;
+            }
+            sanArray.Add(UTF8Encode(san));
+        }
+
+        // This will also catch empty / malformed strings.
+        try { System.Globalization.RegionInfo info = new System.Globalization.RegionInfo(country); }
+        catch (ArgumentException)
+        {
+            modalParam.Add("Message", "Country must be a valid ISO 3166 country code");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+
+        // It's OK if this contains nothing.
+        if (!string.IsNullOrWhiteSpace(emailAddress))
+        {         
+            if(!IsValidEmail(emailAddress))
+            {
+                modalParam.Add("Message", "The value provided for Email Address could not be validated");
+                Modal.Show<Modal>("Error", modalParam);
+                return;
+            }
+        }
+        if (stateOrProvince.Equals(string.Empty))
+        {
+            modalParam.Add("Message", "State or Province field must be present");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+        if (locality.Equals(string.Empty))
+        {
+            modalParam.Add("Message", "Locality field must be present");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+        if (organization.Equals(string.Empty))
+        {
+            modalParam.Add("Message", "Organization field must be present");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+        try
+        {
+            stateOrProvince = UTF8Encode(stateOrProvince);
+            locality = UTF8Encode(locality);
+            organization = UTF8Encode(organization);
+            organizationalUnit = UTF8Encode(organizationalUnit);
+            emailAddress = UTF8Encode(emailAddress);
+        }
+        catch (ArgumentException)
+        {
+            modalParam.Add("Message", "Could not encode all fields as UTF-8");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+        try
+        {
+            csr = crypto.CSRGen(kp, UTF8Encode(commonName), sanArray.ToArray(),
+            UTF8Encode(country), UTF8Encode(stateOrProvince), UTF8Encode(locality), UTF8Encode(organization), UTF8Encode(organizationalUnit), UTF8Encode(emailAddress));
+        }
+        catch (Exception x)
+        {
+            modalParam.Add("Message", x.Message);
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+    }
+
+    private async Task RequestClick()
+    {
+        ModalParameters modalParam = new ModalParameters();
+        AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        ClaimsPrincipal user = authState.User;
+        IEnumerable<Claim> claims = Enumerable.Empty<Claim>();
+        if (!Equals(user.Identity, null)) { if (user.Identity.IsAuthenticated) { claims = user.Claims.Where(q => q.Type == ClaimTypes.GroupSid); } }
+
+        // Read settings.xml and determine which group is allowed to issue certificates. 
+        // Doing this at every attempt allows for changes to settings.xml with out restarting the application.
+        XElement root = settings.Root ?? new XElement("null");
+        if (root.Value.Equals("null")) { modalParam.Add("Message", "Could not parse settings.xml"); }
+        string group = Enumerable.FirstOrDefault(root.Elements("Group"), new XElement("null")).Value;
+        bool auth = false;
+        foreach (Claim claim in claims)
+        {
+            string name = new SecurityIdentifier(claim.Value).Translate(typeof(NTAccount)).ToString();
+            if (name.Equals(group)) { auth = true; }
+        }
+        if (!auth)
+        {
+            modalParam.Add("Message", "You are not authorized to request certificates");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+
+        if (csr.Equals(string.Empty))
+        {
+            modalParam.Add("Message", "You must provide a CSR before requesting a certificate");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+        try { certificate = CryptoFactory.RequestCert(csr); }
+        catch (Exception x)
+        {
+            modalParam.Add("Message", x.Message);
+            Modal.Show<Modal>("Error", modalParam);
+        }
+    }
+
+    private async Task ExportClick()
+    {
+        ModalParameters modalParam = new ModalParameters();
+        if (certificate.Equals(string.Empty))
+        {
+            modalParam.Add("Message", "A certificate is required for export");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+        try
+        {
+            Tuple<string, byte[]>? zipObj = PkcsBuilder.Export(certificate, privateKey);
+            if (zipObj == null) { throw new NullReferenceException("Unable to export. Either the certificate supplied could not be parsed, or CertRobo was unable to load the root certificate."); }
+            else
+            {
+                MemoryStream output = new MemoryStream(zipObj.Item2);
+                DotNetStreamReference streamRef = new DotNetStreamReference(output, false);
+                await JS.InvokeVoidAsync("downloadFileFromStream", zipObj.Item1, streamRef);
+            }
+        }
+        catch (Exception x)
+        {
+            modalParam.Add("Message", x.Message);
+            Modal.Show<Modal>("Error", modalParam);
+        }
+    }
+}
