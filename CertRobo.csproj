@@ -25,6 +25,24 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Remove="static\ca.crt.example" />
+    <None Remove="static\ca.p12.example" />
+    <None Remove="static\settings.xml.example" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="static\ca.crt.example">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Include="static\ca.p12.example">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Include="static\settings.xml.example">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Blazored.Modal" Version="7.3.1" />
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.5.0" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.Negotiate" Version="9.0.0" />
