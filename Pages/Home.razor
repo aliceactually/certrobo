@@ -177,6 +177,133 @@
 </div>
 
 @code {
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     [CascadingParameter] public IModalService Modal { get; set; } = default!;
 
     private CryptoFactory crypto = new CryptoFactory();
@@ -240,13 +367,13 @@
 
         XElement root = settings.Root ?? new XElement("null");
         if (root.Value.Equals("null")) { modalParam.Add("Message", "Could not parse settings.xml"); }
-        
+
         if (modalParam.Count() > 0)
         {
             Modal.Show<Modal>("Error", modalParam);
             return;
         }
-    
+
         country = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Country"), new XElement("null")).Value;
         stateOrProvince = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("StateOrProvince"), new XElement("null")).Value;
         locality = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Locality"), new XElement("null")).Value;
@@ -290,17 +417,27 @@
     void CSRClick()
     {
         ModalParameters modalParam = new ModalParameters();
+        if (privateKey.Equals(string.Empty))
+        {
+            modalParam.Add("Message", "Private key must be supplied");
+            Modal.Show<Modal>("Error", modalParam);
+            return;
+        }
+        if (publicKey.Equals(string.Empty))
+        {
+            try { publicKey = crypto.DerivePublicKey(privateKey); }
+            catch (Exception)
+            {
+                modalParam.Add("Message", "Public key could not be derived from private key");
+                Modal.Show<Modal>("Error", modalParam);
+                return;
+            }
+        }
         KeyPair kp;
         try { kp = new KeyPair(publicKey, privateKey); }
         catch (ArgumentException x)
         {
             modalParam.Add("Message", x.Message);
-            Modal.Show<Modal>("Error", modalParam);
-            return;
-        }
-        if (kp.Public.Equals(string.Empty) || kp.Private.Equals(string.Empty))
-        {
-            modalParam.Add("Message", "Key pair is not valid");
             Modal.Show<Modal>("Error", modalParam);
             return;
         }
@@ -337,8 +474,9 @@
 
         // It's OK if this contains nothing.
         if (!string.IsNullOrWhiteSpace(emailAddress))
-        {         
-            if(!IsValidEmail(emailAddress))
+        {
+
+            if (!IsValidEmail(emailAddress))
             {
                 modalParam.Add("Message", "The value provided for Email Address could not be validated");
                 Modal.Show<Modal>("Error", modalParam);
@@ -399,7 +537,7 @@
         if (!Equals(user.Identity, null)) { if (user.Identity.IsAuthenticated) { claims = user.Claims.Where(q => q.Type == ClaimTypes.GroupSid); } }
 
         // Read settings.xml and determine which group is allowed to issue certificates. 
-        // Doing this at every attempt allows for changes to settings.xml with out restarting the application.
+        // Doing this at every attempt allows for changes to settings.xml without restarting the application.
         XElement root = settings.Root ?? new XElement("null");
         if (root.Value.Equals("null")) { modalParam.Add("Message", "Could not parse settings.xml"); }
         string group = Enumerable.FirstOrDefault(root.Elements("Group"), new XElement("null")).Value;
