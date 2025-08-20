@@ -15,6 +15,7 @@ using System.Management.Automation;
 using System.Management.Automation.Runspaces;
 using System.Text;
 using System.Xml.Linq;
+using Org.BouncyCastle.OpenSsl;
 
 namespace CertRobo
 {
@@ -420,27 +421,61 @@ namespace CertRobo
 
         public static string RequestCert(string csr)
         {
-            // TODO: Convert.TryFromBase64String fails where Convert.FromBase64String in a try block succeeds. Not sure why. Is this input validation good enough?
+            Pkcs10CertificationRequest decodedCsr = (Pkcs10CertificationRequest)new PemReader(new StringReader(csr)).ReadObject();
+            AsymmetricKeyParameter keyParam = decodedCsr.GetPublicKey();
+            if (Object.Equals(keyParam, null)) { throw new ArgumentException("The CSR provided could not be decoded"); }
+            
+            string template;
+            XElement root = settings.Root ?? new XElement("null");
+            if (root.Value.Equals("null")) { return string.Empty; }
+
+            if (keyParam is RsaKeyParameters rsa)
+            {
+                switch (rsa.Modulus.BitLength)
+                {
+                    case 4096:
+                        template = Enumerable.FirstOrDefault(root.Elements("Template4096"), new XElement("null")).Value;
+                        break;
+                    case 2048:
+                        template = Enumerable.FirstOrDefault(root.Elements("Template2048"), new XElement("null")).Value;
+                        break;
+                    default:
+                        throw new ArgumentException("The CSR provided uses an unsupported RSA key length (" + rsa.Modulus.BitLength + ")");
+                }
+            }
+            else if (keyParam is ECPublicKeyParameters ec)
+            {
+                switch (ec.Parameters.N.BitLength)
+                {
+                    case 384:
+                        template = Enumerable.FirstOrDefault(root.Elements("Template384"), new XElement("null")).Value;
+                        break;
+                    case 256:
+                        template = Enumerable.FirstOrDefault(root.Elements("Template256"), new XElement("null")).Value;
+                        break;
+                    default:
+                        throw new ArgumentException("The CSR provided uses an unsupported EC key length (" + ec.Parameters.N.BitLength + ")");
+                }
+
+            }
+            else if (keyParam is Ed25519PrivateKeyParameters) { throw new ArgumentException("The CSR provided uses ED25519, which is not supported"); }
+            else { throw new ArgumentException("The CSR provided uses an unsupported algorithm"); }
+
+            InitialSessionState state = InitialSessionState.CreateDefault();
+            state.ExecutionPolicy = ExecutionPolicy.Unrestricted;
+            PowerShell shell = PowerShell.Create(state);
+
+            string server = Enumerable.FirstOrDefault(root.Elements("Server"), new XElement("null")).Value;
+            if (server.Equals(string.Empty) || template.Equals(string.Empty)) { return string.Empty; }
+
+            //TODO: Instead of just recycling this, maybe it'd be cleaner to yank it back out of decodedCsr?
             string c = "";
             foreach (string s in csr.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { c += s; }
-            try { Convert.FromBase64String(c); }
-            catch { throw new ArgumentException("The CSR provided could not be decoded from base64"); }
-
             string request = Path.GetTempFileName();
             StreamWriter requestStream = File.CreateText(request);
             requestStream.Write(c);
             requestStream.Close();
             string response = Path.GetTempFileName();
-
-            InitialSessionState state = InitialSessionState.CreateDefault();
-            state.ExecutionPolicy = ExecutionPolicy.Unrestricted;
-            PowerShell shell = PowerShell.Create(state);
-            
-            XElement root = settings.Root ?? new XElement("null");
-            if (root.Value.Equals("null")) { return string.Empty; }
-            string server = Enumerable.FirstOrDefault(root.Elements("Server"), new XElement("null")).Value;
-            string template = Enumerable.FirstOrDefault(root.Elements("Template"), new XElement("null")).Value;
-            if (server.Equals(string.Empty) || template.Equals(string.Empty)) { return string.Empty; }
 
             // If we got this far, we should have everything we need to do this successfully...
             shell.AddScript("certreq -f -q -submit -attrib \"CertificateTemplate:" + template + "\" -config \"" + server + "\" " + request + " " + response, true);

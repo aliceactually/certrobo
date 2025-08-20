@@ -27,7 +27,7 @@
   <ItemGroup>
     <None Remove="static\ca.crt.example" />
     <None Remove="static\ca.p12.example" />
-    <None Remove="static\settings.xml.example" />
+    <None Remove="static\settings.xml" />
   </ItemGroup>
 
   <ItemGroup>
@@ -37,29 +37,26 @@
     <Content Include="static\ca.p12.example">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
-    <Content Include="static\settings.xml.example">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </Content>
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Blazored.Modal" Version="7.3.1" />
-    <PackageReference Include="BouncyCastle.Cryptography" Version="2.5.1" />
-    <PackageReference Include="Microsoft.AspNetCore.Authentication.Negotiate" Version="9.0.3" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.3" />
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.Negotiate" Version="9.0.8" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.8" />
     <PackageReference Include="Microsoft.Management.Infrastructure" Version="3.0.0" />
     <PackageReference Include="Microsoft.Management.Infrastructure.Runtime.Win" Version="3.0.0" />
-    <PackageReference Include="Microsoft.PowerShell.Commands.Diagnostics" Version="7.5.0" />
-    <PackageReference Include="Microsoft.PowerShell.Commands.Management" Version="7.5.0" />
-    <PackageReference Include="Microsoft.PowerShell.Commands.Utility" Version="7.5.0" />
-    <PackageReference Include="Microsoft.PowerShell.ConsoleHost" Version="7.5.0" />
-    <PackageReference Include="Microsoft.WSMan.Management" Version="7.5.0" />
-    <PackageReference Include="Microsoft.WSMan.Runtime" Version="7.5.0" />
+    <PackageReference Include="Microsoft.PowerShell.Commands.Diagnostics" Version="7.5.2" />
+    <PackageReference Include="Microsoft.PowerShell.Commands.Management" Version="7.5.2" />
+    <PackageReference Include="Microsoft.PowerShell.Commands.Utility" Version="7.5.2" />
+    <PackageReference Include="Microsoft.PowerShell.ConsoleHost" Version="7.5.2" />
+    <PackageReference Include="Microsoft.WSMan.Management" Version="7.5.2" />
+    <PackageReference Include="Microsoft.WSMan.Runtime" Version="7.5.2" />
     <PackageReference Include="NETStandard.Library" Version="2.0.3" />
-    <PackageReference Include="Radzen.Blazor" Version="6.2.6" />
+    <PackageReference Include="Radzen.Blazor" Version="7.2.2" />
     <PackageReference Include="SharpZipLib.NETStandard" Version="1.0.7" />
-    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="9.0.3" />
-    <PackageReference Include="System.Management.Automation" Version="7.5.0" />
+    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="9.0.8" />
+    <PackageReference Include="System.Management.Automation" Version="7.5.2" />
   </ItemGroup>
 
   <ItemGroup>

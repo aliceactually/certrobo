@@ -1,6 +1,9 @@
 <CertRobo>
 	<Server>ca.contoso.com\Contoso Certificate Authority</Server>
-	<Template>WebServerV3</Template>
+	<Template256>CertRoboECDSA256</Template256>
+	<Template384>CertRoboECDSA384</Template384>
+	<Template2048>CertRoboRSA2048</Template2048>
+	<Template4096>CertRoboRSA4096</Template4096>
 	<Group>CONTOSO\CertRobo Certificate Issuers</Group>
 	<Defaults>
 		<Country>US</Country>
