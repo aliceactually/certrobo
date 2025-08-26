@@ -19,7 +19,10 @@ The file "static/settings.xml" must be present for CertRobo to work properly. An
 The elements in this file are as follows:
 
 * Server: The AD CS server that we are targeting, in the format "FQDN\CA Friendly Name".
-* Template: The certificate template to issue against. The server running CertRobo must have a machine account with permission to issue certificates against this template.
+* Template4096: The certificate template that will be used to issue RSA 4096 certificates.
+* Template2048: The certificate template that will be used to issue RSA 2048 certificates.
+* Template384: The certificate template that will be used to issue ECDSA 384 certificates.
+* Template256: The certificate template that will be used to issue ECDSA 256 certificates.
 * Group: The group that CertRobo will issue certificates to, in the format "DOMAIN\Group".
 * Defaults: These are X.509 attributes used by autofill, and must comply with RFC 5280 Appendix A.
 * Country: Required. This must be an ISO 3166 Alpha-2 country code.
