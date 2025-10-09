@@ -43,9 +43,9 @@ your OCSP responder.
 
 ## License
 
-CertRobo is Copyright © 2022-2024 Alice Saunier. All rights reserved.
-The author gratefully acknowledges the support of Xactly Corporation
-in producing and releasing this software.
+CertRobo is Copyright © 2022-2025 Alice Kallista Saunier. All rights
+reserved. The author gratefully acknowledges the support of Xactly
+Corporation in producing and releasing this software.
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
