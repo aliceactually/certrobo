@@ -377,6 +377,8 @@ namespace CertRobo
 
         public string DerivePublicKey(string privateKey)
         {
+            // Catch an empty string
+            if (string.IsNullOrWhiteSpace(privateKey)) { return string.Empty; }
             string k = "";
             foreach (string s in privateKey.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { k += s; }
             AsymmetricKeyParameter privateParam;

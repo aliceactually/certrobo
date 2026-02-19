@@ -1,5 +1,5 @@
 using Microsoft.AspNetCore.Authentication.Negotiate;
-using Blazored.Modal;
+using Radzen;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -9,13 +9,13 @@ builder.Services.AddAuthentication(NegotiateDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization(options =>
 {
-    // By default, all incoming requests will be authorized according to the default policy.
-    options.FallbackPolicy = options.DefaultPolicy;
+    // Only require auth for specific pages that have [Authorize] attribute
+    // Don't set a fallback policy that applies to everything
 });
 
 builder.Services.AddRazorPages();
 builder.Services.AddServerSideBlazor();
-builder.Services.AddBlazoredModal();
+builder.Services.AddScoped<NotificationService>();
 
 var app = builder.Build();
 

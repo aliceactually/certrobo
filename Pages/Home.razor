@@ -1,6 +1,6 @@
 ﻿@page "/"
+@attribute [Authorize]
 @using Microsoft.AspNetCore.Components.Authorization
-@using Microsoft.AspNetCore.Mvc
 @using Org.BouncyCastle.Asn1.X509
 @using Org.BouncyCastle.X509
 @using System.Globalization
@@ -12,6 +12,7 @@
 @using System.Xml.Linq
 @inject AuthenticationStateProvider AuthenticationStateProvider
 @inject IJSRuntime JS
+@inject Radzen.NotificationService NotificationService
 
 <PageTitle>CertRobo</PageTitle>
 
@@ -110,19 +111,19 @@
                 <div class="row" style="height: 6px" />
                 <div class="row">
                     <div class="col" style="width:208px;min-width:208px;max-width:208px">
-                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Organization</RadzenText>
+                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Organisation</RadzenText>
                     </div>
                     <div class="col" style="width:100%">
-                        <RadzenTextBox @bind-Value=@organization TValue="string" Class="w-100" />
+                        <RadzenTextBox @bind-Value=@organisation TValue="string" Class="w-100" />
                     </div>
                 </div>
                 <div class="row" style="height: 6px" />
                 <div class="row">
                     <div class="col" style="width:208px;min-width:208px;max-width:208px">
-                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Organizational Unit</RadzenText>
+                        <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Organisational Unit</RadzenText>
                     </div>
                     <div class="col" style="width:100%">
-                        <RadzenTextBox @bind-Value=@organizationalUnit TValue="string" Class="w-100" />
+                        <RadzenTextBox @bind-Value=@organisationalUnit TValue="string" Class="w-100" />
                     </div>
                 </div>
                 <div class="row" style="height: 6px" />
@@ -173,139 +174,10 @@
                 </div>
             </RadzenCard>
         </div>
-    </div>
-</div>
+             </div>
+         </div>
 
-@code {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    [CascadingParameter] public IModalService Modal { get; set; } = default!;
-
+         @code {
     private CryptoFactory crypto = new CryptoFactory();
     private int? keyBits = null;
     private string privateKey = "";
@@ -314,21 +186,31 @@
     private string country = "";
     private string stateOrProvince = "";
     private string locality = "";
-    private string organization = "";
-    private string organizationalUnit = "";
+    private string organisation = "";
+    private string organisationalUnit = "";
     private string emailAddress = "";
     private string subjectAlternativeNames = "";
     private string csr = "";
     private string certificate = "";
     private readonly XDocument settings = XDocument.Load("static/settings.xml");
 
-    void GenerateClick()
+    private void ShowErrorDialogue(string message)
     {
-        ModalParameters modalParam = new ModalParameters();
+        NotificationService.Notify(new Radzen.NotificationMessage
+        {
+            Severity = Radzen.NotificationSeverity.Error,
+            Summary = "Error",
+            Detail = message,
+            Duration = 5000,
+            Style = "position: fixed; left: 50%; transform: translateX(-50%); width: auto; max-width: 600px; z-index: 9999;"
+        });
+    }
+
+    private async Task GenerateClick()
+    {
         if (!keyBits.HasValue)
         {
-            modalParam.Add("Message", "You must select key strength before generating a key pair");
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue("You must select key strength before generating a key pair");
             return;
         }
         KeyPair key = crypto.KeyGen((int)keyBits);
@@ -336,21 +218,19 @@
         publicKey = key.Public;
     }
 
-    void DeriveClick()
+    private async Task DeriveClick()
     {
-        ModalParameters modalParam = new ModalParameters();
         try { publicKey = crypto.DerivePublicKey(privateKey); }
         catch (Exception x)
         {
-            modalParam.Add("Message", x.Message);
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue(x.Message);
             publicKey = "";
         }
     }
 
-    void AutofillClick()
+    private async Task AutofillClick()
     {
-        ModalParameters modalParam = new ModalParameters();
+        string errorMessage = string.Empty;
         // Determine if the Common Name field contains Unicode, and attempt to convert to Punycode (RFC 3490). This could produce garbage but it'll get validated further.
         if (!ASCIIEncoding.GetEncoding(0).GetString(ASCIIEncoding.GetEncoding(0).GetBytes(commonName)).Equals(commonName))
         {
@@ -359,26 +239,26 @@
         }
         // Check for illegal characters per RFC 1035
         if (commonName.Except("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~").Any())
-        { modalParam.Add("Message", "Common Name contains illegal characters"); }
+        { errorMessage = "Common Name contains illegal characters"; }
         // Filter out IP addresses and anything malformed
         else if ((Uri.CheckHostName(commonName) != UriHostNameType.Dns))
-        { modalParam.Add("Message", "Common Name is not a valid DNS name"); }
+        { errorMessage = "Common Name is not a valid DNS name"; }
         subjectAlternativeNames = commonName;
 
         XElement root = settings.Root ?? new XElement("null");
-        if (root.Value.Equals("null")) { modalParam.Add("Message", "Could not parse settings.xml"); }
+        if (root.Value == "null") { errorMessage = "Could not parse settings.xml"; }
 
-        if (modalParam.Count() > 0)
+        if (!string.IsNullOrEmpty(errorMessage))
         {
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue(errorMessage);
             return;
         }
 
         country = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Country"), new XElement("null")).Value;
         stateOrProvince = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("StateOrProvince"), new XElement("null")).Value;
         locality = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Locality"), new XElement("null")).Value;
-        organization = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Organization"), new XElement("null")).Value;
-        organizationalUnit = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("OrganizationalUnit"), new XElement("null")).Value;
+        organisation = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Organisation"), new XElement("null")).Value;
+        organisationalUnit = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("OrganisationalUnit"), new XElement("null")).Value;
         emailAddress = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("EmailAddress"), new XElement("null")).Value;
     }
 
@@ -391,7 +271,7 @@
     private string UTF8Encode(string input) 
     {
         try { return (Encoding.UTF8.GetString(Encoding.Default.GetBytes(input))); }
-        catch { throw new ArgumentException("Could not encode string as UTF-8"); }
+        catch (EncoderFallbackException) { throw new ArgumentException("Could not encode string as UTF-8"); }
     }
 
     private static bool IsValidEmail(string email)
@@ -414,22 +294,19 @@
         catch (RegexMatchTimeoutException) { return false; }
     }
 
-    void CSRClick()
+    private async Task CSRClick()
     {
-        ModalParameters modalParam = new ModalParameters();
-        if (privateKey.Equals(string.Empty))
+        if (string.IsNullOrEmpty(privateKey))
         {
-            modalParam.Add("Message", "Private key must be supplied");
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue("Private key must be supplied");
             return;
         }
-        if (publicKey.Equals(string.Empty))
+        if (string.IsNullOrEmpty(publicKey))
         {
             try { publicKey = crypto.DerivePublicKey(privateKey); }
-            catch (Exception)
+            catch (InvalidOperationException)
             {
-                modalParam.Add("Message", "Public key could not be derived from private key");
-                Modal.Show<Modal>("Error", modalParam);
+                ShowErrorDialogue("Public key could not be derived from private key");
                 return;
             }
         }
@@ -437,15 +314,13 @@
         try { kp = new KeyPair(publicKey, privateKey); }
         catch (ArgumentException x)
         {
-            modalParam.Add("Message", x.Message);
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue(x.Message);
             return;
         }
 
         if (!ValidateFQDN(commonName))
         {
-            modalParam.Add("Message", "Common Name is not a valid DNS name");
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue("Common Name is not a valid DNS name");
             return;
         }
 
@@ -456,8 +331,7 @@
         {
             if ((Uri.CheckHostName(san) != UriHostNameType.Dns))
             {
-                modalParam.Add("Message", "Subject Alternative Name(s) contains at least one invalid DNS name");
-                Modal.Show<Modal>("Error", modalParam);
+                ShowErrorDialogue("Subject Alternative Name(s) contains at least one invalid DNS name");
                 return;
             }
             sanArray.Add(UTF8Encode(san));
@@ -467,8 +341,7 @@
         try { System.Globalization.RegionInfo info = new System.Globalization.RegionInfo(country); }
         catch (ArgumentException)
         {
-            modalParam.Add("Message", "Country must be a valid ISO 3166 country code");
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue("Country must be a valid ISO 3166 country code");
             return;
         }
 
@@ -478,103 +351,91 @@
 
             if (!IsValidEmail(emailAddress))
             {
-                modalParam.Add("Message", "The value provided for Email Address could not be validated");
-                Modal.Show<Modal>("Error", modalParam);
+                ShowErrorDialogue("The value provided for Email Address could not be validated");
                 return;
             }
         }
-        if (stateOrProvince.Equals(string.Empty))
+        if (string.IsNullOrEmpty(stateOrProvince))
         {
-            modalParam.Add("Message", "State or Province field must be present");
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue("State or Province field must be present");
             return;
         }
-        if (locality.Equals(string.Empty))
+        if (string.IsNullOrEmpty(locality))
         {
-            modalParam.Add("Message", "Locality field must be present");
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue("Locality field must be present");
             return;
         }
-        if (organization.Equals(string.Empty))
+        if (string.IsNullOrEmpty(organisation))
         {
-            modalParam.Add("Message", "Organization field must be present");
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue("Organisation field must be present");
             return;
         }
         try
         {
             stateOrProvince = UTF8Encode(stateOrProvince);
             locality = UTF8Encode(locality);
-            organization = UTF8Encode(organization);
-            organizationalUnit = UTF8Encode(organizationalUnit);
+            organisation = UTF8Encode(organisation);
+            organisationalUnit = UTF8Encode(organisationalUnit);
             emailAddress = UTF8Encode(emailAddress);
         }
         catch (ArgumentException)
         {
-            modalParam.Add("Message", "Could not encode all fields as UTF-8");
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue("Could not encode all fields as UTF-8");
             return;
         }
         try
         {
             csr = crypto.CSRGen(kp, UTF8Encode(commonName), sanArray.ToArray(),
-            UTF8Encode(country), UTF8Encode(stateOrProvince), UTF8Encode(locality), UTF8Encode(organization), UTF8Encode(organizationalUnit), UTF8Encode(emailAddress));
+            UTF8Encode(country), UTF8Encode(stateOrProvince), UTF8Encode(locality), UTF8Encode(organisation), UTF8Encode(organisationalUnit), UTF8Encode(emailAddress));
         }
         catch (Exception x)
         {
-            modalParam.Add("Message", x.Message);
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue(x.Message);
             return;
         }
     }
 
     private async Task RequestClick()
     {
-        ModalParameters modalParam = new ModalParameters();
         AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
         ClaimsPrincipal user = authState.User;
         IEnumerable<Claim> claims = Enumerable.Empty<Claim>();
-        if (!Equals(user.Identity, null)) { if (user.Identity.IsAuthenticated) { claims = user.Claims.Where(q => q.Type == ClaimTypes.GroupSid); } }
+        if (user.Identity is not null) { if (user.Identity.IsAuthenticated) { claims = user.Claims.Where(q => q.Type == ClaimTypes.GroupSid); } }
 
         // Read settings.xml and determine which group is allowed to issue certificates. 
         // Doing this at every attempt allows for changes to settings.xml without restarting the application.
         XElement root = settings.Root ?? new XElement("null");
-        if (root.Value.Equals("null")) { modalParam.Add("Message", "Could not parse settings.xml"); }
+        if (root.Value == "null") { ShowErrorDialogue("Could not parse settings.xml"); return; }
         string group = Enumerable.FirstOrDefault(root.Elements("Group"), new XElement("null")).Value;
         bool auth = false;
         foreach (Claim claim in claims)
         {
             string name = new SecurityIdentifier(claim.Value).Translate(typeof(NTAccount)).ToString();
-            if (name.ToLowerInvariant().Equals(group.ToLowerInvariant())) { auth = true; }
+            if (string.Equals(name, group, StringComparison.OrdinalIgnoreCase)) { auth = true; }
         }
         if (!auth)
         {
-            modalParam.Add("Message", "You are not authorized to request certificates");
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue("You are not authorised to request certificates");
             return;
         }
 
-        if (csr.Equals(string.Empty))
+        if (string.IsNullOrEmpty(csr))
         {
-            modalParam.Add("Message", "You must provide a CSR before requesting a certificate");
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue("You must provide a CSR before requesting a certificate");
             return;
         }
         try { certificate = CryptoFactory.RequestCert(csr); }
         catch (Exception x)
         {
-            modalParam.Add("Message", x.Message);
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue(x.Message);
         }
     }
 
     private async Task ExportClick()
     {
-        ModalParameters modalParam = new ModalParameters();
-        if (certificate.Equals(string.Empty))
+        if (string.IsNullOrEmpty(certificate))
         {
-            modalParam.Add("Message", "A certificate is required for export");
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue("A certificate is required for export");
             return;
         }
         try
@@ -590,8 +451,7 @@
         }
         catch (Exception x)
         {
-            modalParam.Add("Message", x.Message);
-            Modal.Show<Modal>("Error", modalParam);
+            ShowErrorDialogue(x.Message);
         }
     }
 }

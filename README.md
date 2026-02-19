@@ -8,7 +8,7 @@ It's been written from the ground up using ASP.NET and Blazor to provide a moder
 
 * Windows Server 2016 / Windows 10 or later
 * Internet Information Server 7.0 or later
-* ASP.NET Core 9.0 hosting bundle
+* ASP.NET Core 10.0 hosting bundle
 * PowerShell 7.0 or later
 * An accessible instance of AD CS
 * An accessible OCSP responder
@@ -28,8 +28,8 @@ The elements in this file are as follows:
 * Country: Required. This must be an ISO 3166 Alpha-2 country code.
 * StateOrProvince: Required. The state or province of the issuer. Do not abbreviate.
 * Locality: Required. The locality (city) of the issuer. Do not abbreviate.
-* Organization: Required. The full legal name of the issuer.
-* OrganizationalUnit: Required. The organizational unit (department) of the issuer.
+* Organisation: Required. The full legal name of the issuer.
+* OrganisationalUnit: Required. The organisational unit (department) of the issuer.
 * EmailAddress: Optional. The RFC 5322 email address of the issuer.
 
 The files "static/ca.crt" and "static/ca.p12" should also be present.
@@ -43,7 +43,7 @@ your OCSP responder.
 
 ## License
 
-CertRobo is Copyright © 2022-2025 Alice Kallista Saunier. All rights
+CertRobo is Copyright © 2022-2026 Alice Kallista Saunier. All rights
 reserved. The author gratefully acknowledges the support of Xactly
 Corporation in producing and releasing this software.
 

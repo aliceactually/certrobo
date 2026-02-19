@@ -9,8 +9,8 @@
 		<Country>US</Country>
 		<StateOrProvince>Washington</StateOrProvince>
 		<Locality>Redmond</Locality>
-		<Organization>Contoso Corporation</Organization>
-		<OrganizationalUnit>IT</OrganizationalUnit>
+		<Organisation>Contoso Corporation</Organisation>
+		<OrganisationalUnit>IT</OrganisationalUnit>
 		<EmailAddress>it@contoso.com</EmailAddress>
 	</Defaults>
 </CertRobo>
