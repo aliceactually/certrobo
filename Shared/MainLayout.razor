@@ -1,4 +1,5 @@
 ﻿@inherits LayoutComponentBase
+@inject CertRobo.Shared.ThemeService ThemeService
 
 <PageTitle>CertRobo</PageTitle>
 <RadzenNotification />
@@ -8,9 +9,25 @@
     <main>
         <div class="top-row px-4 auth">
             <LoginDisplay />
+            <button class="theme-toggle" @onclick="ToggleTheme" title="Toggle dark mode">
+                <span class="theme-icon">🌙</span>
+            </button>
         </div>
         <article class="content px-4">
             @Body
         </article>
     </main>
 </div>
+
+@code {
+    protected override async Task OnInitializedAsync()
+    {
+        await ThemeService.InitializeThemeAsync();
+        ThemeService.OnThemeChanged += StateHasChanged;
+    }
+
+    private async Task ToggleTheme()
+    {
+        await ThemeService.ToggleThemeAsync();
+    }
+}

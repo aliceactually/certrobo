@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authentication.Negotiate;
 using Radzen;
+using CertRobo.Shared;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -16,6 +17,7 @@ builder.Services.AddAuthorization(options =>
 builder.Services.AddRazorPages();
 builder.Services.AddServerSideBlazor();
 builder.Services.AddScoped<NotificationService>();
+builder.Services.AddScoped<CertRobo.Shared.ThemeService>();
 
 var app = builder.Build();
 

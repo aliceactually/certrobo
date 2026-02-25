@@ -1,0 +1,37 @@
+/* Override Radzen text styling to use theme variables */
+
+/* Radzen Text component */
+::deep .rz-text,
+::deep .rz-text-subtitle1,
+::deep .rz-text-subtitle2 {
+    color: var(--text-color) !important;
+}
+
+/* Headings */
+::deep h1,
+::deep h2,
+::deep h3,
+::deep h4,
+::deep h5,
+::deep h6 {
+    color: var(--text-color) !important;
+}
+
+/* Form labels */
+::deep label {
+    color: var(--text-color) !important;
+}
+
+/* Radio buttons and checkboxes */
+::deep .rz-radio-button-list label,
+::deep .rz-checkbox label {
+    color: var(--text-color) !important;
+}
+
+/* Input fields */
+::deep .rz-textbox,
+::deep .rz-textarea {
+    background-color: var(--input-bg) !important;
+    border-color: var(--input-border) !important;
+    color: var(--text-color) !important;
+}

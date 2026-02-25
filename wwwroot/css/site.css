@@ -1,7 +1,44 @@
 @import url('open-iconic/font/css/open-iconic-bootstrap.min.css');
 
+/* CSS Variables for theming */
+:root[data-theme="light"],
+:root:not([data-theme]) {
+    --bg-color: #ffffff;
+    --text-color: #212529;
+    --border-color: #dee2e6;
+    --card-bg: #f8f9fa;
+    --link-color: #0071c1;
+    --link-hover: #0056b3;
+    --input-bg: #ffffff;
+    --input-border: #ced4da;
+    --btn-primary-bg: #1b6ec2;
+    --btn-primary-border: #1861ac;
+    --valid-color: #26b050;
+    --error-bg: lightyellow;
+    --error-text: #212529;
+}
+
+:root[data-theme="dark"] {
+    --bg-color: #1a1a1a;
+    --text-color: #e0e0e0;
+    --border-color: #404040;
+    --card-bg: #2d2d2d;
+    --link-color: #66b3ff;
+    --link-hover: #99ccff;
+    --input-bg: #2d2d2d;
+    --input-border: #404040;
+    --btn-primary-bg: #0d47a1;
+    --btn-primary-border: #0a3d91;
+    --valid-color: #4caf50;
+    --error-bg: #3e3e1a;
+    --error-text: #e0e0e0;
+}
+
 html, body {
     font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    transition: background-color 0.3s ease, color 0.3s ease;
 }
 
 h1:focus {
@@ -9,13 +46,17 @@ h1:focus {
 }
 
 a, .btn-link {
-    color: #0071c1;
+    color: var(--link-color);
+}
+
+a:hover, .btn-link:hover {
+    color: var(--link-hover);
 }
 
 .btn-primary {
     color: #fff;
-    background-color: #1b6ec2;
-    border-color: #1861ac;
+    background-color: var(--btn-primary-bg);
+    border-color: var(--btn-primary-border);
 }
 
 .content {
@@ -23,19 +64,19 @@ a, .btn-link {
 }
 
 .valid.modified:not([type=checkbox]) {
-    outline: 1px solid #26b050;
+    outline: 1px solid var(--valid-color);
 }
 
 .invalid {
-    outline: 1px solid red;
+    outline: 1px solid #ff6b6b;
 }
 
 .validation-message {
-    color: red;
+    color: #ff6b6b;
 }
 
 #blazor-error-ui {
-    background: lightyellow;
+    background: var(--error-bg);
     bottom: 0;
     box-shadow: 0 -1px 2px rgba(0, 0, 0, 0.2);
     display: none;
@@ -44,6 +85,7 @@ a, .btn-link {
     position: fixed;
     width: 100%;
     z-index: 1000;
+    color: var(--error-text);
 }
 
     #blazor-error-ui .dismiss {
@@ -62,3 +104,79 @@ a, .btn-link {
     .blazor-error-boundary::after {
         content: "An error has occurred."
     }
+
+/* Theme toggle button */
+.theme-toggle {
+    background: none;
+    border: none;
+    padding: 0.5rem;
+    cursor: pointer;
+    font-size: 1.2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    transition: background-color 0.3s ease, transform 0.2s ease;
+    color: var(--text-color);
+    margin-left: 1rem;
+}
+
+.theme-toggle:hover {
+    background-color: var(--card-bg);
+    transform: scale(1.1);
+}
+
+.theme-icon {
+    display: inline-block;
+    transition: transform 0.3s ease;
+}
+
+.theme-toggle:active .theme-icon {
+    transform: rotate(20deg);
+}
+
+/* Top row / header styling */
+.top-row {
+    background-color: var(--card-bg) !important;
+    color: var(--text-color) !important;
+    border-bottom: 1px solid var(--border-color) !important;
+    transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease !important;
+}
+
+/* Radzen component theming */
+.rz-card {
+    background-color: var(--card-bg);
+    border-color: var(--border-color);
+    color: var(--text-color);
+}
+
+/* Override Radzen text style classes */
+.rz-text,
+.rz-text-subtitle1,
+.rz-text-subtitle2,
+.rz-text-body1,
+.rz-text-body2 {
+    color: var(--text-color) !important;
+}
+
+/* Headings inside cards */
+.rz-card h1,
+.rz-card h2,
+.rz-card h3,
+.rz-card h4,
+.rz-card h5,
+.rz-card h6 {
+    color: var(--text-color) !important;
+}
+
+/* Form inputs */
+.rz-textbox,
+.rz-textarea,
+input[type="text"],
+input[type="email"],
+input[type="password"],
+textarea {
+    background-color: var(--input-bg);
+    border-color: var(--input-border);
+    color: var(--text-color);
+}
