@@ -23,7 +23,7 @@ namespace CertRobo.Shared
                 _currentTheme = await _jsRuntime.InvokeAsync<string>("theme.initialize");
                 NotifyThemeChanged();
             }
-            catch (Exception ex)
+            catch (JSException ex)
             {
                 Console.WriteLine($"Error initializing theme: {ex.Message}");
             }
@@ -36,7 +36,7 @@ namespace CertRobo.Shared
                 _currentTheme = await _jsRuntime.InvokeAsync<string>("theme.toggle");
                 NotifyThemeChanged();
             }
-            catch (Exception ex)
+            catch (JSException ex)
             {
                 Console.WriteLine($"Error toggling theme: {ex.Message}");
             }
@@ -52,7 +52,7 @@ namespace CertRobo.Shared
                 _currentTheme = await _jsRuntime.InvokeAsync<string>("theme.set", theme);
                 NotifyThemeChanged();
             }
-            catch (Exception ex)
+            catch (JSException ex)
             {
                 Console.WriteLine($"Error setting theme: {ex.Message}");
             }
