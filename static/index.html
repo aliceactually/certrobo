@@ -1,72 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
 <head>
-<style type="text/css">
-    .auto-style1 {
-        text-align: center;
-    }
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ffffff" />
+    <title>CertRobo - Certificate Authority Service</title>
+    <style type="text/css">
+        :root[data-theme="light"],
+        :root:not([data-theme]) {
+            --bg-color: #ffffff;
+            --text-color: #212529;
+            --border-color: #dee2e6;
+            --link-color: #0071c1;
+            --link-hover: #0056b3;
+            --card-bg: #f8f9fa;
+        }
 
-    .auto-style2 {
-        text-align: center;
-        font-family: Verdana, Geneva, Tahoma, sans-serif;
-    }
+        :root[data-theme="dark"] {
+            --bg-color: #1a1a1a;
+            --text-color: #e0e0e0;
+            --border-color: #404040;
+            --link-color: #66b3ff;
+            --link-hover: #99ccff;
+            --card-bg: #2d2d2d;
+        }
 
-    .auto-style3 {
-        font-family: Verdana, Geneva, Tahoma, sans-serif;
-    }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
 
-    .auto-style4 {
-        font-family: Verdana, Geneva, Tahoma, sans-serif;
-        border-width: 0px;
-    }
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: Verdana, Geneva, Tahoma, sans-serif;
+            transition: background-color 0.3s ease, color 0.3s ease;
+        }
 
-    .auto-style5 {
-        text-align: center;
-        font-family: Verdana, Geneva, Tahoma, sans-serif;
-        font-size: x-large;
-    }
-</style>
+        header {
+            display: table;
+            width: 100%;
+            border-collapse: collapse;
+            background-color: var(--card-bg);
+            border-bottom: 1px solid var(--border-color);
+            transition: background-color 0.3s ease, border-color 0.3s ease;
+        }
+
+        .header-title {
+            display: table-cell;
+            width: 50%;
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: var(--text-color);
+            padding: 1rem 2rem;
+            vertical-align: middle;
+            text-align: left;
+        }
+
+        .header-toggle-cell {
+            display: table-cell;
+            width: 50%;
+            padding: 1rem 2rem;
+            vertical-align: middle;
+            text-align: right;
+        }
+
+        .theme-toggle {
+            background: none;
+            border: none;
+            padding: 0.5rem;
+            cursor: pointer;
+            font-size: 1.5rem;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            transition: background-color 0.3s ease, transform 0.2s ease;
+            color: var(--text-color);
+        }
+
+        .theme-toggle:hover {
+            background-color: var(--border-color);
+            transform: scale(1.1);
+        }
+
+        .theme-toggle:active {
+            transform: scale(0.95);
+        }
+
+        main {
+            padding: 2rem 1rem;
+        }
+
+        .content-table {
+            margin: 0 auto;
+            border-collapse: collapse;
+        }
+
+        .content-table td {
+            padding: 1rem;
+            text-align: center;
+        }
+
+        .content-table img {
+            display: block;
+            border: none;
+        }
+
+        .title-row {
+            font-size: x-large;
+            font-weight: bold;
+            color: var(--text-color);
+        }
+
+        a {
+            color: var(--link-color);
+            text-decoration: none;
+            transition: color 0.3s ease;
+        }
+
+        a:hover {
+            color: var(--link-hover);
+        }
+    </style>
 </head>
 
-<table align="center">
-    <tr>
-        <td class="auto-style1">
-            <img alt="" class="auto-style3" src="images/robo.png" height="320" width="320">
-        </td>
-    </tr>
-    <tr>
-        <td class="auto-style5">
-            <b>CERTROBO EXISTS TO SERVE</b>
-        </td>
-    </tr>
-</table>
-<table align="center">
-    <tr height="24" />
-    <tr>
-        <td class="auto-style1">
-            <a href="/certsrv">
-                <img alt="" class="auto-style4" height="192" src="images/key.png" width="192">
-            </a>
-        </td>
-        <td class="auto-style2">
-            <a href="rootca.crt">
-                <img alt="" class="auto-style4" height="192" src="images/p7b.png" width="192">
-            </a>
-        </td>
-        <td class="auto-style2">
-            <a href="rootca.p12">
-                <img alt="" class="auto-style4" height="192" src="images/p12.png" width="192">
-            </a>
-        </td>
-        <td class="auto-style2">
-            <a href="http://ca.contoso.com/ocsp">
-                <img alt="" class="auto-style4" height="192" src="images/crl.png" width="192">
-            </a>
-        </td>
-    </tr>
-    <tr>
-        <td class="auto-style2">Certificate generator</td>
-        <td class="auto-style2">Root certificate<br>P7B (Base64) format</td>
-        <td class="auto-style2">Root certificate<br>P12 (binary) format</td>
-        <td class="auto-style2">Certificate Revocation List</td>
-    </tr>
-</table>
-<br class="auto-style3">
+<body>
+    <header>
+        <div class="header-title">CertRobo</div>
+        <div class="header-toggle-cell">
+            <button class="theme-toggle" id="themeToggle" title="Toggle dark mode">🌙</button>
+        </div>
+    </header>
+
+    <main>
+        <table class="content-table">
+            <tr>
+                <td>
+                    <img alt="Robot mascot" src="images/robo.png" height="320" width="320">
+                </td>
+            </tr>
+            <tr>
+                <td class="title-row">
+                    <b>CERTROBO EXISTS TO SERVE</b>
+                </td>
+            </tr>
+        </table>
+        <table class="content-table">
+            <tr>
+                <td><a href="/certsrv">
+                        <img alt="Certificate generator" height="192" src="images/key.png" width="192"></a></td>
+                <td><a href="rootca.crt">
+                        <img alt="Root certificate P7B format" height="192" src="images/p7b.png" width="192"></a></td>
+                <td><a href="rootca.p12">
+                        <img alt="Root certificate P12 format" height="192" src="images/p12.png" width="192"></a></td>
+                <td>
+                    <a href="http://ca.contoso.com/ocsp">
+                        <img alt="Certificate Revocation List" height="192" src="images/crl.png" width="192"></a></td>
+            </tr>
+            <tr>
+                <td>Certificate generator</td>
+                <td>Root certificate<br>P7B (Base64) format</td>
+                <td>Root certificate<br>P12 (binary) format</td>
+                <td>Certificate Revocation List</td>
+            </tr>
+        </table>
+    </main>
+
+    <script>
+        // Standalone dark mode implementation for static page
+        const THEME_KEY = 'certrobo-theme';
+        const LIGHT = 'light';
+        const DARK = 'dark';
+
+        function getOSPreference() {
+            return window.matchMedia('(prefers-color-scheme: dark)').matches ? DARK : LIGHT;
+        }
+
+        function updateThemeIcon() {
+            const themeToggle = document.getElementById('themeToggle');
+            if (themeToggle) {
+                const current = document.documentElement.getAttribute('data-theme') || LIGHT;
+                themeToggle.textContent = current === LIGHT ? '🌙' : '☀️';
+            }
+        }
+
+        function setTheme(theme) {
+            document.documentElement.setAttribute('data-theme', theme);
+            localStorage.setItem(THEME_KEY, theme);
+            updateThemeIcon();
+            const meta = document.querySelector('meta[name="theme-color"]');
+            if (meta) {
+                meta.content = theme === DARK ? '#1a1a1a' : '#ffffff';
+            }
+        }
+
+        function toggleTheme() {
+            const current = document.documentElement.getAttribute('data-theme') || LIGHT;
+            const newTheme = current === LIGHT ? DARK : LIGHT;
+            setTheme(newTheme);
+        }
+
+        function initializeTheme() {
+            const savedTheme = localStorage.getItem(THEME_KEY);
+            const theme = savedTheme || getOSPreference();
+            setTheme(theme);
+        }
+
+        // Initialize theme on page load
+        document.addEventListener('DOMContentLoaded', initializeTheme);
+
+        // Set up theme toggle button
+        const themeToggle = document.getElementById('themeToggle');
+        if (themeToggle) {
+            themeToggle.addEventListener('click', toggleTheme);
+        }
+
+        // Watch for OS theme changes (only if user hasn't set a preference)
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+            if (!localStorage.getItem(THEME_KEY)) {
+                setTheme(e.matches ? DARK : LIGHT);
+            }
+        });
+    </script>
+</body>
+</html>

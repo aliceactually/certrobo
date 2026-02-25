@@ -7,12 +7,25 @@
 <div class="page">
 
     <main>
-        <div class="top-row px-4 auth">
-            <LoginDisplay />
-            <button class="theme-toggle" @onclick="ToggleTheme" title="Toggle dark mode">
-                <span class="theme-icon">🌙</span>
-            </button>
-        </div>
+        <table class="top-row auth">
+            <tr>
+                <td class="auth-cell">
+                    <AuthorizeView>
+                        <Authorized>
+                            <p>Hello @context.User.Identity?.Name</p>
+                        </Authorized>
+                        <NotAuthorized>
+                            <p>Not Authorized</p>
+                        </NotAuthorized>
+                    </AuthorizeView>
+                </td>
+                <td class="toggle-cell">
+                    <button class="theme-toggle" @onclick="ToggleTheme" title="Toggle dark mode">
+                        <span class="theme-icon">🌙</span>
+                    </button>
+                </td>
+            </tr>
+        </table>
         <article class="content px-4">
             @Body
         </article>

@@ -12,6 +12,31 @@ main {
     background-image: linear-gradient(180deg, rgb(5, 39, 103) 0%, #3a0647 70%);
 }
 
+.top-row {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.auth-cell {
+    width: 50%;
+    text-align: left;
+    vertical-align: middle;
+    padding: 0.5rem 1rem;
+}
+
+.toggle-cell {
+    width: 50%;
+    text-align: right;
+    vertical-align: middle;
+    padding: 0.5rem 1rem;
+}
+
+.top-row p {
+    margin: 0;
+    color: var(--text-color);
+    transition: color 0.3s ease;
+}
+
     .top-row ::deep a, .top-row .btn-link {
         white-space: nowrap;
         margin-left: 1.5rem;
@@ -23,14 +48,6 @@ main {
     }
 
 @media (max-width: 640.98px) {
-    .top-row:not(.auth) {
-        display: none;
-    }
-
-    .top-row.auth {
-        justify-content: space-between;
-    }
-
     .top-row a, .top-row .btn-link {
         margin-left: 0;
     }
