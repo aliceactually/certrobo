@@ -187,14 +187,18 @@
             }
         }
 
-        function setTheme(theme) {
+        function applyTheme(theme) {
             document.documentElement.setAttribute('data-theme', theme);
-            localStorage.setItem(THEME_KEY, theme);
             updateThemeIcon();
             const meta = document.querySelector('meta[name="theme-color"]');
             if (meta) {
                 meta.content = theme === DARK ? '#1a1a1a' : '#ffffff';
             }
+        }
+
+        function setTheme(theme) {
+            applyTheme(theme);
+            localStorage.setItem(THEME_KEY, theme);
         }
 
         function toggleTheme() {
@@ -205,23 +209,23 @@
 
         function initializeTheme() {
             const savedTheme = localStorage.getItem(THEME_KEY);
-            const theme = savedTheme || getOSPreference();
-            setTheme(theme);
+            if (savedTheme) {
+                applyTheme(savedTheme);
+            } else {
+                applyTheme(getOSPreference());
+            }
         }
 
-        // Initialize theme on page load
-        document.addEventListener('DOMContentLoaded', initializeTheme);
+        // Initialize theme immediately (script is at end of body, DOM is ready)
+        initializeTheme();
 
         // Set up theme toggle button
-        const themeToggle = document.getElementById('themeToggle');
-        if (themeToggle) {
-            themeToggle.addEventListener('click', toggleTheme);
-        }
+        document.getElementById('themeToggle')?.addEventListener('click', toggleTheme);
 
         // Watch for OS theme changes (only if user hasn't set a preference)
         window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
             if (!localStorage.getItem(THEME_KEY)) {
-                setTheme(e.matches ? DARK : LIGHT);
+                applyTheme(e.matches ? DARK : LIGHT);
             }
         });
     </script>

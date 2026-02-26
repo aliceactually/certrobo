@@ -21,9 +21,12 @@
                     </AuthorizeView>
                 </td>
                 <td class="toggle-cell">
-                    <button class="theme-toggle" @onclick="ToggleTheme" title="Toggle dark mode">
-                        <span class="theme-icon">@(ThemeService.CurrentTheme == "dark" ? "☀️" : "🌙")</span>
-                    </button>
+                    @if (_initialized)
+                    {
+                        <button class="theme-toggle" @onclick="ToggleTheme" title="Toggle dark mode">
+                            <span class="theme-icon">@(ThemeService.CurrentTheme == "dark" ? "☀️" : "🌙")</span>
+                        </button>
+                    }
                 </td>
             </tr>
         </table>
@@ -43,6 +46,7 @@
             await ThemeService.InitializeThemeAsync();
             ThemeService.OnThemeChanged += StateHasChanged;
             _initialized = true;
+            StateHasChanged();
         }
     }
 
