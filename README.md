@@ -23,7 +23,13 @@ The elements in this file are as follows:
 * Template2048: The certificate template that will be used to issue RSA 2048 certificates.
 * Template384: The certificate template that will be used to issue ECDSA 384 certificates.
 * Template256: The certificate template that will be used to issue ECDSA 256 certificates.
-* Group: The group that CertRobo will issue certificates to, in the format "DOMAIN\Group".
+* Groups: Contains one or more Group elements, each defining an AD group and the domains it may issue certificates for.
+  * Group: A group/domain authorization entry.
+    * Name: The AD group, in the format "DOMAIN\Group".
+    * Domains: Contains one or more Domain elements.
+      * Domain: A domain the group is allowed to issue certificates for. Wildcard patterns are supported: `*.contoso.com` allows any 
+        subdomain of contoso.com (including wildcard certs like `*.contoso.com`). A bare domain like `contoso.com` matches only that
+        exact domain. A single `*` allows all domains.
 * Defaults: These are X.509 attributes used by autofill, and must comply with RFC 5280 Appendix A.
 * Country: Required. This must be an ISO 3166 Alpha-2 country code.
 * StateOrProvince: Required. The state or province of the issuer. Do not abbreviate.

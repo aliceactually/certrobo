@@ -4,7 +4,21 @@
 	<Template384>CertRoboECDSA384</Template384>
 	<Template2048>CertRoboRSA2048</Template2048>
 	<Template4096>CertRoboRSA4096</Template4096>
-	<Group>CONTOSO\CertRobo Certificate Issuers</Group>
+	<Groups>
+		<Group>
+			<Name>CONTOSO\Web Server Admins</Name>
+			<Domains>
+				<Domain>contoso.com</Domain>
+				<Domain>*.contoso.com</Domain>
+			</Domains>
+		</Group>
+		<Group>
+			<Name>CONTOSO\DevOps Team</Name>
+			<Domains>
+				<Domain>*.dev.contoso.com</Domain>
+			</Domains>
+		</Group>
+	</Groups>
 	<Defaults>
 		<Country>US</Country>
 		<StateOrProvince>Washington</StateOrProvince>

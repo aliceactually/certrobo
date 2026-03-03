@@ -1,7 +1,11 @@
 ﻿@page "/"
 @attribute [Authorize]
 @using Microsoft.AspNetCore.Components.Authorization
+@using Org.BouncyCastle.Asn1
+@using Org.BouncyCastle.Asn1.Pkcs
 @using Org.BouncyCastle.Asn1.X509
+@using Org.BouncyCastle.OpenSsl
+@using Org.BouncyCastle.Pkcs
 @using Org.BouncyCastle.X509
 @using System.Globalization
 @using System.IO
@@ -213,9 +217,44 @@
             ShowErrorDialogue("You must select key strength before generating a key pair");
             return;
         }
-        KeyPair key = crypto.KeyGen((int)keyBits);
-        privateKey = key.Private;
-        publicKey = key.Public;
+
+        using CancellationTokenSource cts = new();
+        Task animationTask = Task.Run(async () =>
+        {
+            int dots = 0;
+            while (!cts.Token.IsCancellationRequested)
+            {
+                dots = (dots % 3) + 1;
+                string text = "Processing" + new string('.', dots);
+                privateKey = text;
+                publicKey = text;
+                await InvokeAsync(StateHasChanged);
+                try { await Task.Delay(500, cts.Token); }
+                catch (TaskCanceledException) { break; }
+            }
+        });
+
+        KeyPair? result = null;
+        Exception? error = null;
+        int bits = (int)keyBits;
+        await Task.Run(() =>
+        {
+            try { result = crypto.KeyGen(bits); }
+            catch (Exception x) { error = x; }
+        });
+
+        cts.Cancel();
+        await animationTask;
+
+        if (error != null)
+        {
+            privateKey = "";
+            publicKey = "";
+            ShowErrorDialogue(error.Message);
+            return;
+        }
+        privateKey = result!.Private;
+        publicKey = result!.Public;
     }
 
     private async Task DeriveClick()
@@ -395,6 +434,60 @@
         }
     }
 
+    private static bool DomainMatchesPattern(string domain, string pattern)
+    {
+        if (pattern == "*") return true;
+        if (pattern.StartsWith("*."))
+        {
+            string suffix = pattern[1..]; // e.g. ".contoso.com"
+            return domain.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)
+                || domain.Equals(suffix[1..], StringComparison.OrdinalIgnoreCase);
+        }
+        return domain.Equals(pattern, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static List<string> GetDomainsFromCsr(string csrPem)
+    {
+        List<string> domains = new();
+        Pkcs10CertificationRequest decoded = (Pkcs10CertificationRequest)new PemReader(new StringReader(csrPem)).ReadObject();
+        CertificationRequestInfo info = decoded.GetCertificationRequestInfo();
+
+        // Extract CN
+        var oids = info.Subject.GetOidList();
+        var values = info.Subject.GetValueList();
+        for (int i = 0; i < oids.Count; i++)
+        {
+            if (X509Name.CN.Equals(oids[i])) { domains.Add((string)values[i]!); }
+        }
+
+        // Extract SANs from extension request attributes
+        Asn1Set attributes = info.Attributes;
+        if (attributes != null)
+        {
+            foreach (Asn1Encodable attr in attributes)
+            {
+                AttributePkcs pkcsAttr = AttributePkcs.GetInstance(attr);
+                if (PkcsObjectIdentifiers.Pkcs9AtExtensionRequest.Equals(pkcsAttr.AttrType))
+                {
+                    foreach (Asn1Encodable extSet in pkcsAttr.AttrValues)
+                    {
+                        X509Extensions extensions = X509Extensions.GetInstance(extSet);
+                        X509Extension sanExt = extensions.GetExtension(X509Extensions.SubjectAlternativeName);
+                        if (sanExt != null)
+                        {
+                            GeneralNames sans = GeneralNames.GetInstance(Asn1OctetString.GetInstance(sanExt.Value).GetOctets());
+                            foreach (GeneralName gn in sans.GetNames())
+                            {
+                                if (gn.TagNo == GeneralName.DnsName) { domains.Add(gn.Name.ToString()!); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return domains.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
     private async Task RequestClick()
     {
         AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
@@ -402,21 +495,43 @@
         IEnumerable<Claim> claims = Enumerable.Empty<Claim>();
         if (user.Identity is not null) { if (user.Identity.IsAuthenticated) { claims = user.Claims.Where(q => q.Type == ClaimTypes.GroupSid); } }
 
-        // Read settings.xml and determine which group is allowed to issue certificates. 
+        // Read settings.xml and determine which groups are allowed to issue certificates for which domains.
         // Doing this at every attempt allows for changes to settings.xml without restarting the application.
         XElement root = settings.Root ?? new XElement("null");
         if (root.Value == "null") { ShowErrorDialogue("Could not parse settings.xml"); return; }
-        string group = Enumerable.FirstOrDefault(root.Elements("Group"), new XElement("null")).Value;
-        bool auth = false;
+
+        // Resolve the user's AD group names from their claims
+        HashSet<string> userGroups = new(StringComparer.OrdinalIgnoreCase);
         foreach (Claim claim in claims)
         {
-            string name = new SecurityIdentifier(claim.Value).Translate(typeof(NTAccount)).ToString();
-            if (string.Equals(name, group, StringComparison.OrdinalIgnoreCase)) { auth = true; }
+            try
+            {
+                string name = new SecurityIdentifier(claim.Value).Translate(typeof(NTAccount)).ToString();
+                userGroups.Add(name);
+            }
+            catch { /* skip SIDs that cannot be resolved */ }
         }
-        if (!auth)
+
+        // Collect all allowed domain patterns from groups the user belongs to
+        List<string> allowedPatterns = new();
+        XElement? groupsElement = root.Element("Groups");
+        if (groupsElement != null)
         {
-            ShowErrorDialogue("You are not authorised to request certificates");
-            return;
+            foreach (XElement groupElement in groupsElement.Elements("Group"))
+            {
+                string groupName = groupElement.Element("Name")?.Value ?? string.Empty;
+                if (userGroups.Contains(groupName))
+                {
+                    XElement? domainsElement = groupElement.Element("Domains");
+                    if (domainsElement != null)
+                    {
+                        foreach (XElement domain in domainsElement.Elements("Domain"))
+                        {
+                            allowedPatterns.Add(domain.Value);
+                        }
+                    }
+                }
+            }
         }
 
         if (string.IsNullOrEmpty(csr))
@@ -424,11 +539,55 @@
             ShowErrorDialogue("You must provide a CSR before requesting a certificate");
             return;
         }
-        try { certificate = CryptoFactory.RequestCert(csr); }
-        catch (Exception x)
+
+        // Extract all domains from the CSR and verify each one is allowed
+        List<string> requestedDomains;
+        try { requestedDomains = GetDomainsFromCsr(csr); }
+        catch (Exception)
         {
-            ShowErrorDialogue(x.Message);
+            ShowErrorDialogue("Could not parse the CSR to verify requested domains");
+            return;
         }
+
+        List<string> deniedDomains = requestedDomains.Where(domain => !allowedPatterns.Any(pattern => DomainMatchesPattern(domain, pattern))).ToList();
+        if (deniedDomains.Count > 0)
+        {
+            ShowErrorDialogue("You are not authorised to request certificates for: " + string.Join(", ", deniedDomains));
+            return;
+        }
+
+        using CancellationTokenSource cts = new();
+        Task animationTask = Task.Run(async () =>
+        {
+            int dots = 0;
+            while (!cts.Token.IsCancellationRequested)
+            {
+                dots = (dots % 3) + 1;
+                certificate = "Processing" + new string('.', dots);
+                await InvokeAsync(StateHasChanged);
+                try { await Task.Delay(500, cts.Token); }
+                catch (TaskCanceledException) { break; }
+            }
+        });
+
+        string? result = null;
+        Exception? error = null;
+        await Task.Run(() =>
+        {
+            try { result = CryptoFactory.RequestCert(csr); }
+            catch (Exception x) { error = x; }
+        });
+
+        cts.Cancel();
+        await animationTask;
+
+        if (error != null)
+        {
+            certificate = "";
+            ShowErrorDialogue(error.Message);
+            return;
+        }
+        certificate = result ?? "";
     }
 
     private async Task ExportClick()
