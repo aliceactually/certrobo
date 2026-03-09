@@ -47,7 +47,7 @@ chained certificates.
 The file "static/index.html" should be slightly modified to point to
 your OCSP responder.
 
-## License
+## Licence
 
 CertRobo is Copyright © 2022-2026 Alice Kallista Saunier. All rights
 reserved. The author gratefully acknowledges the support of Xactly
