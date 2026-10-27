@@ -1,6 +1,7 @@
 using CertRobo.Data;
 using CertRobo.Models;
 using CertRobo.Services;
+using Microsoft.Data.Sqlite;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -80,6 +81,20 @@ public class StandaloneCaAndIdentityTests : IDisposable
         CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
         db.Database.EnsureCreated();
         return sp;
+    }
+
+    [Fact]
+    public async Task SqliteRuntime_MeetsSecurityPatchFloor()
+    {
+        // CVE-2025-6965 was fixed in 3.50.2. Check the loaded engine, not package metadata.
+        await using SqliteConnection connection = new("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = "SELECT sqlite_version()";
+        string versionText = (string)(await command.ExecuteScalarAsync())!;
+
+        Assert.True(Version.TryParse(versionText, out Version? version), $"Unrecognised SQLite version: {versionText}");
+        Assert.True(version >= new Version(3, 50, 2), $"SQLite {versionText} is below the CVE-2025-6965 patch floor (3.50.2).");
     }
 
     [Fact]
