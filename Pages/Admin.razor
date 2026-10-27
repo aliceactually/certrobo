@@ -1,0 +1,1405 @@
+@page "/admin"
+@attribute [Authorize(Roles = AppRoles.Administrator)]
+@using CertRobo.Data
+@using CertRobo.Models
+@using CertRobo.Services
+@using Microsoft.Extensions.Configuration
+@using System.Security.Claims
+@inject AccountManagementService AccountService
+@inject CertificateAuthorityService CaService
+@inject BackupRestoreService BackupService
+@inject LegacySettingsMigrationService MigrationService
+@inject IConfiguration Configuration
+@inject IWebHostEnvironment HostEnvironment
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject IJSRuntime JS
+@inject Radzen.NotificationService NotificationService
+
+<PageTitle>CertRobo — Administration</PageTitle>
+
+<div class="container-fluid admin-container">
+    <div class="admin-header">
+        <div>
+            <h1 class="h2 mb-1">CertRobo Administration</h1>
+            <p class="text-muted-theme mb-0">Manage Certificate Authority lifecycle, local accounts, domain issuance policies, and revocation state.</p>
+        </div>
+    </div>
+
+    @if (!string.IsNullOrEmpty(statusBannerMessage))
+    {
+        <div class="alert @(statusBannerIsError ? "alert-danger" : "alert-success") d-flex justify-content-between align-items-center mb-3" role="alert">
+            <span>@statusBannerMessage</span>
+            <button type="button" class="btn-close" aria-label="Dismiss notification" @onclick="() => statusBannerMessage = null"></button>
+        </div>
+    }
+
+    <!-- Section Navigation -->
+    <div class="admin-section-nav" role="tablist" aria-label="Administration sections" @onkeydown="OnTabKeyDownAsync">
+        <button type="button"
+                @ref="_tabCaRef"
+                role="tab"
+                id="tab-ca"
+                aria-controls="panel-ca"
+                aria-selected="@(activeSection == AdminSection.CertificateAuthority ? "true" : "false")"
+                tabindex="@(activeSection == AdminSection.CertificateAuthority ? 0 : -1)"
+                class="admin-tab-btn @(activeSection == AdminSection.CertificateAuthority ? "active" : "")"
+                @onclick="() => SelectSection(AdminSection.CertificateAuthority)">
+            <span>Certificate authority</span>
+            @if (activeCa == null)
+            {
+                <span class="badge bg-warning text-dark">Setup required</span>
+            }
+            else if (!IsCaUnlocked)
+            {
+                <span class="badge bg-danger">Locked</span>
+            }
+        </button>
+
+        <button type="button"
+                @ref="_tabUsersRef"
+                role="tab"
+                id="tab-users"
+                aria-controls="panel-users"
+                aria-selected="@(activeSection == AdminSection.UsersAndPermissions ? "true" : "false")"
+                tabindex="@(activeSection == AdminSection.UsersAndPermissions ? 0 : -1)"
+                class="admin-tab-btn @(activeSection == AdminSection.UsersAndPermissions ? "active" : "")"
+                @onclick="() => SelectSection(AdminSection.UsersAndPermissions)">
+            <span>Users and permissions</span>
+            <span class="badge bg-secondary">@users.Count</span>
+        </button>
+
+        <button type="button"
+                @ref="_tabCertsRef"
+                role="tab"
+                id="tab-certs"
+                aria-controls="panel-certs"
+                aria-selected="@(activeSection == AdminSection.Certificates ? "true" : "false")"
+                tabindex="@(activeSection == AdminSection.Certificates ? 0 : -1)"
+                class="admin-tab-btn @(activeSection == AdminSection.Certificates ? "active" : "")"
+                @onclick="() => SelectSection(AdminSection.Certificates)">
+            <span>Certificates</span>
+            <span class="badge bg-secondary">@certificates.Count</span>
+        </button>
+
+        <button type="button"
+                @ref="_tabSettingsRef"
+                role="tab"
+                id="tab-settings"
+                aria-controls="panel-settings"
+                aria-selected="@(activeSection == AdminSection.SettingsAndMaintenance ? "true" : "false")"
+                tabindex="@(activeSection == AdminSection.SettingsAndMaintenance ? 0 : -1)"
+                class="admin-tab-btn @(activeSection == AdminSection.SettingsAndMaintenance ? "active" : "")"
+                @onclick="() => SelectSection(AdminSection.SettingsAndMaintenance)">
+            <span>Settings and maintenance</span>
+        </button>
+    </div>
+
+    <!-- SECTION 1: CERTIFICATE AUTHORITY -->
+    @if (activeSection == AdminSection.CertificateAuthority)
+    {
+        <section id="panel-ca" role="tabpanel" aria-labelledby="tab-ca" tabindex="0">
+            <RadzenCard class="mb-4">
+                <div class="section-card-header">
+                    <div>
+                        <h3>Active Certificate Authority</h3>
+                        <p class="text-muted-theme small mb-0">Current signing identity, key protection state, and public CRL publication.</p>
+                    </div>
+                    @if (activeCa != null)
+                    {
+                        <div class="d-flex flex-wrap gap-2">
+                            <a href="/ca.crt" target="_blank" class="btn btn-sm btn-outline-primary">Download CA Chain (PEM)</a>
+                            <a href="/ca.crl" target="_blank" class="btn btn-sm btn-outline-primary">Download CRL (DER)</a>
+                            <a href="/ca.crl.pem" target="_blank" class="btn btn-sm btn-outline-secondary">Download CRL (PEM)</a>
+                        </div>
+                    }
+                </div>
+
+                @if (activeCa == null)
+                {
+                    <div class="alert alert-warning mb-3" role="status">
+                        <h4 class="h5 mb-1">No active Certificate Authority is configured yet</h4>
+                        <p class="mb-2">Choose whether to generate a new Root CA or import existing CA signing material below to begin issuing certificates.</p>
+                        <div class="d-flex flex-wrap gap-2">
+                            <button type="button"
+                                    class="btn @(caProvisionMode == CaProvisionMode.Create ? "btn-primary" : "btn-outline-primary")"
+                                    @onclick="() => caProvisionMode = CaProvisionMode.Create">
+                                Create New CA
+                            </button>
+                            <button type="button"
+                                    class="btn @(caProvisionMode == CaProvisionMode.Import ? "btn-primary" : "btn-outline-primary")"
+                                    @onclick="() => caProvisionMode = CaProvisionMode.Import">
+                                Import Existing CA (PEM)
+                            </button>
+                        </div>
+                    </div>
+                }
+                else
+                {
+                    <div class="ca-summary-grid">
+                        <div class="ca-stat-box">
+                            <div class="ca-stat-label">Authority Name &amp; Role</div>
+                            <div class="ca-stat-value">
+                                @activeCa.Name
+                                <span class="badge @(activeCa.IsIntermediate ? "bg-info text-dark" : "bg-primary") ms-1">
+                                    @(activeCa.IsIntermediate ? "Intermediate CA" : "Root CA")
+                                </span>
+                            </div>
+                        </div>
+
+                        <div class="ca-stat-box">
+                            <div class="ca-stat-label">Signing Key State</div>
+                            <div class="ca-stat-value">
+                                @if (IsCaUnlocked)
+                                {
+                                    <span class="badge bg-success">Unlocked in memory</span>
+                                }
+                                else
+                                {
+                                    <span class="badge bg-danger">Locked — passphrase required</span>
+                                }
+                            </div>
+                        </div>
+
+                        <div class="ca-stat-box">
+                            <div class="ca-stat-label">Validity Window (UTC)</div>
+                            <div class="ca-stat-value">@activeCa.NotBeforeUtc.ToString("yyyy-MM-dd") to @activeCa.NotAfterUtc.ToString("yyyy-MM-dd")</div>
+                        </div>
+
+                        <div class="ca-stat-box">
+                            <div class="ca-stat-label">Serial &amp; CRL Continuity</div>
+                            <div class="ca-stat-value">Last Serial: @activeCa.LastAllocatedSerial &middot; CRL #@activeCa.LastCrlNumber</div>
+                        </div>
+                    </div>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <div class="operation-panel">
+                                <h4>Signing Key Custody</h4>
+                                <p class="text-muted-theme small mb-2">
+                                    Provide the storage passphrase to unlock the encrypted PKCS#8 CA private key in runtime memory.
+                                </p>
+                                <div class="mb-2">
+                                    <label class="form-label" for="ca-unlock-passphrase">CA Key Passphrase</label>
+                                    <div class="d-flex flex-wrap gap-2">
+                                        <input id="ca-unlock-passphrase"
+                                               class="form-control"
+                                               style="max-width: 320px;"
+                                               type="password"
+                                               autocomplete="off"
+                                               @bind="unlockPassphrase" />
+                                        <RadzenButton Text="Unlock CA" Click="@UnlockCaClick" />
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="col-md-6">
+                            <div class="operation-panel">
+                                <h4>Certificate Revocation List (CRL) Publication</h4>
+                                <p class="text-muted-theme small mb-2">
+                                    Sign and publish a fresh X.509 v2 CRL immediately. Requires the active CA signing key to be unlocked.
+                                </p>
+                                <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3">
+                                    <span class="small text-muted-theme">Current published sequence: <strong>CRL #@activeCa.LastCrlNumber</strong></span>
+                                    <RadzenButton Text="Refresh CRL Now" Click="@RefreshCrlClick" Disabled="@(!IsCaUnlocked)" />
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="pt-3 border-top d-flex flex-wrap align-items-center justify-content-between gap-2">
+                        <div>
+                            <strong class="d-block">CA Lifecycle &amp; Rotation Actions</strong>
+                            <span class="text-muted-theme small">Create a new Root/Subordinate Intermediate CA or import external CA signing material.</span>
+                        </div>
+                        <div class="d-flex flex-wrap gap-2">
+                            <button type="button"
+                                    class="btn btn-sm @(caProvisionMode == CaProvisionMode.Create ? "btn-primary" : "btn-outline-secondary")"
+                                    aria-expanded="@(caProvisionMode == CaProvisionMode.Create ? "true" : "false")"
+                                    @onclick="() => ToggleCaProvisionMode(CaProvisionMode.Create)">
+                                @(caProvisionMode == CaProvisionMode.Create ? "Hide Create CA Form" : "Create New Root / Intermediate CA...")
+                            </button>
+                            <button type="button"
+                                    class="btn btn-sm @(caProvisionMode == CaProvisionMode.Import ? "btn-primary" : "btn-outline-secondary")"
+                                    aria-expanded="@(caProvisionMode == CaProvisionMode.Import ? "true" : "false")"
+                                    @onclick="() => ToggleCaProvisionMode(CaProvisionMode.Import)">
+                                @(caProvisionMode == CaProvisionMode.Import ? "Hide Import CA Form" : "Import Existing CA (PEM)...")
+                            </button>
+                        </div>
+                    </div>
+                }
+            </RadzenCard>
+
+            @if (caProvisionMode == CaProvisionMode.Create)
+            {
+                <RadzenCard class="mb-4" style="max-width: 920px;">
+                    <div class="section-card-header">
+                        <div>
+                            <h3>Create New CA (Root or Subordinate Intermediate)</h3>
+                            <p class="text-muted-theme small mb-0">Generates a new CA keypair encrypted at rest and publishes its initial CRL #1.</p>
+                        </div>
+                        @if (activeCa != null)
+                        {
+                            <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="() => caProvisionMode = CaProvisionMode.None">Cancel</button>
+                        }
+                    </div>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label" for="new-ca-name">CA Display Name</label>
+                            <input id="new-ca-name" class="form-control" @bind="newCaName" />
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label" for="new-ca-cn">Subject Common Name (CN)</label>
+                            <input id="new-ca-cn" class="form-control" @bind="newCaCommonName" />
+                        </div>
+                    </div>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-4">
+                            <label class="form-label" for="new-ca-keyspec">Key Algorithm &amp; Size</label>
+                            <select id="new-ca-keyspec" class="form-select" @bind="newCaKeySpec">
+                                <option value="ECDSA-384">ECDSA P-384</option>
+                                <option value="ECDSA-256">ECDSA P-256</option>
+                                <option value="RSA-4096">RSA 4096</option>
+                                <option value="RSA-2048">RSA 2048</option>
+                            </select>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label" for="new-ca-validity">Validity (Days)</label>
+                            <input id="new-ca-validity" class="form-control numeric-input-short" type="number" min="1" max="36500" @bind="newCaValidityDays" />
+                        </div>
+                        <div class="col-md-5">
+                            <label class="form-label" for="new-ca-passphrase">New CA Key Storage Passphrase</label>
+                            <input id="new-ca-passphrase" class="form-control" type="password" autocomplete="new-password" @bind="newCaPassphrase" />
+                        </div>
+                    </div>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label" for="new-ca-cdp">CRL Distribution Point URL (CDP)</label>
+                            <input id="new-ca-cdp" class="form-control" @bind="newCaCdpUrl" />
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label" for="new-ca-aia">Authority Information Access URL (AIA)</label>
+                            <input id="new-ca-aia" class="form-control" @bind="newCaAiaUrl" />
+                        </div>
+                    </div>
+
+                    <div class="form-check mb-3">
+                        <input class="form-check-input"
+                               type="checkbox"
+                               id="subordinateCheck"
+                               @bind="createAsSubordinateOfActive"
+                               disabled="@(activeCa == null || activeCa.IsIntermediate)" />
+                        <label class="form-check-label" for="subordinateCheck">
+                            Sign as a Subordinate Intermediate CA under the current active Root CA
+                            @if (activeCa != null && !activeCa.IsIntermediate)
+                            {
+                                <span class="text-muted-theme">(@activeCa.Name)</span>
+                            }
+                        </label>
+                    </div>
+
+                    <div class="d-flex justify-content-end gap-2">
+                        @if (activeCa != null)
+                        {
+                            <button type="button" class="btn btn-outline-secondary" @onclick="() => caProvisionMode = CaProvisionMode.None">Cancel</button>
+                        }
+                        <RadzenButton Text="Generate & Activate CA" Click="@CreateCaClick" />
+                    </div>
+                </RadzenCard>
+            }
+
+            @if (caProvisionMode == CaProvisionMode.Import)
+            {
+                <RadzenCard class="mb-4" style="max-width: 920px;">
+                    <div class="section-card-header">
+                        <div>
+                            <h3>Import Existing CA Material (PEM)</h3>
+                            <p class="text-muted-theme small mb-0">Validates certificate/key match, CA BasicConstraints, and chain before encrypting the signing key at rest.</p>
+                        </div>
+                        @if (activeCa != null)
+                        {
+                            <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="() => caProvisionMode = CaProvisionMode.None">Cancel</button>
+                        }
+                    </div>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label" for="import-ca-name">CA Display Name</label>
+                            <input id="import-ca-name" class="form-control" @bind="importCaName" />
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label" for="import-serial-floor">Initial Serial Floor</label>
+                            <input id="import-serial-floor" class="form-control numeric-input-short" type="number" min="1" @bind="importSerialFloor" />
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label" for="import-crl-floor">Initial CRL # Floor</label>
+                            <input id="import-crl-floor" class="form-control numeric-input-short" type="number" min="0" @bind="importCrlFloor" />
+                        </div>
+                    </div>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label" for="import-ca-cdp">CRL Distribution Point URL (CDP)</label>
+                            <input id="import-ca-cdp" class="form-control" @bind="newCaCdpUrl" />
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label" for="import-ca-aia">Authority Information Access URL (AIA)</label>
+                            <input id="import-ca-aia" class="form-control" @bind="newCaAiaUrl" />
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label" for="import-cert-pem">Issuer Certificate (PEM)</label>
+                        <textarea id="import-cert-pem"
+                                  class="form-control monospace-input"
+                                  rows="5"
+                                  placeholder="-----BEGIN CERTIFICATE-----..."
+                                  @bind="importCertPem"></textarea>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label" for="import-chain-pem">Parent / Root Chain Certificates (PEM — required when importing an Intermediate CA)</label>
+                        <textarea id="import-chain-pem"
+                                  class="form-control monospace-input"
+                                  rows="4"
+                                  placeholder="-----BEGIN CERTIFICATE-----..."
+                                  @bind="importChainPem"></textarea>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label" for="import-key-pem">CA Private Key (PEM)</label>
+                        <textarea id="import-key-pem"
+                                  class="form-control monospace-input"
+                                  rows="5"
+                                  placeholder="-----BEGIN PRIVATE KEY----- or -----BEGIN ENCRYPTED PRIVATE KEY-----..."
+                                  @bind="importKeyPem"></textarea>
+                    </div>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label" for="import-input-passphrase">Input Key Passphrase (leave blank if unencrypted)</label>
+                            <input id="import-input-passphrase" class="form-control" type="password" autocomplete="off" @bind="importInputPassphrase" />
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label" for="import-storage-passphrase">New Storage Passphrase (required to encrypt at rest)</label>
+                            <input id="import-storage-passphrase" class="form-control" type="password" autocomplete="new-password" @bind="importStoragePassphrase" />
+                        </div>
+                    </div>
+
+                    <div class="d-flex justify-content-end gap-2">
+                        @if (activeCa != null)
+                        {
+                            <button type="button" class="btn btn-outline-secondary" @onclick="() => caProvisionMode = CaProvisionMode.None">Cancel</button>
+                        }
+                        <RadzenButton Text="Import & Activate CA" Click="@ImportCaClick" />
+                    </div>
+                </RadzenCard>
+            }
+        </section>
+    }
+
+    <!-- SECTION 2: USERS AND PERMISSIONS -->
+    @if (activeSection == AdminSection.UsersAndPermissions)
+    {
+        <section id="panel-users" role="tabpanel" aria-labelledby="tab-users" tabindex="0">
+            <RadzenCard class="mb-4">
+                <div class="section-card-header">
+                    <div>
+                        <h3>Local Accounts</h3>
+                        <p class="text-muted-theme small mb-0">Select an account to manage its domain permissions, account status, or password reset.</p>
+                    </div>
+                    <button type="button"
+                            class="btn @(showCreateUserForm ? "btn-outline-secondary" : "btn-primary")"
+                            aria-expanded="@(showCreateUserForm ? "true" : "false")"
+                            @onclick="() => showCreateUserForm = !showCreateUserForm">
+                        @(showCreateUserForm ? "Close Add User Form" : "+ Add Local Account")
+                    </button>
+                </div>
+
+                @if (showCreateUserForm)
+                {
+                    <div class="operation-panel mb-4" style="max-width: 820px;">
+                        <h4>Create Local Account</h4>
+                        <div class="row g-3 mb-3">
+                            <div class="col-md-4">
+                                <label class="form-label" for="new-user-name">Username</label>
+                                <input id="new-user-name" class="form-control" autocomplete="off" @bind="newUserName" />
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label" for="new-user-email">Email Address (optional)</label>
+                                <input id="new-user-email" class="form-control" type="email" autocomplete="off" @bind="newUserEmail" />
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label" for="new-user-role">Role</label>
+                                <select id="new-user-role" class="form-select" @bind="newUserRole">
+                                    <option value="@AppRoles.Issuer">Issuer (request certificates)</option>
+                                    <option value="@AppRoles.Administrator">Administrator (full management)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="row g-3 mb-3">
+                            <div class="col-md-5">
+                                <label class="form-label" for="new-user-password">Initial Password (min 12 chars)</label>
+                                <input id="new-user-password" class="form-control" type="password" autocomplete="new-password" @bind="newUserPassword" />
+                            </div>
+                            <div class="col-md-7">
+                                <label class="form-label" for="new-user-domains">Initial Allowed Domain Patterns (comma-separated)</label>
+                                <input id="new-user-domains" class="form-control" @bind="newUserDomains" />
+                                <div class="form-text">Examples: <code>*.contoso.com</code> (subdomains + apex), <code>contoso.com</code> (apex only), or <code>*</code> (all domains).</div>
+                            </div>
+                        </div>
+
+                        <div class="d-flex justify-content-end gap-2">
+                            <button type="button" class="btn btn-outline-secondary" @onclick="() => showCreateUserForm = false">Cancel</button>
+                            <RadzenButton Text="Create User" Click="@CreateUserClick" />
+                        </div>
+                    </div>
+                }
+
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th scope="col">Username</th>
+                                <th scope="col">Roles</th>
+                                <th scope="col">Allowed Domain Rules</th>
+                                <th scope="col">Status</th>
+                                <th scope="col" class="text-end">Manage</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @if (users.Count == 0)
+                            {
+                                <tr>
+                                    <td colspan="5" class="text-center py-4 text-muted-theme">No local accounts found.</td>
+                                </tr>
+                            }
+                            else
+                            {
+                                @foreach (var u in users)
+                                {
+                                    bool isSelected = selectedUserId == u.Id;
+                                    <tr class="@(isSelected ? "user-row-selected" : "")">
+                                        <td>
+                                            <strong>@u.UserName</strong>
+                                            @if (!string.IsNullOrWhiteSpace(u.Email))
+                                            {
+                                                <div class="small text-muted-theme">@u.Email</div>
+                                            }
+                                        </td>
+                                        <td>@string.Join(", ", u.Roles)</td>
+                                        <td>
+                                            @if (u.DirectPermissions.Count == 0)
+                                            {
+                                                <span class="text-muted-theme small">None assigned</span>
+                                            }
+                                            else
+                                            {
+                                                <div class="d-flex flex-wrap gap-1">
+                                                    @foreach (var perm in u.DirectPermissions)
+                                                    {
+                                                        <span class="badge bg-secondary">@perm.DomainPattern (@perm.AllowedProfileId)</span>
+                                                    }
+                                                </div>
+                                            }
+                                        </td>
+                                        <td>
+                                            @if (u.IsDisabled)
+                                            {
+                                                <span class="badge bg-danger">Disabled</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="badge bg-success">Active</span>
+                                            }
+                                        </td>
+                                        <td class="text-end">
+                                            <button type="button"
+                                                    class="btn btn-sm @(isSelected ? "btn-primary" : "btn-outline-primary")"
+                                                    aria-pressed="@(isSelected ? "true" : "false")"
+                                                    @onclick="() => SelectUser(u.Id)">
+                                                @(isSelected ? "Managing" : "Manage Account")
+                                            </button>
+                                        </td>
+                                    </tr>
+                                }
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            </RadzenCard>
+
+            @if (SelectedUser != null)
+            {
+                var u = SelectedUser;
+                <RadzenCard class="mb-4">
+                    <div class="section-card-header">
+                        <div>
+                            <h3>Manage Account: @u.UserName</h3>
+                            <p class="text-muted-theme small mb-0">
+                                Roles: <strong>@string.Join(", ", u.Roles)</strong> &middot;
+                                Status: <strong>@(u.IsDisabled ? "Disabled" : "Active")</strong>
+                            </p>
+                        </div>
+                        <div class="d-flex flex-wrap gap-2">
+                            <button type="button"
+                                    class="btn btn-sm @(u.IsDisabled ? "btn-success" : "btn-warning")"
+                                    @onclick="() => ToggleUserDisabledClick(u)">
+                                @(u.IsDisabled ? "Enable Account" : "Disable Account")
+                            </button>
+                            <button type="button"
+                                    class="btn btn-sm @(showPasswordResetForSelectedUser ? "btn-secondary" : "btn-outline-secondary")"
+                                    aria-expanded="@(showPasswordResetForSelectedUser ? "true" : "false")"
+                                    @onclick="() => showPasswordResetForSelectedUser = !showPasswordResetForSelectedUser">
+                                @(showPasswordResetForSelectedUser ? "Cancel Password Reset" : "Reset Password...")
+                            </button>
+                        </div>
+                    </div>
+
+                    @if (showPasswordResetForSelectedUser)
+                    {
+                        <div class="operation-panel mb-4" style="max-width: 600px;">
+                            <h4>Reset Password for @u.UserName</h4>
+                            <p class="text-muted-theme small mb-2">
+                                Setting a new password immediately rotates the account's security stamp and invalidates active sessions.
+                            </p>
+                            <div class="mb-2">
+                                <label class="form-label" for="reset-user-password">New Password (min 12 chars)</label>
+                                <div class="d-flex flex-wrap gap-2">
+                                    <input id="reset-user-password"
+                                           class="form-control"
+                                           style="max-width: 320px;"
+                                           type="password"
+                                           autocomplete="new-password"
+                                           @bind="selectedUserNewPassword" />
+                                    <RadzenButton Text="Confirm Password Reset" Click="@(() => ResetUserPasswordClick(u.Id, u.UserName))" />
+                                </div>
+                            </div>
+                        </div>
+                    }
+
+                    <h4 class="h5 mb-2">Authorised Domain &amp; Profile Rules</h4>
+                    <p class="text-muted-theme small mb-3">
+                        <code>*.example.com</code> authorises any subdomain (including wildcard certificates) and the apex <code>example.com</code>.
+                        A bare domain <code>example.com</code> authorises only that exact name.
+                    </p>
+
+                    @if (u.DirectPermissions.Count == 0)
+                    {
+                        <p class="text-muted-theme fst-italic mb-3">This account currently has no domain permission rules assigned.</p>
+                    }
+                    else
+                    {
+                        <div class="d-flex flex-wrap gap-2 mb-3">
+                            @foreach (var perm in u.DirectPermissions)
+                            {
+                                <span class="permission-chip">
+                                    <span><strong>@perm.DomainPattern</strong> <small class="text-muted-theme">(profile: @perm.AllowedProfileId)</small></span>
+                                    <button type="button"
+                                            class="permission-remove-btn"
+                                            aria-label="@($"Remove domain permission {perm.DomainPattern} for {u.UserName}")"
+                                            title="Remove domain permission"
+                                            @onclick="() => RemovePermissionClick(perm.Id)">
+                                        &times;
+                                    </button>
+                                </span>
+                            }
+                        </div>
+                    }
+
+                    <div class="operation-panel" style="max-width: 760px;">
+                        <h4>Add Domain Permission Rule</h4>
+                        <div class="row g-3 align-items-end">
+                            <div class="col-md-5">
+                                <label class="form-label" for="add-domain-pattern">Domain Pattern</label>
+                                <input id="add-domain-pattern"
+                                       class="form-control"
+                                       placeholder="e.g. *.contoso.com or contoso.com"
+                                       @bind="selectedUserDomainPattern" />
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label" for="add-domain-profile">Allowed Profile</label>
+                                <select id="add-domain-profile" class="form-select" @bind="selectedUserAllowedProfile">
+                                    <option value="*">All TLS Server Profiles (*)</option>
+                                    @foreach (var prof in CertificateProfiles.All.Values)
+                                    {
+                                        <option value="@prof.ProfileId">@prof.DisplayName</option>
+                                    }
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <RadzenButton Text="Add Permission" Click="@(() => AddUserDomainClick(u.Id))" Style="width: 100%;" />
+                            </div>
+                        </div>
+                    </div>
+                </RadzenCard>
+            }
+        </section>
+    }
+
+    <!-- SECTION 3: CERTIFICATES -->
+    @if (activeSection == AdminSection.Certificates)
+    {
+        <section id="panel-certs" role="tabpanel" aria-labelledby="tab-certs" tabindex="0">
+            <RadzenCard class="mb-4">
+                <div class="section-card-header">
+                    <div>
+                        <h3>Issued Certificate Ledger &amp; Revocation</h3>
+                        <p class="text-muted-theme small mb-0">Search issued, revoked, or denied requests and revoke active certificates.</p>
+                    </div>
+                </div>
+
+                <div class="row g-2 align-items-end mb-3">
+                    <div class="col-md-6">
+                        <label class="form-label" for="cert-search-input">Filter by Common Name, SAN, Serial Number, or Requester</label>
+                        <input id="cert-search-input"
+                               class="form-control"
+                               placeholder="e.g. portal.contoso.com or serial hex"
+                               @bind="certSearchQuery" />
+                    </div>
+                    <div class="col-md-3">
+                        <label class="form-label" for="cert-status-filter">Status</label>
+                        <select id="cert-status-filter" class="form-select" @bind="certStatusFilterString">
+                            <option value="">All Statuses</option>
+                            <option value="Issued">Issued</option>
+                            <option value="Revoked">Revoked</option>
+                            <option value="Denied">Denied</option>
+                            <option value="Failed">Failed</option>
+                        </select>
+                    </div>
+                    <div class="col-md-3 d-flex gap-2">
+                        <RadzenButton Text="Search" Click="@LoadCertificatesAsync" />
+                        <button type="button" class="btn btn-outline-secondary" @onclick="ClearCertificateSearchAsync">Reset</button>
+                    </div>
+                </div>
+
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th scope="col">Serial Number</th>
+                                <th scope="col">Common Name &amp; SANs</th>
+                                <th scope="col">Profile</th>
+                                <th scope="col">Requester</th>
+                                <th scope="col">Status</th>
+                                <th scope="col">Valid Until (UTC)</th>
+                                <th scope="col" class="text-end">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @if (certificates.Count == 0)
+                            {
+                                <tr>
+                                    <td colspan="7" class="text-center py-4 text-muted-theme">
+                                        No certificate records match the current filter.
+                                    </td>
+                                </tr>
+                            }
+                            else
+                            {
+                                @foreach (var c in certificates)
+                                {
+                                    <tr>
+                                        <td><code>@c.SerialNumberHex</code></td>
+                                        <td>
+                                            <strong>@c.CommonName</strong>
+                                            @if (!string.IsNullOrWhiteSpace(c.SubjectAlternativeNamesCsv))
+                                            {
+                                                <div class="small text-muted-theme">SANs: @c.SubjectAlternativeNamesCsv</div>
+                                            }
+                                        </td>
+                                        <td><span class="small">@c.ProfileId</span></td>
+                                        <td>@c.RequestedByUserName</td>
+                                        <td>
+                                            @switch (c.Status)
+                                            {
+                                                case IssuanceStatus.Issued:
+                                                    <span class="badge bg-success">Issued</span>
+                                                    break;
+                                                case IssuanceStatus.Revoked:
+                                                    <span class="badge bg-danger">Revoked</span>
+                                                    break;
+                                                case IssuanceStatus.Denied:
+                                                    <span class="badge bg-warning text-dark">Denied</span>
+                                                    break;
+                                                default:
+                                                    <span class="badge bg-secondary">@c.Status</span>
+                                                    break;
+                                            }
+                                            @if (!string.IsNullOrWhiteSpace(c.FailureOrDenialReason))
+                                            {
+                                                <div class="small text-muted-theme mt-1">@c.FailureOrDenialReason</div>
+                                            }
+                                        </td>
+                                        <td>@(c.NotAfterUtc == default ? "—" : c.NotAfterUtc.ToString("yyyy-MM-dd"))</td>
+                                        <td class="text-end">
+                                            @if (c.Status == IssuanceStatus.Issued)
+                                            {
+                                                <button type="button"
+                                                        class="btn btn-sm btn-danger"
+                                                        @onclick="() => RevokeCertClick(c.Id)">
+                                                    Revoke
+                                                </button>
+                                            }
+                                            else if (c.Status == IssuanceStatus.Revoked && c.RevokedAtUtc.HasValue)
+                                            {
+                                                <span class="small text-muted-theme">Revoked @c.RevokedAtUtc.Value.ToString("yyyy-MM-dd")</span>
+                                            }
+                                        </td>
+                                    </tr>
+                                }
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            </RadzenCard>
+        </section>
+    }
+
+    <!-- SECTION 4: SETTINGS AND MAINTENANCE -->
+    @if (activeSection == AdminSection.SettingsAndMaintenance)
+    {
+        <section id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" tabindex="0">
+            <!-- Group 1: X.509 Subject Defaults -->
+            <RadzenCard class="mb-4" style="max-width: 920px;">
+                <div class="section-card-header">
+                    <div>
+                        <h3>X.509 Subject Defaults (Autofill)</h3>
+                        <p class="text-muted-theme small mb-0">
+                            Default subject attributes populated when users click "Autofill remaining" on the Certificate Tool page.
+                        </p>
+                    </div>
+                </div>
+
+                <div class="row g-3 mb-3">
+                    <div class="col-sm-3 col-md-2">
+                        <label class="form-label" for="defaults-country">Country (ISO-2)</label>
+                        <input id="defaults-country" class="form-control iso-country-input" maxlength="2" @bind="subjectDefaults.Country" />
+                    </div>
+                    <div class="col-sm-9 col-md-5">
+                        <label class="form-label" for="defaults-state">State or Province (full name)</label>
+                        <input id="defaults-state" class="form-control" @bind="subjectDefaults.StateOrProvince" />
+                    </div>
+                    <div class="col-md-5">
+                        <label class="form-label" for="defaults-locality">Locality / City (full name)</label>
+                        <input id="defaults-locality" class="form-control" @bind="subjectDefaults.Locality" />
+                    </div>
+                </div>
+
+                <div class="row g-3 mb-3">
+                    <div class="col-md-4">
+                        <label class="form-label" for="defaults-org">Organisation</label>
+                        <input id="defaults-org" class="form-control" @bind="subjectDefaults.Organisation" />
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label" for="defaults-ou">Organisational Unit</label>
+                        <input id="defaults-ou" class="form-control" @bind="subjectDefaults.OrganisationalUnit" />
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label" for="defaults-email">Email Address</label>
+                        <input id="defaults-email" class="form-control" type="email" @bind="subjectDefaults.EmailAddress" />
+                    </div>
+                </div>
+
+                <div class="d-flex justify-content-end">
+                    <RadzenButton Text="Save Subject Defaults" Click="@SaveDefaultsClick" />
+                </div>
+            </RadzenCard>
+
+            <!-- Group 2: Consistent Online Backup -->
+            <RadzenCard class="mb-4" style="max-width: 920px;">
+                <div class="section-card-header">
+                    <div>
+                        <h3>Consistent State Backup</h3>
+                        <p class="text-muted-theme small mb-0">
+                            Creates an online SQLite snapshot (<code>VACUUM INTO</code>) bundled with encrypted CA private keys (<code>*.p8.enc</code>) and Data Protection keys.
+                        </p>
+                    </div>
+                    <RadzenButton Text="Download Consistent Backup (.zip)" Click="@DownloadBackupClick" />
+                </div>
+                <p class="small text-muted-theme mb-0">
+                    Keep the CA unlock passphrase separate from the backup archive. To restore from the CLI:
+                    <code>./CertRobo --restore certrobo-backup.zip</code>.
+                </p>
+            </RadzenCard>
+
+            <!-- Group 3: Legacy Migration & Continuity Tools (revealed on demand) -->
+            <RadzenCard class="mb-4" style="max-width: 920px;">
+                <div class="section-card-header">
+                    <div>
+                        <h3>Legacy Migration &amp; CA Continuity Tools</h3>
+                        <p class="text-muted-theme small mb-0">
+                            One-time cutover utilities for inspecting legacy <code>settings.xml</code> rules or seeding revoked serials from an imported CA.
+                        </p>
+                    </div>
+                    <div class="d-flex flex-wrap gap-2">
+                        <button type="button"
+                                class="btn btn-sm @(showLegacySettingsInspector ? "btn-primary" : "btn-outline-secondary")"
+                                aria-expanded="@(showLegacySettingsInspector ? "true" : "false")"
+                                @onclick="() => showLegacySettingsInspector = !showLegacySettingsInspector">
+                            @(showLegacySettingsInspector ? "Hide settings.xml Inspector" : "Inspect Legacy settings.xml...")
+                        </button>
+                        <button type="button"
+                                class="btn btn-sm @(showLegacyRevocationSeeder ? "btn-primary" : "btn-outline-secondary")"
+                                aria-expanded="@(showLegacyRevocationSeeder ? "true" : "false")"
+                                @onclick="() => showLegacyRevocationSeeder = !showLegacyRevocationSeeder">
+                            @(showLegacyRevocationSeeder ? "Hide Revoked Serial Seeder" : "Seed Legacy Revoked Serial...")
+                        </button>
+                    </div>
+                </div>
+
+                @if (!showLegacySettingsInspector && !showLegacyRevocationSeeder)
+                {
+                    <p class="small text-muted-theme mb-0">
+                        Select a migration utility above when performing cutover from an existing AD CS or legacy CertRobo deployment.
+                    </p>
+                }
+
+                @if (showLegacySettingsInspector)
+                {
+                    <div class="operation-panel mb-3">
+                        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+                            <div>
+                                <h4 class="mb-0">Inspect Legacy <code>settings.xml</code></h4>
+                                <span class="small text-muted-theme">Imports X.509 defaults and generates a reviewable AD group &rarr; domain policy worksheet without guessing local accounts.</span>
+                            </div>
+                            <RadzenButton Text="Run Inspector & Import Defaults" Click="@InspectLegacySettingsClick" />
+                        </div>
+                        @if (!string.IsNullOrWhiteSpace(legacyWorksheetText))
+                        {
+                            <pre class="mt-2 mb-0 p-3 rounded worksheet-output">@legacyWorksheetText</pre>
+                        }
+                    </div>
+                }
+
+                @if (showLegacyRevocationSeeder)
+                {
+                    <div class="operation-panel">
+                        <h4>Seed Legacy Revoked Serial (Imported CA Continuity)</h4>
+                        <p class="small text-muted-theme mb-3">
+                            Record serial numbers that were revoked under an imported CA identity prior to cutover and immediately republish the signed CRL.
+                        </p>
+                        <div class="row g-3 align-items-end">
+                            <div class="col-md-4">
+                                <label class="form-label" for="seed-serial-hex">Serial Number (Hex)</label>
+                                <input id="seed-serial-hex" class="form-control monospace-input" placeholder="e.g. 01A2B3C4" @bind="seedSerialHex" />
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label" for="seed-common-name">Common Name (optional)</label>
+                                <input id="seed-common-name" class="form-control" placeholder="e.g. legacy.contoso.com" @bind="seedCommonName" />
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label" for="seed-reason-code">Revocation Reason</label>
+                                <select id="seed-reason-code" class="form-select" @bind="seedReasonCode">
+                                    <option value="0">0 — Unspecified</option>
+                                    <option value="1">1 — KeyCompromise</option>
+                                    <option value="4">4 — Superseded</option>
+                                    <option value="5">5 — CessationOfOperation</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="d-flex justify-content-end mt-3">
+                            <RadzenButton Text="Seed Revoked Serial & Update CRL" Click="@SeedRevokedSerialClick" />
+                        </div>
+                    </div>
+                }
+            </RadzenCard>
+        </section>
+    }
+</div>
+
+@code {
+    private enum AdminSection
+    {
+        CertificateAuthority,
+        UsersAndPermissions,
+        Certificates,
+        SettingsAndMaintenance
+    }
+
+    private enum CaProvisionMode
+    {
+        None,
+        Create,
+        Import
+    }
+
+    private static readonly AdminSection[] SectionOrder =
+    [
+        AdminSection.CertificateAuthority,
+        AdminSection.UsersAndPermissions,
+        AdminSection.Certificates,
+        AdminSection.SettingsAndMaintenance
+    ];
+
+    private ElementReference _tabCaRef;
+    private ElementReference _tabUsersRef;
+    private ElementReference _tabCertsRef;
+    private ElementReference _tabSettingsRef;
+
+    private AdminSection activeSection = AdminSection.CertificateAuthority;
+    private CaProvisionMode caProvisionMode = CaProvisionMode.None;
+
+    private CaAuthorityRecord? activeCa;
+    private IReadOnlyList<UserSummaryDto> users = [];
+    private IReadOnlyList<IssuedCertificateRecord> certificates = [];
+    private SubjectDefaultsConfig subjectDefaults = new();
+
+    private string? statusBannerMessage;
+    private bool statusBannerIsError;
+
+    // CA Unlock / Create / Import state
+    private string unlockPassphrase = "";
+    private string newCaName = "CertRobo Root CA";
+    private string newCaCommonName = "ca.contoso.com";
+    private string newCaKeySpec = "ECDSA-384";
+    private int newCaValidityDays = 3650;
+    private string newCaPassphrase = "";
+    private string newCaCdpUrl = "/ca.crl";
+    private string newCaAiaUrl = "/ca.crt";
+    private bool createAsSubordinateOfActive = false;
+
+    private string importCaName = "Imported CA";
+    private long importSerialFloor = 1000;
+    private long importCrlFloor = 0;
+    private string importCertPem = "";
+    private string importChainPem = "";
+    private string importKeyPem = "";
+    private string importInputPassphrase = "";
+    private string importStoragePassphrase = "";
+
+    // Users & Permissions state
+    private bool showCreateUserForm = false;
+    private string? selectedUserId;
+    private bool showPasswordResetForSelectedUser = false;
+    private string selectedUserNewPassword = "";
+    private string selectedUserDomainPattern = "";
+    private string selectedUserAllowedProfile = "*";
+
+    private string newUserName = "";
+    private string newUserEmail = "";
+    private string newUserPassword = "";
+    private string newUserRole = AppRoles.Issuer;
+    private string newUserDomains = "*.contoso.com";
+
+    // Certificates search/filter state
+    private string certSearchQuery = "";
+    private string certStatusFilterString = "";
+
+    // Settings & Maintenance state
+    private bool showLegacySettingsInspector = false;
+    private bool showLegacyRevocationSeeder = false;
+    private string legacyWorksheetText = "";
+    private string seedSerialHex = "";
+    private string seedCommonName = "";
+    private int seedReasonCode = 0;
+
+    private bool IsCaUnlocked => !string.IsNullOrEmpty(CaService.ResolveEffectivePassphrase());
+
+    private UserSummaryDto? SelectedUser =>
+        users.FirstOrDefault(u => u.Id == selectedUserId) ?? users.FirstOrDefault();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await ReloadAllAsync();
+        if (activeCa == null)
+        {
+            caProvisionMode = CaProvisionMode.Create;
+        }
+    }
+
+    private void SelectSection(AdminSection section)
+    {
+        activeSection = section;
+    }
+
+    private async Task OnTabKeyDownAsync(KeyboardEventArgs e)
+    {
+        int currentIndex = Array.IndexOf(SectionOrder, activeSection);
+        if (currentIndex < 0)
+        {
+            currentIndex = 0;
+        }
+
+        AdminSection? nextSection = e.Key switch
+        {
+            "ArrowRight" => SectionOrder[(currentIndex + 1) % SectionOrder.Length],
+            "ArrowLeft" => SectionOrder[(currentIndex - 1 + SectionOrder.Length) % SectionOrder.Length],
+            "Home" => SectionOrder[0],
+            "End" => SectionOrder[^1],
+            _ => null
+        };
+
+        if (nextSection.HasValue)
+        {
+            activeSection = nextSection.Value;
+            ElementReference targetRef = activeSection switch
+            {
+                AdminSection.CertificateAuthority => _tabCaRef,
+                AdminSection.UsersAndPermissions => _tabUsersRef,
+                AdminSection.Certificates => _tabCertsRef,
+                AdminSection.SettingsAndMaintenance => _tabSettingsRef,
+                _ => _tabCaRef
+            };
+
+            try
+            {
+                await targetRef.FocusAsync();
+            }
+            catch
+            {
+                // Ignore if focus occurs during disconnect
+            }
+        }
+    }
+
+    private void ToggleCaProvisionMode(CaProvisionMode mode)
+    {
+        caProvisionMode = caProvisionMode == mode ? CaProvisionMode.None : mode;
+    }
+
+    private void SelectUser(string userId)
+    {
+        selectedUserId = userId;
+        ResetSelectedUserEditorState();
+    }
+
+    private void ResetSelectedUserEditorState()
+    {
+        showPasswordResetForSelectedUser = false;
+        selectedUserNewPassword = "";
+        selectedUserDomainPattern = "";
+        selectedUserAllowedProfile = "*";
+    }
+
+    private async Task ReloadAllAsync()
+    {
+        activeCa = await CaService.GetActiveAuthorityAsync();
+        subjectDefaults = await AccountService.GetSubjectDefaultsAsync();
+        users = await AccountService.ListUsersAsync();
+        if (selectedUserId == null && users.Count > 0)
+        {
+            selectedUserId = users[0].Id;
+        }
+        await LoadCertificatesAsync();
+    }
+
+    private async Task LoadCertificatesAsync()
+    {
+        IssuanceStatus? statusFilter = null;
+        if (!string.IsNullOrWhiteSpace(certStatusFilterString)
+            && Enum.TryParse<IssuanceStatus>(certStatusFilterString, ignoreCase: true, out var parsed))
+        {
+            statusFilter = parsed;
+        }
+        certificates = await CaService.SearchCertificatesAsync(certSearchQuery, statusFilter);
+    }
+
+    private async Task ClearCertificateSearchAsync()
+    {
+        certSearchQuery = "";
+        certStatusFilterString = "";
+        await LoadCertificatesAsync();
+    }
+
+    private void Notify(Radzen.NotificationSeverity severity, string summary, string detail)
+    {
+        statusBannerIsError = severity == Radzen.NotificationSeverity.Error || severity == Radzen.NotificationSeverity.Warning;
+        statusBannerMessage = $"{summary}: {detail}";
+
+        NotificationService.Notify(new Radzen.NotificationMessage
+        {
+            Severity = severity,
+            Summary = summary,
+            Detail = detail,
+            Duration = 4000
+        });
+    }
+
+    private async Task DownloadBackupClick()
+    {
+        try
+        {
+            string appDataDir = Configuration["CertRobo:DataDirectory"]
+                ?? Path.Combine(HostEnvironment.ContentRootPath, "App_Data");
+            string sqliteDbPath = Configuration["CertRobo:SqliteFilePath"]
+                ?? Path.Combine(appDataDir, "certrobo.db");
+            string dpKeysDir = Path.Combine(appDataDir, "dataprotection-keys");
+
+            byte[] archiveBytes = await BackupService.CreateConsistentBackupArchiveAsync(sqliteDbPath, dpKeysDir);
+            string fileName = $"certrobo-backup-{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}.zip";
+            MemoryStream output = new(archiveBytes);
+            using DotNetStreamReference streamRef = new(output, false);
+            await JS.InvokeVoidAsync("downloadFileFromStream", fileName, streamRef);
+            Notify(Radzen.NotificationSeverity.Success, "Backup Ready", $"Downloaded {fileName}.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Backup Error", ex.Message);
+        }
+    }
+
+    private Task UnlockCaClick()
+    {
+        try
+        {
+            CaService.UnlockRuntimePassphrase(unlockPassphrase);
+            unlockPassphrase = "";
+            Notify(Radzen.NotificationSeverity.Success, "CA Unlocked", "CA passphrase set in runtime memory.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Error", ex.Message);
+        }
+        return Task.CompletedTask;
+    }
+
+    private async Task RefreshCrlClick()
+    {
+        try
+        {
+            var crl = await CaService.RefreshActiveCrlAsync();
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Success, "CRL Refreshed", $"Published CRL #{crl?.CrlNumber}.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "CRL Error", ex.Message);
+        }
+    }
+
+    private async Task CreateCaClick()
+    {
+        try
+        {
+            SubjectDefaultsConfig defaults = await AccountService.GetSubjectDefaultsAsync();
+            (CertificateKeyFamily family, int bits) = newCaKeySpec switch
+            {
+                "ECDSA-256" => (CertificateKeyFamily.Ecdsa, 256),
+                "ECDSA-384" => (CertificateKeyFamily.Ecdsa, 384),
+                "RSA-2048" => (CertificateKeyFamily.Rsa, 2048),
+                _ => (CertificateKeyFamily.Rsa, 4096)
+            };
+
+            CaAuthorityRecord? parent = createAsSubordinateOfActive ? activeCa : null;
+            await CaService.CreateSelfSignedOrIntermediateCaAsync(
+                newCaName,
+                newCaCommonName,
+                defaults.Country,
+                defaults.StateOrProvince,
+                defaults.Locality,
+                defaults.Organisation,
+                defaults.OrganisationalUnit,
+                family,
+                bits,
+                newCaValidityDays,
+                newCaPassphrase,
+                crlDistributionPointUrl: newCaCdpUrl,
+                authorityIssuerCertUrl: newCaAiaUrl,
+                parentAuthority: parent,
+                parentPassphrase: CaService.ResolveEffectivePassphrase() ?? newCaPassphrase);
+
+            newCaPassphrase = "";
+            caProvisionMode = CaProvisionMode.None;
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Success, "CA Created", $"Activated CA '{newCaName}'.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "CA Creation Error", ex.Message);
+        }
+    }
+
+    private async Task ImportCaClick()
+    {
+        try
+        {
+            await CaService.ImportCaAsync(
+                importCaName,
+                importCertPem,
+                string.IsNullOrWhiteSpace(importChainPem) ? null : importChainPem,
+                importKeyPem,
+                string.IsNullOrWhiteSpace(importInputPassphrase) ? null : importInputPassphrase,
+                importStoragePassphrase,
+                crlDistributionPointUrl: newCaCdpUrl,
+                authorityIssuerCertUrl: newCaAiaUrl,
+                initialSerialFloor: importSerialFloor,
+                initialCrlNumberFloor: importCrlFloor);
+
+            importKeyPem = "";
+            importInputPassphrase = "";
+            importStoragePassphrase = "";
+            caProvisionMode = CaProvisionMode.None;
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Success, "CA Imported", $"Imported and activated '{importCaName}'.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "CA Import Error", ex.Message);
+        }
+    }
+
+    private async Task SeedRevokedSerialClick()
+    {
+        AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        string actor = authState.User.Identity?.Name ?? "admin";
+        var (ok, err) = await CaService.SeedRevokedSerialAsync(
+            seedSerialHex,
+            seedCommonName,
+            seedReasonCode,
+            actor);
+
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Seed Error", err ?? "Failed to seed revoked serial.");
+            return;
+        }
+
+        seedSerialHex = "";
+        seedCommonName = "";
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "Serial Seeded", "Revoked serial recorded and CRL updated.");
+    }
+
+    private async Task SaveDefaultsClick()
+    {
+        try
+        {
+            await AccountService.UpdateSubjectDefaultsAsync(subjectDefaults);
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Success, "Defaults Saved", "Updated X.509 Subject Defaults.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Error", ex.Message);
+        }
+    }
+
+    private async Task InspectLegacySettingsClick()
+    {
+        try
+        {
+            string xmlPath = File.Exists("static/settings.xml")
+                ? "static/settings.xml"
+                : "static/settings.xml.example";
+            var report = await MigrationService.InspectAndOptionallyImportDefaultsAsync(xmlPath, importSubjectDefaults: true);
+            legacyWorksheetText = report.FormatWorksheetText();
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Info, "Legacy Settings Inspected", $"Loaded defaults and group mapping worksheet from {xmlPath}.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Inspection Error", ex.Message);
+        }
+    }
+
+    private async Task CreateUserClick()
+    {
+        string[] patterns = newUserDomains
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        var (ok, err, createdUser) = await AccountService.CreateUserAsync(
+            newUserName,
+            newUserPassword,
+            newUserEmail,
+            [newUserRole, AppRoles.Issuer],
+            patterns);
+
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "User Error", err ?? "Failed to create user.");
+            return;
+        }
+
+        newUserName = "";
+        newUserEmail = "";
+        newUserPassword = "";
+        showCreateUserForm = false;
+        if (createdUser != null)
+        {
+            SelectUser(createdUser.Id);
+        }
+        else
+        {
+            ResetSelectedUserEditorState();
+        }
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "User Created", "Local account created.");
+    }
+
+    private async Task ToggleUserDisabledClick(UserSummaryDto user)
+    {
+        var (ok, err) = await AccountService.SetUserDisabledAsync(user.Id, !user.IsDisabled);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Error", err ?? "Update failed.");
+            return;
+        }
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "Account Updated", $"Account '{user.UserName}' is now {(user.IsDisabled ? "enabled" : "disabled")}.");
+    }
+
+    private async Task ResetUserPasswordClick(string userId, string userName)
+    {
+        if (string.IsNullOrWhiteSpace(selectedUserNewPassword))
+        {
+            Notify(Radzen.NotificationSeverity.Warning, "Password Required", "Enter a new password before confirming reset.");
+            return;
+        }
+
+        var (ok, err) = await AccountService.ResetPasswordAsync(userId, selectedUserNewPassword);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Reset Error", err ?? "Password reset failed.");
+            return;
+        }
+
+        selectedUserNewPassword = "";
+        showPasswordResetForSelectedUser = false;
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "Password Reset", $"Password reset for '{userName}' and active sessions invalidated.");
+    }
+
+    private async Task AddUserDomainClick(string userId)
+    {
+        if (string.IsNullOrWhiteSpace(selectedUserDomainPattern))
+        {
+            Notify(Radzen.NotificationSeverity.Warning, "Domain Pattern Required", "Enter a domain pattern (e.g. *.contoso.com) to add.");
+            return;
+        }
+        var (ok, err) = await AccountService.AddDomainPermissionAsync("User", userId, selectedUserDomainPattern, selectedUserAllowedProfile);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Policy Error", err ?? "Invalid pattern.");
+            return;
+        }
+        selectedUserDomainPattern = "";
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "Permission Added", "Domain permission rule added.");
+    }
+
+    private async Task RemovePermissionClick(int ruleId)
+    {
+        await AccountService.RemoveDomainPermissionAsync(ruleId);
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Info, "Permission Removed", "Domain permission rule removed.");
+    }
+
+    private async Task RevokeCertClick(int certId)
+    {
+        AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        string actor = authState.User.Identity?.Name ?? "admin";
+        var (ok, err) = await CaService.RevokeCertificateAsync(certId, 0, actor);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Revocation Error", err ?? "Revocation failed.");
+            return;
+        }
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "Certificate Revoked", "Certificate revoked and CRL updated.");
+    }
+}

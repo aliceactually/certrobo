@@ -362,3 +362,5 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 /static/settings.xml
+/App_Data/
+*.p8.enc

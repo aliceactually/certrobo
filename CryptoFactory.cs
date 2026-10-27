@@ -1,196 +1,263 @@
 ﻿using ICSharpCode.SharpZipLib.Zip;
-using Microsoft.PowerShell;
-using Org.BouncyCastle.Crypto.Generators;
-using Org.BouncyCastle.Crypto;
-using Org.BouncyCastle.Math.EC;
-using Org.BouncyCastle.Security;
-using Org.BouncyCastle.Asn1.X509;
-using Org.BouncyCastle.X509;
-using Org.BouncyCastle.Pkcs;
-using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Asn1;
 using Org.BouncyCastle.Asn1.Pkcs;
+using Org.BouncyCastle.Asn1.X509;
+using Org.BouncyCastle.Crypto;
+using Org.BouncyCastle.Crypto.Generators;
 using Org.BouncyCastle.Crypto.Operators;
-using System.Management.Automation;
-using System.Management.Automation.Runspaces;
-using System.Text;
-using System.Xml.Linq;
+using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Math.EC;
 using Org.BouncyCastle.OpenSsl;
+using Org.BouncyCastle.Pkcs;
+using Org.BouncyCastle.Security;
+using Org.BouncyCastle.X509;
+using System.Text;
 
-namespace CertRobo
+namespace CertRobo;
+
+public class PkcsBuilder
 {
-    public class PkcsBuilder
+    private static readonly char[] newline = ['\n', '\r'];
+
+    private string? _cert;
+    private string? _key;
+
+    public PkcsBuilder() { }
+
+    public PkcsBuilder(string certificate, string privateKey)
     {
-    static readonly char[] newline = ([ '\n', '\r' ]);
+        _cert = certificate;
+        _key = privateKey;
+    }
 
-    string? _cert;
-    string? _key;
-
-        public PkcsBuilder() { }
-
-        public PkcsBuilder(string certificate, string privateKey)
+    public string? Certificate
+    {
+        get => _cert;
+        set
         {
-            _cert = certificate;
-            _key = privateKey;
-        }
-
-        public string? Certificate
-        {
-            get { return _cert; }
-            set
+            if (value != null)
             {
-                if (value != null)
+                string cn = "";
+                try
                 {
-                    string cn = "";
-                    try
-                    {
-                        string c = "";
-                        foreach (string s in value.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { c += s; }
-                        X509Certificate cert = new(Convert.FromBase64String(c));
-                        foreach (string s in cert.SubjectDN.ToString().Split(',')) { if (s.StartsWith("CN=")) { cn = s.Split('=').Last(); } }
-                    }
-                    catch { throw new ArgumentException("Certificate could not be parsed"); }
-                    if (cn == string.Empty) { throw new ArgumentException("Certificate does not contain a Common Name"); }
+                    X509Certificate cert = ParseFirstCertificate(value);
+                    cn = ExtractCommonName(cert);
                 }
-                _cert = value;
-            }
-        }
-
-        public string? PrivateKey
-        {
-            get { return _key; }
-            set
-            {
-                if (value != null)
+                catch
                 {
-                    try
-                    {
-                        string t = string.Empty;
-                        foreach (string s in value.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { t += s; }
-                        PrivateKeyFactory.CreateKey(Convert.FromBase64String(t));
-                    }
-                    catch { throw new ArgumentException("Private key could not be parsed"); }
+                    throw new ArgumentException("Certificate could not be parsed");
                 }
-                _key = value;
+                if (cn == string.Empty)
+                {
+                    throw new ArgumentException("Certificate does not contain a Common Name");
+                }
             }
+            _cert = value;
         }
+    }
 
-        public string CN
+    public string? PrivateKey
+    {
+        get => _key;
+        set
         {
-            get
+            if (value != null)
             {
-                if (_cert == null) { return string.Empty; }
-                string c = string.Empty;
-                foreach (string s in _cert.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { c += s; }
-                X509Certificate cert = new(Convert.FromBase64String(c));
-                foreach (string s in cert.SubjectDN.ToString().Split(',')) { if (s.StartsWith("CN=")) { return s.Split('=').Last(); } }
-                // This will only happen if the certificate lacks a CN, which is certainly some kind of user error, but...
+                try
+                {
+                    string t = string.Empty;
+                    foreach (string s in value.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
+                    {
+                        t += s;
+                    }
+                    PrivateKeyFactory.CreateKey(Convert.FromBase64String(t));
+                }
+                catch
+                {
+                    throw new ArgumentException("Private key could not be parsed");
+                }
+            }
+            _key = value;
+        }
+    }
+
+    public string CN
+    {
+        get
+        {
+            if (_cert == null)
+            {
                 return string.Empty;
             }
+            X509Certificate cert = ParseFirstCertificate(_cert);
+            return ExtractCommonName(cert);
         }
-        private static bool CertKeyCheck(string certificate, string privateKey)
-        {
-            if (certificate == null || privateKey == null) { return false; }
-            string k = string.Empty;
-            foreach (string s in privateKey.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { k += s; }
-            AsymmetricKeyParameter privateParam = PrivateKeyFactory.CreateKey(Convert.FromBase64String(k));
-            string c = string.Empty;
-            foreach (string s in certificate.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { c += s; }
-            X509Certificate cert = new(Convert.FromBase64String(c));
-            AsymmetricKeyParameter publicParam = cert.GetPublicKey();
+    }
 
-            if (privateParam is RsaPrivateCrtKeyParameters privRsa && publicParam is RsaKeyParameters pubRsa)
-            {
-                if (privRsa.Modulus.Equals(pubRsa.Modulus) && privRsa.PublicExponent.Equals(pubRsa.Exponent)) { return true; }
-            }
-            else if (privateParam is ECPrivateKeyParameters privEc && publicParam is ECPublicKeyParameters pubEc)
-            {
-                ECPoint q = privEc.Parameters.G.Multiply(privEc.D);
-                ECPublicKeyParameters derived = new(privEc.AlgorithmName, q, privEc.PublicKeyParamSet);
-                if (derived.Q.Equals(pubEc.Q)) { return true; }
-            }
-            else if (privateParam is Ed25519PrivateKeyParameters privEd && publicParam is Ed25519PublicKeyParameters pubEd)
-            {
-                if (pubEd.GetEncoded().SequenceEqual(privEd.GeneratePublicKey().GetEncoded())) { return true; }
-            }
+    public static bool CertKeyCheck(string certificate, string privateKey)
+    {
+        if (string.IsNullOrWhiteSpace(certificate) || string.IsNullOrWhiteSpace(privateKey))
+        {
             return false;
         }
 
-        public static Tuple<string, byte[]>? Export(string certificate, string privateKey)
+        string k = string.Empty;
+        foreach (string s in privateKey.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
         {
-            // Determine what we have, if we have anything. Start with the certificate itself and radiate out.
-            string c = "";
-            foreach (string s in certificate.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { c += s; }
+            k += s;
+        }
+        AsymmetricKeyParameter privateParam = PrivateKeyFactory.CreateKey(Convert.FromBase64String(k));
+        X509Certificate cert = ParseFirstCertificate(certificate);
+        AsymmetricKeyParameter publicParam = cert.GetPublicKey();
 
-            // Test the certificate and abort if needed.
-            X509Certificate cert;
-            try { cert = new(Convert.FromBase64String(c)); }
-            catch { return null; }
-
-            // Fetch the root certificate from static
-            string r = "";
-            foreach (string s in File.ReadAllText("static/rootca.crt").Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { r += s; }
-            X509Certificate root;
-            string rootAlgo;
-            try 
-            { 
-                root = new(Convert.FromBase64String(r));
-                rootAlgo = root.SubjectPublicKeyInfo.Algorithm.Algorithm.GetID();
+        if (privateParam is RsaPrivateCrtKeyParameters privRsa && publicParam is RsaKeyParameters pubRsa)
+        {
+            if (privRsa.Modulus.Equals(pubRsa.Modulus) && privRsa.PublicExponent.Equals(pubRsa.Exponent))
+            {
+                return true;
             }
-            catch { return null; }
+        }
+        else if (privateParam is ECPrivateKeyParameters privEc && publicParam is ECPublicKeyParameters pubEc)
+        {
+            ECPoint q = privEc.Parameters.G.Multiply(privEc.D);
+            ECPublicKeyParameters derived = new(privEc.AlgorithmName, q, privEc.PublicKeyParamSet);
+            if (derived.Q.Equals(pubEc.Q))
+            {
+                return true;
+            }
+        }
+        else if (privateParam is Ed25519PrivateKeyParameters privEd && publicParam is Ed25519PublicKeyParameters pubEd)
+        {
+            if (pubEd.GetEncoded().SequenceEqual(privEd.GeneratePublicKey().GetEncoded()))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 
-            // Let's find out if this certificate was signed by the root
-            bool chain = true;
-            try { cert.Verify(root.GetPublicKey()); }
-            catch { chain = false; }
+    public static Tuple<string, byte[]>? Export(
+        string certificate,
+        string privateKey,
+        string? rootCaCertPath = null,
+        string? chainPemContent = null)
+    {
+        X509Certificate cert;
+        try
+        {
+            cert = ParseFirstCertificate(certificate);
+        }
+        catch
+        {
+            return null;
+        }
 
-            string cn = "";
-            foreach (string s in cert.SubjectDN.ToString().Split(',')) { if (s.StartsWith("CN=")) { cn = s.Split('=').Last(); } }
-            MemoryStream output = new();
-            ZipOutputStream zipStream = new(output);
+        string resolvedChainPem;
+        if (!string.IsNullOrWhiteSpace(chainPemContent))
+        {
+            resolvedChainPem = chainPemContent;
+        }
+        else
+        {
+            string resolvedRootPath = rootCaCertPath
+                ?? (File.Exists("static/rootca.crt") ? "static/rootca.crt" : "static/rootca.crt.example");
+            if (!File.Exists(resolvedRootPath))
+            {
+                return null;
+            }
+            resolvedChainPem = File.ReadAllText(resolvedRootPath);
+        }
 
-            // Base64
+        IList<X509Certificate> chainCerts;
+        try
+        {
+            chainCerts = ParseCertificateBundle(resolvedChainPem);
+            if (chainCerts.Count == 0)
+            {
+                return null;
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        // Verify that the leaf certificate is signed by the first certificate in the chain (either intermediate or root)
+        // and that each subsequent certificate in the chain is signed by the next.
+        bool chainValid = true;
+        try
+        {
+            cert.Verify(chainCerts[0].GetPublicKey());
+            for (int i = 0; i < chainCerts.Count - 1; i++)
+            {
+                chainCerts[i].Verify(chainCerts[i + 1].GetPublicKey());
+            }
+        }
+        catch
+        {
+            chainValid = false;
+        }
+
+        string cn = ExtractCommonName(cert);
+        if (string.IsNullOrEmpty(cn))
+        {
+            cn = "certificate";
+        }
+
+        string normalizedLeafPem = NormalizePemEnding(certificate);
+        string normalizedChainPem = NormalizePemEnding(resolvedChainPem);
+
+        using MemoryStream output = new();
+        using (ZipOutputStream zipStream = new(output))
+        {
+            zipStream.IsStreamOwner = false;
+
+            // Base64 leaf
             zipStream.PutNextEntry(new ZipEntry(cn + ".crt"));
-            zipStream.Write(Encoding.ASCII.GetBytes(certificate));
-            
-            // Base64, chained
-            if (chain)
+            zipStream.Write(Encoding.ASCII.GetBytes(normalizedLeafPem));
+
+            // Base64 chained (leaf + intermediate(s) + root)
+            if (chainValid)
             {
                 zipStream.PutNextEntry(new ZipEntry(cn + "-chained.crt"));
-                zipStream.Write(Encoding.ASCII.GetBytes(certificate));
-                zipStream.Write(File.ReadAllBytes("static/rootca.crt"));
+                zipStream.Write(Encoding.ASCII.GetBytes(normalizedLeafPem));
+                zipStream.Write(Encoding.ASCII.GetBytes(normalizedChainPem));
             }
-            
-            if (privateKey != string.Empty)
+
+            if (!string.IsNullOrWhiteSpace(privateKey))
             {
                 string k = "";
-                foreach (string s in privateKey.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { k += s; }
+                foreach (string s in privateKey.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
+                {
+                    k += s;
+                }
                 AsymmetricKeyParameter p = PrivateKeyFactory.CreateKey(Convert.FromBase64String(k));
-                if (p is RsaPrivateCrtKeyParameters || p is ECPrivateKeyParameters || p is Ed25519PrivateKeyParameters)
+                if (p is RsaPrivateCrtKeyParameters or ECPrivateKeyParameters or Ed25519PrivateKeyParameters)
                 {
                     if (CertKeyCheck(certificate, privateKey))
                     {
-                        // Base64, with key
-                        zipStream.PutNextEntry(new ZipEntry(cn + ".key"));
-                        zipStream.Write(Encoding.ASCII.GetBytes(privateKey));
-                        zipStream.PutNextEntry(new ZipEntry(cn + ".pem"));
-                        zipStream.Write(Encoding.ASCII.GetBytes(certificate));
-                        zipStream.Write(Encoding.ASCII.GetBytes(privateKey));
+                        string normalizedKeyPem = NormalizePemEnding(privateKey);
 
-                        // Base64, with key, chained
-                        if (chain)
+                        zipStream.PutNextEntry(new ZipEntry(cn + ".key"));
+                        zipStream.Write(Encoding.ASCII.GetBytes(normalizedKeyPem));
+
+                        zipStream.PutNextEntry(new ZipEntry(cn + ".pem"));
+                        zipStream.Write(Encoding.ASCII.GetBytes(normalizedLeafPem));
+                        zipStream.Write(Encoding.ASCII.GetBytes(normalizedKeyPem));
+
+                        if (chainValid)
                         {
                             zipStream.PutNextEntry(new ZipEntry(cn + "-chained.pem"));
-                            zipStream.Write(Encoding.ASCII.GetBytes(certificate));
-                            zipStream.Write(File.ReadAllBytes("static/rootca.crt"));
-                            zipStream.Write(Encoding.ASCII.GetBytes(privateKey));
+                            zipStream.Write(Encoding.ASCII.GetBytes(normalizedLeafPem));
+                            zipStream.Write(Encoding.ASCII.GetBytes(normalizedChainPem));
+                            zipStream.Write(Encoding.ASCII.GetBytes(normalizedKeyPem));
                         }
 
-                        // PKCS #12
+                        // PKCS #12 leaf
                         Pkcs12StoreBuilder builder = new();
                         builder.SetUseDerEncoding(true);
                         Pkcs12Store store = builder.Build();
-                        store.SetKeyEntry(string.Empty, new AsymmetricKeyEntry(p), new X509CertificateEntry[] { new(cert) });
+                        store.SetKeyEntry(string.Empty, new AsymmetricKeyEntry(p), [new X509CertificateEntry(cert)]);
                         byte[] pkcs;
                         using (MemoryStream stream = new())
                         {
@@ -200,13 +267,15 @@ namespace CertRobo
                         zipStream.PutNextEntry(new ZipEntry(cn + ".p12"));
                         zipStream.Write(pkcs);
 
-                        // PKCS #12, chained
-                        if (chain)
+                        // PKCS #12 chained (leaf + all chain certificates in order)
+                        if (chainValid)
                         {
                             builder = new();
                             builder.SetUseDerEncoding(true);
                             store = builder.Build();
-                            store.SetKeyEntry(string.Empty, new AsymmetricKeyEntry(p), new X509CertificateEntry[] { new(cert), new(root) });
+                            List<X509CertificateEntry> certEntries = [new X509CertificateEntry(cert)];
+                            certEntries.AddRange(chainCerts.Select(c => new X509CertificateEntry(c)));
+                            store.SetKeyEntry(string.Empty, new AsymmetricKeyEntry(p), certEntries.ToArray());
                             using (MemoryStream stream = new())
                             {
                                 store.Save(stream, null, new SecureRandom());
@@ -220,289 +289,308 @@ namespace CertRobo
             }
 
             zipStream.Finish();
-            zipStream.Close();
-            return new Tuple<string, byte[]>((cn + ".zip"), output.ToArray());
+        }
+
+        return new Tuple<string, byte[]>(cn + ".zip", output.ToArray());
+    }
+
+    private static X509Certificate ParseFirstCertificate(string pem)
+    {
+        IList<X509Certificate> certs = ParseCertificateBundle(pem);
+        return certs.FirstOrDefault() ?? throw new ArgumentException("Certificate could not be parsed");
+    }
+
+    private static IList<X509Certificate> ParseCertificateBundle(string pem)
+    {
+        List<X509Certificate> list = [];
+        using StringReader sr = new(pem);
+        PemReader reader = new(sr);
+        object? obj;
+        while ((obj = reader.ReadObject()) != null)
+        {
+            if (obj is X509Certificate c)
+            {
+                list.Add(c);
+            }
+        }
+        return list;
+    }
+
+    private static string ExtractCommonName(X509Certificate cert)
+    {
+        var oids = cert.SubjectDN.GetOidList();
+        var values = cert.SubjectDN.GetValueList();
+        for (int i = 0; i < oids.Count; i++)
+        {
+            if (X509Name.CN.Equals(oids[i]))
+            {
+                return ((string)values[i]!).Trim();
+            }
+        }
+        return string.Empty;
+    }
+
+    private static string NormalizePemEnding(string pem)
+    {
+        return pem.EndsWith('\n') ? pem : pem + "\n";
+    }
+}
+
+public class KeyPair(string publicKey, string privateKey)
+{
+    private static readonly char[] newline = ['\n', '\r'];
+
+    public string Public { get; } = publicKey;
+
+    public string Private { get; } = privateKey;
+
+    public string Type()
+    {
+        AsymmetricKeyParameter privateParam;
+        try
+        {
+            privateParam = ToAsymmetricCipherKeyPair().Private;
+        }
+        catch (Exception)
+        {
+            throw new ArgumentException("Could not parse key pair");
+        }
+        if (privateParam is ECPrivateKeyParameters)
+        {
+            return "ECDSA";
+        }
+        else if (privateParam is RsaPrivateCrtKeyParameters)
+        {
+            return "RSA";
+        }
+        else
+        {
+            throw new ArgumentException("Could not parse key pair");
         }
     }
 
-    public class KeyPair(string publicKey, string privateKey)
+    public AsymmetricCipherKeyPair ToAsymmetricCipherKeyPair()
     {
-        static readonly char[] newline = (['\n', '\r']);
-
-        public string Public { get; } = publicKey;
-
-        public string Private { get; } = privateKey;
-
-        public string Type()
+        AsymmetricKeyParameter publicKey;
+        AsymmetricKeyParameter privateKey;
+        try
         {
-            AsymmetricKeyParameter privateParam;
-            try { privateParam = ToAsymmetricCipherKeyPair().Private; }
-            catch (Exception) { throw new ArgumentException("Could not parse key pair"); }
-            if (privateParam.GetType().ToString() == "Org.BouncyCastle.Crypto.Parameters.ECPrivateKeyParameters") { return "ECDSA"; }
-            else if (privateParam.GetType().ToString() == "Org.BouncyCastle.Crypto.Parameters.RsaPrivateCrtKeyParameters") { return "RSA"; }
-            else { throw new ArgumentException("Could not parse key pair"); }
+            string t = "";
+            foreach (string s in Public.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
+            {
+                t += s;
+            }
+            publicKey = PublicKeyFactory.CreateKey(Convert.FromBase64String(t));
         }
-
-        public AsymmetricCipherKeyPair ToAsymmetricCipherKeyPair()
+        catch (Exception)
         {
-            AsymmetricKeyParameter publicKey;
-            AsymmetricKeyParameter privateKey;
-            try
+            throw new ArgumentException("Could not parse public key.");
+        }
+        try
+        {
+            string t = "";
+            foreach (string s in Private.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
             {
-                string t = "";
-                foreach (string s in Public.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { t += s; }
-                publicKey = PublicKeyFactory.CreateKey(Convert.FromBase64String(t));
+                t += s;
             }
-            catch (Exception) { throw new ArgumentException("Could not parse public key."); }
-            try
-            {
-                string t = "";
-                foreach (string s in Private.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { t += s; }
-                privateKey = PrivateKeyFactory.CreateKey(Convert.FromBase64String(t));
-            }
-            catch (Exception) { throw new ArgumentException("Could not parse private key."); }
-            try { return new AsymmetricCipherKeyPair(publicKey, privateKey); }
-            catch (Exception) { throw new ArgumentException("Could not construct keypair from provided keys."); }
+            privateKey = PrivateKeyFactory.CreateKey(Convert.FromBase64String(t));
+        }
+        catch (Exception)
+        {
+            throw new ArgumentException("Could not parse private key.");
+        }
+        try
+        {
+            return new AsymmetricCipherKeyPair(publicKey, privateKey);
+        }
+        catch (Exception)
+        {
+            throw new ArgumentException("Could not construct keypair from provided keys.");
         }
     }
+}
 
-    public class CryptoFactory
+public class CryptoFactory
+{
+    private static readonly char[] newline = ['\n', '\r'];
+
+    public string CSRGen(
+        KeyPair pair,
+        string commonName,
+        string[] subjectAlternativeNames,
+        string countryCode,
+        string stateOrProvinceName,
+        string localityName,
+        string organization,
+        string organizationalUnit,
+        string emailAddress)
     {
-        static private readonly char[] newline = (['\n', '\r']);
-        static private readonly XDocument settings = XDocument.Load("static/settings.xml");
-
-        public string CSRGen(KeyPair pair, string commonName, string[] subjectAlternativeNames, string countryCode,
-            string stateOrProvinceName, string localityName, string organization, string organizationalUnit, string emailAddress)
+        IDictionary<DerObjectIdentifier, string> values = new Dictionary<DerObjectIdentifier, string>
         {
+            [X509Name.CN] = commonName,
+            [X509Name.C] = countryCode,
+            [X509Name.ST] = stateOrProvinceName,
+            [X509Name.L] = localityName,
+            [X509Name.O] = organization,
+            [X509Name.OU] = organizationalUnit,
+            [X509Name.E] = emailAddress
+        };
+        IList<DerObjectIdentifier> keys =
+        [
+            X509Name.CN,
+            X509Name.C,
+            X509Name.ST,
+            X509Name.L,
+            X509Name.O,
+            X509Name.OU,
+            X509Name.E
+        ];
+        X509Name issuerDN = new(keys, values);
 
-            IDictionary<DerObjectIdentifier,string> values = new Dictionary<DerObjectIdentifier, string>
-            {
-                [X509Name.CN] = commonName,
-                [X509Name.C] = countryCode,
-                [X509Name.ST] = stateOrProvinceName,
-                [X509Name.L] = localityName,
-                [X509Name.O] = organization,
-                [X509Name.OU] = organizationalUnit,
-                [X509Name.E] = emailAddress
-            };
-            IList<DerObjectIdentifier> keys = new List<DerObjectIdentifier>()
-            {
-                X509Name.CN,
-                X509Name.C,
-                X509Name.ST,
-                X509Name.L,
-                X509Name.O,
-                X509Name.OU,
-                X509Name.E
-            };
-            X509Name issuerDN = new(keys, values);
-
-            Dictionary<DerObjectIdentifier, X509Extension> extensions = [];
-            if (subjectAlternativeNames.Length > 0)
-            {
-                GeneralNames san = new(subjectAlternativeNames.Select(n => new GeneralName(GeneralName.DnsName, n)).ToArray());
-                Asn1OctetString bytes = new DerOctetString(san);
-                extensions.Add(X509Extensions.SubjectAlternativeName, new X509Extension(false, bytes));
-            }
-
-            ISignatureFactory sig;
-            if (pair.Type() == "RSA") { sig = new Asn1SignatureFactory("SHA256withRSA", pair.ToAsymmetricCipherKeyPair().Private, new SecureRandom()); }
-            else if (pair.Type() == "ECDSA") { sig = new Asn1SignatureFactory("SHA256withECDSA", pair.ToAsymmetricCipherKeyPair().Private, new SecureRandom()); }
-            else { throw new ArgumentException("Could not determine key type"); }
-
-            Pkcs10CertificationRequest req = new(sig, issuerDN, pair.ToAsymmetricCipherKeyPair().Public,
-                new DerSet(new AttributePkcs(PkcsObjectIdentifiers.Pkcs9AtExtensionRequest, new DerSet(new X509Extensions(extensions)))));
-            return "-----BEGIN CERTIFICATE REQUEST-----\r\n" + StringChunker(Convert.ToBase64String(req.GetEncoded()), 64) + "\r\n-----END CERTIFICATE REQUEST-----";
+        Dictionary<DerObjectIdentifier, X509Extension> extensions = [];
+        if (subjectAlternativeNames.Length > 0)
+        {
+            GeneralNames san = new(subjectAlternativeNames.Select(n => new GeneralName(GeneralName.DnsName, n)).ToArray());
+            Asn1OctetString bytes = new DerOctetString(san);
+            extensions.Add(X509Extensions.SubjectAlternativeName, new X509Extension(false, bytes));
         }
 
-        private static string StringChunker(string input, int length)
+        ISignatureFactory sig;
+        if (pair.Type() == "RSA")
         {
-            string output = "";
-            int i = 0;
-            while (i < input.Length)
-            {
-                if (i + length > input.Length) { length = input.Length - i; }
-                output += string.Concat(input.AsSpan(i, length), "\n");
-                i += length;
-            }
-            return output[..^1];
+            sig = new Asn1SignatureFactory("SHA256withRSA", pair.ToAsymmetricCipherKeyPair().Private, new SecureRandom());
+        }
+        else if (pair.Type() == "ECDSA")
+        {
+            sig = new Asn1SignatureFactory("SHA256withECDSA", pair.ToAsymmetricCipherKeyPair().Private, new SecureRandom());
+        }
+        else
+        {
+            throw new ArgumentException("Could not determine key type");
         }
 
-        public KeyPair KeyGen(int keySizeInBits)
-        {
-            SecureRandom random = new();
-            KeyGenerationParameters keyParams = new(random, keySizeInBits);
+        Pkcs10CertificationRequest req = new(
+            sig,
+            issuerDN,
+            pair.ToAsymmetricCipherKeyPair().Public,
+            new DerSet(new AttributePkcs(PkcsObjectIdentifiers.Pkcs9AtExtensionRequest, new DerSet(new X509Extensions(extensions)))));
 
-            // NISTP-521 is supported, but since it's not Suite B compliant it's not exposed in the UI. No harm leaving it in here for future use.
-            return keySizeInBits switch
+        return "-----BEGIN CERTIFICATE REQUEST-----\r\n"
+            + StringChunker(Convert.ToBase64String(req.GetEncoded()), 64)
+            + "\r\n-----END CERTIFICATE REQUEST-----";
+    }
+
+    private static string StringChunker(string input, int length)
+    {
+        string output = "";
+        int i = 0;
+        while (i < input.Length)
+        {
+            if (i + length > input.Length)
             {
-                256 or 384 or 521 or 2048 or 4096 => KeyGen(keyParams),
-                _ => throw new ArgumentException("Invalid key size")
-            };
+                length = input.Length - i;
+            }
+            output += string.Concat(input.AsSpan(i, length), "\n");
+            i += length;
+        }
+        return output[..^1];
+    }
+
+    public KeyPair KeyGen(int keySizeInBits)
+    {
+        SecureRandom random = new();
+        KeyGenerationParameters keyParams = new(random, keySizeInBits);
+
+        return keySizeInBits switch
+        {
+            256 or 384 or 521 or 2048 or 4096 => KeyGen(keyParams),
+            _ => throw new ArgumentException("Invalid key size")
+        };
+    }
+
+    private static KeyPair KeyGen(KeyGenerationParameters keyParams)
+    {
+        AsymmetricCipherKeyPair thisKey;
+
+        if (keyParams.Strength is 256 or 384 or 521)
+        {
+            ECKeyPairGenerator keygen = new();
+            keygen.Init(keyParams);
+            thisKey = keygen.GenerateKeyPair();
+        }
+        else if (keyParams.Strength is 2048 or 4096)
+        {
+            RsaKeyPairGenerator keygen = new();
+            keygen.Init(keyParams);
+            thisKey = keygen.GenerateKeyPair();
+        }
+        else
+        {
+            throw new ArgumentOutOfRangeException(nameof(keyParams));
         }
 
-        private static KeyPair KeyGen(KeyGenerationParameters keyParams)
+        byte[] publicBytes = SubjectPublicKeyInfoFactory.CreateSubjectPublicKeyInfo(thisKey.Public).ToAsn1Object().GetDerEncoded();
+        string publicString =
+            "-----BEGIN PUBLIC KEY-----\n"
+            + StringChunker(Convert.ToBase64String(publicBytes, 0, publicBytes.Length, Base64FormattingOptions.None), 64)
+            + "\n-----END PUBLIC KEY-----";
+
+        byte[] privateBytes = PrivateKeyInfoFactory.CreatePrivateKeyInfo(thisKey.Private).ToAsn1Object().GetDerEncoded();
+        string privateString =
+            "-----BEGIN PRIVATE KEY-----\n"
+            + StringChunker(Convert.ToBase64String(privateBytes, 0, privateBytes.Length, Base64FormattingOptions.None), 64)
+            + "\n-----END PRIVATE KEY-----";
+
+        return new KeyPair(publicString, privateString);
+    }
+
+    public string DerivePublicKey(string privateKey)
+    {
+        if (string.IsNullOrWhiteSpace(privateKey))
         {
-            AsymmetricCipherKeyPair thisKey;
-
-            if (keyParams.Strength == 256 || keyParams.Strength == 384 || keyParams.Strength == 521)
-            {
-                ECKeyPairGenerator keygen = new();
-                keygen.Init(keyParams);
-                thisKey = keygen.GenerateKeyPair();
-            }
-            else if (keyParams.Strength == 2048 || keyParams.Strength == 4096)
-            {
-                RsaKeyPairGenerator keygen = new();
-                keygen.Init(keyParams);
-                thisKey = keygen.GenerateKeyPair();
-            }
-            else { throw new ArgumentOutOfRangeException(nameof(keyParams)); }
-
-            byte[] publicBytes = SubjectPublicKeyInfoFactory.CreateSubjectPublicKeyInfo(thisKey.Public).ToAsn1Object().GetDerEncoded();
-            string publicString =
-                "-----BEGIN PUBLIC KEY-----\n"
-                + StringChunker(Convert.ToBase64String(publicBytes, 0, publicBytes.Length, Base64FormattingOptions.None), 64)
-                + "\n-----END PUBLIC KEY-----";
-
-            byte[] privateBytes = PrivateKeyInfoFactory.CreatePrivateKeyInfo(thisKey.Private).ToAsn1Object().GetDerEncoded();
-            string privateString;
-            privateString =
-                "-----BEGIN PRIVATE KEY-----\n"
-                + StringChunker(Convert.ToBase64String(privateBytes, 0, privateBytes.Length, Base64FormattingOptions.None), 64)
-                + "\n-----END PRIVATE KEY-----";
-
-            return new KeyPair(publicString, privateString);
+            return string.Empty;
+        }
+        string k = "";
+        foreach (string s in privateKey.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
+        {
+            k += s;
+        }
+        AsymmetricKeyParameter privateParam;
+        try
+        {
+            byte[] privateBytes = Convert.FromBase64String(k);
+            privateParam = PrivateKeyFactory.CreateKey(privateBytes);
+        }
+        catch (Exception)
+        {
+            throw new ArgumentException("The private key provided could not be decoded");
         }
 
-        public string DerivePublicKey(string privateKey)
+        AsymmetricCipherKeyPair keyPair;
+        if (privateParam is RsaPrivateCrtKeyParameters rsa)
         {
-            // Catch an empty string
-            if (string.IsNullOrWhiteSpace(privateKey)) { return string.Empty; }
-            string k = "";
-            foreach (string s in privateKey.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { k += s; }
-            AsymmetricKeyParameter privateParam;
-            try
-            {
-                byte[] privateBytes = Convert.FromBase64String(k);
-                privateParam = PrivateKeyFactory.CreateKey(privateBytes);
-            }
-            catch (Exception) { throw new ArgumentException("The private key provided could not be decoded"); }
-
-            AsymmetricCipherKeyPair keyPair;
-            if (privateParam is RsaPrivateCrtKeyParameters rsa)
-            {
-                RsaKeyParameters kp = new(false, rsa.Modulus, rsa.PublicExponent);
-                keyPair = new AsymmetricCipherKeyPair(kp, privateParam);
-            }
-            else if (privateParam is ECPrivateKeyParameters ec)
-            {
-                ECPoint q = ec.Parameters.G.Multiply(ec.D);
-                ECPublicKeyParameters kp = new(ec.AlgorithmName, q, ec.PublicKeyParamSet);
-                keyPair = new AsymmetricCipherKeyPair(kp, ec);
-            }
-            else if (privateParam is Ed25519PrivateKeyParameters ed)
-            {
-                Ed25519PublicKeyParameters kp = ed.GeneratePublicKey();
-                keyPair = new AsymmetricCipherKeyPair(kp, privateParam);
-            }
-            else
-            {
-                try { throw new NotSupportedException($"The key type {k.GetType().Name} is not supported"); }
-                catch { throw new ArgumentException("The key provided could not be decoded"); }
-            }
-
-            byte[] publicBytes = SubjectPublicKeyInfoFactory.CreateSubjectPublicKeyInfo(keyPair.Public).ToAsn1Object().GetDerEncoded();
-            string publicString =
-                "-----BEGIN PUBLIC KEY-----\n"
-                + StringChunker(Convert.ToBase64String(publicBytes, 0, publicBytes.Length, Base64FormattingOptions.None), 64)
-                + "\n-----END PUBLIC KEY-----";
-
-            return publicString;
+            RsaKeyParameters kp = new(false, rsa.Modulus, rsa.PublicExponent);
+            keyPair = new AsymmetricCipherKeyPair(kp, privateParam);
+        }
+        else if (privateParam is ECPrivateKeyParameters ec)
+        {
+            ECPoint q = ec.Parameters.G.Multiply(ec.D);
+            ECPublicKeyParameters kp = new(ec.AlgorithmName, q, ec.PublicKeyParamSet);
+            keyPair = new AsymmetricCipherKeyPair(kp, ec);
+        }
+        else if (privateParam is Ed25519PrivateKeyParameters ed)
+        {
+            Ed25519PublicKeyParameters kp = ed.GeneratePublicKey();
+            keyPair = new AsymmetricCipherKeyPair(kp, privateParam);
+        }
+        else
+        {
+            throw new ArgumentException("The key provided could not be decoded");
         }
 
-        public static string RequestCert(string csr)
-        {
-            Pkcs10CertificationRequest decodedCsr = (Pkcs10CertificationRequest)new PemReader(new StringReader(csr)).ReadObject();
-            AsymmetricKeyParameter keyParam = decodedCsr.GetPublicKey();
-            if (Object.Equals(keyParam, null)) { throw new ArgumentException("The CSR provided could not be decoded"); }
-            
-            string template;
-            XElement root = settings.Root ?? new XElement("null");
-            if (root.Value.Equals("null")) { return string.Empty; }
-
-            if (keyParam is RsaKeyParameters rsa)
-            {
-                switch (rsa.Modulus.BitLength)
-                {
-                    case 4096:
-                        template = Enumerable.FirstOrDefault(root.Elements("Template4096"), new XElement("null")).Value;
-                        break;
-                    case 2048:
-                        template = Enumerable.FirstOrDefault(root.Elements("Template2048"), new XElement("null")).Value;
-                        break;
-                    default:
-                        throw new ArgumentException("The CSR provided uses an unsupported RSA key length (" + rsa.Modulus.BitLength + ")");
-                }
-            }
-            else if (keyParam is ECPublicKeyParameters ec)
-            {
-                switch (ec.Parameters.N.BitLength)
-                {
-                    case 384:
-                        template = Enumerable.FirstOrDefault(root.Elements("Template384"), new XElement("null")).Value;
-                        break;
-                    case 256:
-                        template = Enumerable.FirstOrDefault(root.Elements("Template256"), new XElement("null")).Value;
-                        break;
-                    default:
-                        throw new ArgumentException("The CSR provided uses an unsupported EC key length (" + ec.Parameters.N.BitLength + ")");
-                }
-
-            }
-            else if (keyParam is Ed25519PrivateKeyParameters) { throw new ArgumentException("The CSR provided uses ED25519, which is not supported"); }
-            else { throw new ArgumentException("The CSR provided uses an unsupported algorithm"); }
-
-            InitialSessionState state = InitialSessionState.CreateDefault();
-            state.ExecutionPolicy = ExecutionPolicy.Unrestricted;
-            PowerShell shell = PowerShell.Create(state);
-
-            string server = Enumerable.FirstOrDefault(root.Elements("Server"), new XElement("null")).Value;
-            if (server.Equals(string.Empty) || template.Equals(string.Empty)) { return string.Empty; }
-
-            //TODO: Instead of just recycling this, maybe it'd be cleaner to yank it back out of decodedCsr?
-            string c = "";
-            foreach (string s in csr.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----"))) { c += s; }
-            string request = Path.GetTempFileName();
-            StreamWriter requestStream = File.CreateText(request);
-            requestStream.Write(c);
-            requestStream.Close();
-            string response = Path.GetTempFileName();
-
-            // If we got this far, we should have everything we need to do this successfully...
-            shell.AddScript("certreq -f -q -submit -attrib \"CertificateTemplate:" + template + "\" -config \"" + server + "\" " + request + " " + response, true);
-
-            IEnumerable<PSObject> result = shell.Invoke();
-            if (shell.HadErrors)
-            {
-                string error = "";
-                foreach (PSObject obj in result)
-                {
-                    // This cast should never actually result in a null being returned, but since the compiler does not know that, we need to validate it to avoid a null dereference warning
-                    string? thisErr = obj.BaseObject.ToString();
-                    if (!object.Equals(thisErr, null)) { error += obj.ToString().Trim() + "\r\n"; }
-                    else { error += "An error occurred, but a null reference exception was encountered while attempting to retrieve the error details\r\n"; }
-                }
-                throw new InvalidOperationException("An exception was thrown by Certreq while attempting to issue the certificate: \"" + error.TrimEnd() + "\"");
-            }
-
-            StreamReader responseStream = File.OpenText(response);
-            string output = responseStream.ReadToEnd();
-            responseStream.Close();
-            File.Delete(request);
-            File.Delete(response);
-
-            return output;
-        }
+        byte[] publicBytes = SubjectPublicKeyInfoFactory.CreateSubjectPublicKeyInfo(keyPair.Public).ToAsn1Object().GetDerEncoded();
+        return "-----BEGIN PUBLIC KEY-----\n"
+            + StringChunker(Convert.ToBase64String(publicBytes, 0, publicBytes.Length, Base64FormattingOptions.None), 64)
+            + "\n-----END PUBLIC KEY-----";
     }
 }

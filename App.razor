@@ -1,14 +1,50 @@
-﻿<CascadingAuthenticationState>
-    <Router AppAssembly="@typeof(App).Assembly">
-        <Found Context="routeData">
-            <AuthorizeRouteView RouteData="@routeData" DefaultLayout="@typeof(MainLayout)" />
-            <FocusOnNavigate RouteData="@routeData" Selector="h1" />
-        </Found>
-        <NotFound>
-            <PageTitle>Not found</PageTitle>
-            <LayoutView Layout="@typeof(MainLayout)">
-                <p role="alert">Sorry, there's nothing at this address.</p>
-            </LayoutView>
-        </NotFound>
-    </Router>
+﻿@using CertRobo.Services
+@inject AccountManagementService AccountService
+
+<CascadingAuthenticationState>
+    <CascadingValue Name="AntiforgeryToken" Value="@AntiforgeryToken">
+        <CascadingValue Name="IsBootstrapRequired" Value="@_isBootstrapRequired">
+            <Router AppAssembly="@typeof(App).Assembly">
+                <Found Context="routeData">
+                    <AuthorizeRouteView RouteData="@routeData" DefaultLayout="@typeof(MainLayout)">
+                        <NotAuthorized>
+                            <div class="card rz-card p-4 mt-4" style="max-width: 480px;">
+                                @if (_isBootstrapRequired)
+                                {
+                                    <h4>Initial Setup Required</h4>
+                                    <p class="mb-3">Create the initial local Administrator account to begin using CertRobo.</p>
+                                    <a href="/setup" target="_top" class="btn btn-primary">Initial Setup</a>
+                                }
+                                else
+                                {
+                                    <h4>Authentication Required</h4>
+                                    <p class="mb-3">Please sign in with an authorised local account to continue.</p>
+                                    <a href="/login" target="_top" class="btn btn-primary">Sign In</a>
+                                }
+                            </div>
+                        </NotAuthorized>
+                    </AuthorizeRouteView>
+                    <FocusOnNavigate RouteData="@routeData" Selector="h1" />
+                </Found>
+                <NotFound>
+                    <PageTitle>Not found</PageTitle>
+                    <LayoutView Layout="@typeof(MainLayout)">
+                        <p role="alert">Sorry, there's nothing at this address.</p>
+                    </LayoutView>
+                </NotFound>
+            </Router>
+        </CascadingValue>
+    </CascadingValue>
 </CascadingAuthenticationState>
+
+@code {
+    private bool _isBootstrapRequired;
+
+    [Parameter]
+    public string? AntiforgeryToken { get; set; }
+
+    protected override async Task OnInitializedAsync()
+    {
+        _isBootstrapRequired = await AccountService.IsBootstrapRequiredAsync();
+    }
+}

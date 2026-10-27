@@ -1,20 +1,15 @@
 ﻿@page "/"
 @attribute [Authorize]
+@using CertRobo.Data
+@using CertRobo.Models
+@using CertRobo.Services
 @using Microsoft.AspNetCore.Components.Authorization
-@using Org.BouncyCastle.Asn1
-@using Org.BouncyCastle.Asn1.Pkcs
-@using Org.BouncyCastle.Asn1.X509
-@using Org.BouncyCastle.OpenSsl
-@using Org.BouncyCastle.Pkcs
-@using Org.BouncyCastle.X509
 @using System.Globalization
-@using System.IO
 @using System.Security.Claims
-@using System.Security.Principal
 @using System.Text
-@using System.Text.RegularExpressions
-@using System.Xml.Linq
 @inject AuthenticationStateProvider AuthenticationStateProvider
+@inject AccountManagementService AccountService
+@inject CertificateAuthorityService CaService
 @inject IJSRuntime JS
 @inject Radzen.NotificationService NotificationService
 
@@ -178,11 +173,11 @@
                 </div>
             </RadzenCard>
         </div>
-             </div>
-         </div>
+    </div>
+</div>
 
-         @code {
-    private CryptoFactory crypto = new CryptoFactory();
+@code {
+    private readonly CryptoFactory crypto = new();
     private int? keyBits = null;
     private string privateKey = "";
     private string publicKey = "";
@@ -196,7 +191,7 @@
     private string subjectAlternativeNames = "";
     private string csr = "";
     private string certificate = "";
-    private readonly XDocument settings = XDocument.Load("static/settings.xml");
+    private string? lastIssuedChainPem = null;
 
     private void ShowErrorDialogue(string message)
     {
@@ -257,35 +252,36 @@
         publicKey = result!.Public;
     }
 
-    private async Task DeriveClick()
+    private Task DeriveClick()
     {
-        try { publicKey = crypto.DerivePublicKey(privateKey); }
+        try
+        {
+            publicKey = crypto.DerivePublicKey(privateKey);
+        }
         catch (Exception x)
         {
             ShowErrorDialogue(x.Message);
             publicKey = "";
         }
+        return Task.CompletedTask;
     }
 
     private async Task AutofillClick()
     {
         string errorMessage = string.Empty;
-        // Determine if the Common Name field contains Unicode, and attempt to convert to Punycode (RFC 3490). This could produce garbage but it'll get validated further.
-        if (!ASCIIEncoding.GetEncoding(0).GetString(ASCIIEncoding.GetEncoding(0).GetBytes(commonName)).Equals(commonName))
+        if (!Encoding.ASCII.GetString(Encoding.ASCII.GetBytes(commonName)).Equals(commonName))
         {
-            IdnMapping idn = new IdnMapping();
+            IdnMapping idn = new();
             commonName = idn.GetAscii(commonName);
         }
-        // Check for illegal characters per RFC 1035
-        if (commonName.Except("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~").Any())
-        { errorMessage = "Common Name contains illegal characters"; }
-        // Filter out IP addresses and anything malformed
-        else if ((Uri.CheckHostName(commonName) != UriHostNameType.Dns))
-        { errorMessage = "Common Name is not a valid DNS name"; }
-        subjectAlternativeNames = commonName;
-
-        XElement root = settings.Root ?? new XElement("null");
-        if (root.Value == "null") { errorMessage = "Could not parse settings.xml"; }
+        if (commonName.Except("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~*").Any())
+        {
+            errorMessage = "Common Name contains illegal characters";
+        }
+        else if (!IssuancePolicyService.IsValidRequestedDnsIdentity(commonName, out _))
+        {
+            errorMessage = "Common Name is not a valid DNS name";
+        }
 
         if (!string.IsNullOrEmpty(errorMessage))
         {
@@ -293,268 +289,132 @@
             return;
         }
 
-        country = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Country"), new XElement("null")).Value;
-        stateOrProvince = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("StateOrProvince"), new XElement("null")).Value;
-        locality = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Locality"), new XElement("null")).Value;
-        organisation = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("Organisation"), new XElement("null")).Value;
-        organisationalUnit = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("OrganisationalUnit"), new XElement("null")).Value;
-        emailAddress = Enumerable.FirstOrDefault(root.Elements("Defaults").Elements("EmailAddress"), new XElement("null")).Value;
+        subjectAlternativeNames = commonName;
+
+        SubjectDefaultsConfig defaults = await AccountService.GetSubjectDefaultsAsync();
+        country = defaults.Country;
+        stateOrProvince = defaults.StateOrProvince;
+        locality = defaults.Locality;
+        organisation = defaults.Organisation;
+        organisationalUnit = defaults.OrganisationalUnit;
+        emailAddress = defaults.EmailAddress;
     }
 
-    private bool ValidateFQDN(string input)
-    {
-        if ((Uri.CheckHostName(input) == UriHostNameType.Dns)) { if (input.Split('.').Count() > 2) { return true; } }
-        return false;
-    }
-
-    private string UTF8Encode(string input) 
-    {
-        try { return (Encoding.UTF8.GetString(Encoding.Default.GetBytes(input))); }
-        catch (EncoderFallbackException) { throw new ArgumentException("Could not encode string as UTF-8"); }
-    }
-
-    private static bool IsValidEmail(string email)
-    {
-        if (string.IsNullOrWhiteSpace(email)) { return false; }
-        try
-        {
-            email = Regex.Replace(email, @"(@)(.+)$", DomainMapper, RegexOptions.None, TimeSpan.FromMilliseconds(200));
-
-            string DomainMapper(Match match)
-            {
-                IdnMapping idn = new();
-                string domainName = idn.GetAscii(match.Groups[2].Value);
-                return match.Groups[1].Value + domainName;
-            }
-        }
-        catch (RegexMatchTimeoutException) { return false; }
-        catch (ArgumentException) { return false; }
-        try { return Regex.IsMatch(email, @"^[^@\s]+@[^@\s]+\.[^@\s]+$", RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(250)); }
-        catch (RegexMatchTimeoutException) { return false; }
-    }
-
-    private async Task CSRClick()
+    private Task CSRClick()
     {
         if (string.IsNullOrEmpty(privateKey))
         {
             ShowErrorDialogue("Private key must be supplied");
-            return;
+            return Task.CompletedTask;
         }
         if (string.IsNullOrEmpty(publicKey))
         {
-            try { publicKey = crypto.DerivePublicKey(privateKey); }
-            catch (InvalidOperationException)
+            try
+            {
+                publicKey = crypto.DerivePublicKey(privateKey);
+            }
+            catch (Exception)
             {
                 ShowErrorDialogue("Public key could not be derived from private key");
-                return;
+                return Task.CompletedTask;
             }
         }
         KeyPair kp;
-        try { kp = new KeyPair(publicKey, privateKey); }
+        try
+        {
+            kp = new KeyPair(publicKey, privateKey);
+        }
         catch (ArgumentException x)
         {
             ShowErrorDialogue(x.Message);
-            return;
+            return Task.CompletedTask;
         }
 
-        if (!ValidateFQDN(commonName))
+        if (!IssuancePolicyService.IsValidRequestedDnsIdentity(commonName, out string canonicalCn))
         {
             ShowErrorDialogue("Common Name is not a valid DNS name");
-            return;
+            return Task.CompletedTask;
         }
 
-        // Stripping whitespace and updating the field. A little passive-aggressive reminder for the user...
-        subjectAlternativeNames = String.Concat(subjectAlternativeNames.Where(c => !Char.IsWhiteSpace(c)));
-        List<string> sanArray = new();
-        foreach (string san in subjectAlternativeNames.Split(','))
+        subjectAlternativeNames = string.Concat(subjectAlternativeNames.Where(c => !char.IsWhiteSpace(c)));
+        List<string> sanArray = [];
+        foreach (string san in subjectAlternativeNames.Split(',', StringSplitOptions.RemoveEmptyEntries))
         {
-            if ((Uri.CheckHostName(san) != UriHostNameType.Dns))
+            if (!IssuancePolicyService.IsValidRequestedDnsIdentity(san, out string canonicalSan))
             {
                 ShowErrorDialogue("Subject Alternative Name(s) contains at least one invalid DNS name");
-                return;
+                return Task.CompletedTask;
             }
-            sanArray.Add(UTF8Encode(san));
+            sanArray.Add(canonicalSan);
+        }
+        if (sanArray.Count == 0)
+        {
+            sanArray.Add(canonicalCn);
         }
 
-        // This will also catch empty / malformed strings.
-        try { System.Globalization.RegionInfo info = new System.Globalization.RegionInfo(country); }
+        try
+        {
+            _ = new RegionInfo(country.Trim());
+        }
         catch (ArgumentException)
         {
             ShowErrorDialogue("Country must be a valid ISO 3166 country code");
-            return;
+            return Task.CompletedTask;
         }
 
-        // It's OK if this contains nothing.
-        if (!string.IsNullOrWhiteSpace(emailAddress))
+        if (!string.IsNullOrWhiteSpace(emailAddress) && !DomainPolicyEvaluator.IsValidEmail(emailAddress))
         {
-
-            if (!IsValidEmail(emailAddress))
-            {
-                ShowErrorDialogue("The value provided for Email Address could not be validated");
-                return;
-            }
+            ShowErrorDialogue("The value provided for Email Address could not be validated");
+            return Task.CompletedTask;
         }
         if (string.IsNullOrEmpty(stateOrProvince))
         {
             ShowErrorDialogue("State or Province field must be present");
-            return;
+            return Task.CompletedTask;
         }
         if (string.IsNullOrEmpty(locality))
         {
             ShowErrorDialogue("Locality field must be present");
-            return;
+            return Task.CompletedTask;
         }
         if (string.IsNullOrEmpty(organisation))
         {
             ShowErrorDialogue("Organisation field must be present");
-            return;
+            return Task.CompletedTask;
         }
+
         try
         {
-            stateOrProvince = UTF8Encode(stateOrProvince);
-            locality = UTF8Encode(locality);
-            organisation = UTF8Encode(organisation);
-            organisationalUnit = UTF8Encode(organisationalUnit);
-            emailAddress = UTF8Encode(emailAddress);
-        }
-        catch (ArgumentException)
-        {
-            ShowErrorDialogue("Could not encode all fields as UTF-8");
-            return;
-        }
-        try
-        {
-            csr = crypto.CSRGen(kp, UTF8Encode(commonName), sanArray.ToArray(),
-            UTF8Encode(country), UTF8Encode(stateOrProvince), UTF8Encode(locality), UTF8Encode(organisation), UTF8Encode(organisationalUnit), UTF8Encode(emailAddress));
+            csr = crypto.CSRGen(
+                kp,
+                canonicalCn,
+                sanArray.ToArray(),
+                country.Trim().ToUpperInvariant(),
+                stateOrProvince.Trim(),
+                locality.Trim(),
+                organisation.Trim(),
+                organisationalUnit.Trim(),
+                emailAddress.Trim());
         }
         catch (Exception x)
         {
             ShowErrorDialogue(x.Message);
-            return;
         }
-    }
-
-    private static bool DomainMatchesPattern(string domain, string pattern)
-    {
-        if (pattern == "*") return true;
-        if (pattern.StartsWith("*."))
-        {
-            string suffix = pattern[1..]; // e.g. ".contoso.com"
-            return domain.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)
-                || domain.Equals(suffix[1..], StringComparison.OrdinalIgnoreCase);
-        }
-        return domain.Equals(pattern, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static List<string> GetDomainsFromCsr(string csrPem)
-    {
-        List<string> domains = new();
-        Pkcs10CertificationRequest decoded = (Pkcs10CertificationRequest)new PemReader(new StringReader(csrPem)).ReadObject();
-        CertificationRequestInfo info = decoded.GetCertificationRequestInfo();
-
-        // Extract CN
-        var oids = info.Subject.GetOidList();
-        var values = info.Subject.GetValueList();
-        for (int i = 0; i < oids.Count; i++)
-        {
-            if (X509Name.CN.Equals(oids[i])) { domains.Add((string)values[i]!); }
-        }
-
-        // Extract SANs from extension request attributes
-        Asn1Set attributes = info.Attributes;
-        if (attributes != null)
-        {
-            foreach (Asn1Encodable attr in attributes)
-            {
-                AttributePkcs pkcsAttr = AttributePkcs.GetInstance(attr);
-                if (PkcsObjectIdentifiers.Pkcs9AtExtensionRequest.Equals(pkcsAttr.AttrType))
-                {
-                    foreach (Asn1Encodable extSet in pkcsAttr.AttrValues)
-                    {
-                        X509Extensions extensions = X509Extensions.GetInstance(extSet);
-                        X509Extension sanExt = extensions.GetExtension(X509Extensions.SubjectAlternativeName);
-                        if (sanExt != null)
-                        {
-                            GeneralNames sans = GeneralNames.GetInstance(Asn1OctetString.GetInstance(sanExt.Value).GetOctets());
-                            foreach (GeneralName gn in sans.GetNames())
-                            {
-                                if (gn.TagNo == GeneralName.DnsName) { domains.Add(gn.Name.ToString()!); }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return domains.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        return Task.CompletedTask;
     }
 
     private async Task RequestClick()
     {
-        AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
-        ClaimsPrincipal user = authState.User;
-        IEnumerable<Claim> claims = Enumerable.Empty<Claim>();
-        if (user.Identity is not null) { if (user.Identity.IsAuthenticated) { claims = user.Claims.Where(q => q.Type == ClaimTypes.GroupSid); } }
-
-        // Read settings.xml and determine which groups are allowed to issue certificates for which domains.
-        // Doing this at every attempt allows for changes to settings.xml without restarting the application.
-        XElement root = settings.Root ?? new XElement("null");
-        if (root.Value == "null") { ShowErrorDialogue("Could not parse settings.xml"); return; }
-
-        // Resolve the user's AD group names from their claims
-        HashSet<string> userGroups = new(StringComparer.OrdinalIgnoreCase);
-        foreach (Claim claim in claims)
-        {
-            try
-            {
-                string name = new SecurityIdentifier(claim.Value).Translate(typeof(NTAccount)).ToString();
-                userGroups.Add(name);
-            }
-            catch { /* skip SIDs that cannot be resolved */ }
-        }
-
-        // Collect all allowed domain patterns from groups the user belongs to
-        List<string> allowedPatterns = new();
-        XElement? groupsElement = root.Element("Groups");
-        if (groupsElement != null)
-        {
-            foreach (XElement groupElement in groupsElement.Elements("Group"))
-            {
-                string groupName = groupElement.Element("Name")?.Value ?? string.Empty;
-                if (userGroups.Contains(groupName))
-                {
-                    XElement? domainsElement = groupElement.Element("Domains");
-                    if (domainsElement != null)
-                    {
-                        foreach (XElement domain in domainsElement.Elements("Domain"))
-                        {
-                            allowedPatterns.Add(domain.Value);
-                        }
-                    }
-                }
-            }
-        }
-
         if (string.IsNullOrEmpty(csr))
         {
             ShowErrorDialogue("You must provide a CSR before requesting a certificate");
             return;
         }
 
-        // Extract all domains from the CSR and verify each one is allowed
-        List<string> requestedDomains;
-        try { requestedDomains = GetDomainsFromCsr(csr); }
-        catch (Exception)
-        {
-            ShowErrorDialogue("Could not parse the CSR to verify requested domains");
-            return;
-        }
-
-        List<string> deniedDomains = requestedDomains.Where(domain => !allowedPatterns.Any(pattern => DomainMatchesPattern(domain, pattern))).ToList();
-        if (deniedDomains.Count > 0)
-        {
-            ShowErrorDialogue("You are not authorised to request certificates for: " + string.Join(", ", deniedDomains));
-            return;
-        }
+        AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        ClaimsPrincipal principal = authState.User;
+        string? userId = principal.FindFirstValue(ClaimTypes.NameIdentifier);
+        string? securityStamp = principal.FindFirstValue("AspNet.Identity.SecurityStamp");
 
         using CancellationTokenSource cts = new();
         Task animationTask = Task.Run(async () =>
@@ -570,24 +430,25 @@
             }
         });
 
-        string? result = null;
-        Exception? error = null;
-        await Task.Run(() =>
-        {
-            try { result = CryptoFactory.RequestCert(csr); }
-            catch (Exception x) { error = x; }
-        });
+        IssuanceOutcome outcome = await CaService.IssueCertificateFromCsrAsync(
+            userId,
+            csr,
+            explicitProfileId: null,
+            requestedValidityDays: null,
+            expectedSecurityStamp: securityStamp);
 
         cts.Cancel();
         await animationTask;
 
-        if (error != null)
+        if (!outcome.Succeeded)
         {
             certificate = "";
-            ShowErrorDialogue(error.Message);
+            ShowErrorDialogue(outcome.ErrorMessage ?? "Certificate issuance failed.");
             return;
         }
-        certificate = result ?? "";
+
+        certificate = outcome.CertificatePem ?? "";
+        lastIssuedChainPem = outcome.Record?.ChainPem;
     }
 
     private async Task ExportClick()
@@ -599,14 +460,33 @@
         }
         try
         {
-            Tuple<string, byte[]>? zipObj = PkcsBuilder.Export(certificate, privateKey);
-            if (zipObj == null) { throw new NullReferenceException("Unable to export. Either the certificate supplied could not be parsed, or CertRobo was unable to load the root certificate."); }
-            else
+            string? chainPem = lastIssuedChainPem;
+            if (string.IsNullOrWhiteSpace(chainPem))
             {
-                MemoryStream output = new MemoryStream(zipObj.Item2);
-                DotNetStreamReference streamRef = new DotNetStreamReference(output, false);
-                await JS.InvokeVoidAsync("downloadFileFromStream", zipObj.Item1, streamRef);
+                CaAuthorityRecord? activeCa = await CaService.GetActiveAuthorityAsync();
+                if (activeCa != null)
+                {
+                    chainPem = CertificateAuthorityService.BuildOrderedCertificateChainPem(activeCa);
+                }
             }
+
+            Tuple<string, byte[]>? zipObj = PkcsBuilder.Export(
+                certificate,
+                privateKey,
+                rootCaCertPath: null,
+                chainPemContent: chainPem);
+
+            if (zipObj == null)
+            {
+                throw new InvalidOperationException("Unable to export. Either the certificate supplied could not be parsed, or CertRobo was unable to load the CA certificate chain.");
+            }
+
+            MemoryStream output = new(zipObj.Item2);
+            using DotNetStreamReference streamRef = new(output, false);
+            await JS.InvokeVoidAsync("downloadFileFromStream", zipObj.Item1, streamRef);
+
+            // Clear ephemeral generated private key from component state after export
+            privateKey = "";
         }
         catch (Exception x)
         {
