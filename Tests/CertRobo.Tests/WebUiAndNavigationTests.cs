@@ -120,11 +120,16 @@ public class WebUiAndNavigationTests : IDisposable
         Assert.Contains("Administration", adminHtml);
         Assert.DoesNotContain("<table class=\"top-row auth\"", adminHtml);
 
-        // 4 Admin section tabs
+        // 4 Admin section tabs with roving tabindex (active tab 0, inactive tabs -1)
         Assert.Contains("id=\"tab-ca\"", adminHtml);
         Assert.Contains("id=\"tab-users\"", adminHtml);
         Assert.Contains("id=\"tab-certs\"", adminHtml);
         Assert.Contains("id=\"tab-settings\"", adminHtml);
+        Assert.Matches(@"id=""tab-ca""[^>]*tabindex=""0""", adminHtml);
+        Assert.Matches(@"id=""tab-users""[^>]*tabindex=""-1""", adminHtml);
+        Assert.Matches(@"id=""tab-certs""[^>]*tabindex=""-1""", adminHtml);
+        Assert.Matches(@"id=""tab-settings""[^>]*tabindex=""-1""", adminHtml);
+        Assert.Matches(@"id=""panel-ca""\s+role=""tabpanel""\s+aria-labelledby=""tab-ca""\s+tabindex=""0""", adminHtml);
 
         // Verify all rendered <label for="..."> attributes in /admin match an input/select/textarea id
         MatchCollection labelMatches = Regex.Matches(adminHtml, "<label[^>]*\\bfor=\"([^\"]+)\"");
@@ -145,6 +150,98 @@ public class WebUiAndNavigationTests : IDisposable
         }));
         Assert.Equal(HttpStatusCode.Redirect, logoutPost.StatusCode);
         Assert.Equal("/login", logoutPost.Headers.Location?.OriginalString);
+    }
+
+    [Fact]
+    public async Task AdminComponent_ClearsPendingAccountEditorState_OnCreateUser_And_ImplementsTabKeyboardNavigation()
+    {
+        using IServiceScope scope = _factory.Services.CreateScope();
+        AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+        var (_, _, adminUser) = await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*.contoso.com");
+        Assert.NotNull(adminUser);
+
+        // Instantiate Pages.Admin with real services from the DI container
+        CertRobo.Pages.Admin adminPage = new();
+        Type adminType = typeof(CertRobo.Pages.Admin);
+        SetProperty(adminPage, "AccountService", acct);
+        SetProperty(adminPage, "CaService", scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>());
+        SetProperty(adminPage, "BackupService", scope.ServiceProvider.GetRequiredService<BackupRestoreService>());
+        SetProperty(adminPage, "MigrationService", scope.ServiceProvider.GetRequiredService<LegacySettingsMigrationService>());
+        SetProperty(adminPage, "Configuration", scope.ServiceProvider.GetRequiredService<IConfiguration>());
+        SetProperty(adminPage, "HostEnvironment", scope.ServiceProvider.GetRequiredService<Microsoft.AspNetCore.Hosting.IWebHostEnvironment>());
+        SetProperty(adminPage, "AuthenticationStateProvider", scope.ServiceProvider.GetRequiredService< Microsoft.AspNetCore.Components.Authorization.AuthenticationStateProvider>());
+        SetProperty(adminPage, "NotificationService", scope.ServiceProvider.GetRequiredService<Radzen.NotificationService>());
+
+        await InvokeMethodAsync(adminPage, "OnInitializedAsync");
+        Assert.Equal(adminUser.Id, GetField<string?>(adminPage, "selectedUserId"));
+
+        // 1. Simulate managing account A (admin) with an unconfirmed password reset and pending domain/profile inputs
+        SetField(adminPage, "showPasswordResetForSelectedUser", true);
+        SetField(adminPage, "selectedUserNewPassword", "UnfinishedReset!2026");
+        SetField(adminPage, "selectedUserDomainPattern", "*.stale-domain.contoso.com");
+        SetField(adminPage, "selectedUserAllowedProfile", CertificateProfiles.Rsa4096ServerId);
+
+        // 2. Open Add Local Account and create account B (operator-b)
+        SetField(adminPage, "showCreateUserForm", true);
+        SetField(adminPage, "newUserName", "operator-b");
+        SetField(adminPage, "newUserEmail", "operator-b@contoso.com");
+        SetField(adminPage, "newUserPassword", "OperatorBPass!2026");
+        SetField(adminPage, "newUserRole", AppRoles.Issuer);
+        SetField(adminPage, "newUserDomains", "*.ops.contoso.com");
+
+        await InvokeMethodAsync(adminPage, "CreateUserClick");
+
+        // 3. Verify selected account switched to B AND all pending account-editor fields from A were cleared
+        IReadOnlyList<UserSummaryDto> currentUsers = GetField<IReadOnlyList<UserSummaryDto>>(adminPage, "users");
+        UserSummaryDto? userB = currentUsers.FirstOrDefault(u => u.UserName == "operator-b");
+        Assert.NotNull(userB);
+        Assert.Equal(userB.Id, GetField<string?>(adminPage, "selectedUserId"));
+        Assert.False(GetField<bool>(adminPage, "showPasswordResetForSelectedUser"));
+        Assert.Equal(string.Empty, GetField<string>(adminPage, "selectedUserNewPassword"));
+        Assert.Equal(string.Empty, GetField<string>(adminPage, "selectedUserDomainPattern"));
+        Assert.Equal("*", GetField<string>(adminPage, "selectedUserAllowedProfile"));
+
+        // 4. Verify W3C tabs keyboard navigation (ArrowRight, ArrowLeft, End, Home)
+        Assert.Equal("CertificateAuthority", GetField<object>(adminPage, "activeSection").ToString());
+
+        await InvokeMethodAsync(adminPage, "OnTabKeyDownAsync", new Microsoft.AspNetCore.Components.Web.KeyboardEventArgs { Key = "ArrowRight" });
+        Assert.Equal("UsersAndPermissions", GetField<object>(adminPage, "activeSection").ToString());
+
+        await InvokeMethodAsync(adminPage, "OnTabKeyDownAsync", new Microsoft.AspNetCore.Components.Web.KeyboardEventArgs { Key = "End" });
+        Assert.Equal("SettingsAndMaintenance", GetField<object>(adminPage, "activeSection").ToString());
+
+        await InvokeMethodAsync(adminPage, "OnTabKeyDownAsync", new Microsoft.AspNetCore.Components.Web.KeyboardEventArgs { Key = "ArrowLeft" });
+        Assert.Equal("Certificates", GetField<object>(adminPage, "activeSection").ToString());
+
+        await InvokeMethodAsync(adminPage, "OnTabKeyDownAsync", new Microsoft.AspNetCore.Components.Web.KeyboardEventArgs { Key = "Home" });
+        Assert.Equal("CertificateAuthority", GetField<object>(adminPage, "activeSection").ToString());
+    }
+
+    private static void SetProperty(object instance, string name, object value)
+    {
+        var prop = instance.GetType().GetProperty(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)!;
+        prop.SetValue(instance, value);
+    }
+
+    private static T GetField<T>(object instance, string name)
+    {
+        var field = instance.GetType().GetField(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        return (T)field.GetValue(instance)!;
+    }
+
+    private static void SetField(object instance, string name, object? value)
+    {
+        var field = instance.GetType().GetField(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        field.SetValue(instance, value);
+    }
+
+    private static async Task InvokeMethodAsync(object instance, string name, params object[] args)
+    {
+        var method = instance.GetType().GetMethod(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        if (method.Invoke(instance, args) is Task task)
+        {
+            await task;
+        }
     }
 
     private static string ExtractAntiforgeryToken(string html)

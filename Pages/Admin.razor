@@ -34,12 +34,14 @@
     }
 
     <!-- Section Navigation -->
-    <nav class="admin-section-nav" role="tablist" aria-label="Administration sections">
+    <div class="admin-section-nav" role="tablist" aria-label="Administration sections" @onkeydown="OnTabKeyDownAsync">
         <button type="button"
+                @ref="_tabCaRef"
                 role="tab"
                 id="tab-ca"
                 aria-controls="panel-ca"
                 aria-selected="@(activeSection == AdminSection.CertificateAuthority ? "true" : "false")"
+                tabindex="@(activeSection == AdminSection.CertificateAuthority ? 0 : -1)"
                 class="admin-tab-btn @(activeSection == AdminSection.CertificateAuthority ? "active" : "")"
                 @onclick="() => SelectSection(AdminSection.CertificateAuthority)">
             <span>Certificate authority</span>
@@ -54,10 +56,12 @@
         </button>
 
         <button type="button"
+                @ref="_tabUsersRef"
                 role="tab"
                 id="tab-users"
                 aria-controls="panel-users"
                 aria-selected="@(activeSection == AdminSection.UsersAndPermissions ? "true" : "false")"
+                tabindex="@(activeSection == AdminSection.UsersAndPermissions ? 0 : -1)"
                 class="admin-tab-btn @(activeSection == AdminSection.UsersAndPermissions ? "active" : "")"
                 @onclick="() => SelectSection(AdminSection.UsersAndPermissions)">
             <span>Users and permissions</span>
@@ -65,10 +69,12 @@
         </button>
 
         <button type="button"
+                @ref="_tabCertsRef"
                 role="tab"
                 id="tab-certs"
                 aria-controls="panel-certs"
                 aria-selected="@(activeSection == AdminSection.Certificates ? "true" : "false")"
+                tabindex="@(activeSection == AdminSection.Certificates ? 0 : -1)"
                 class="admin-tab-btn @(activeSection == AdminSection.Certificates ? "active" : "")"
                 @onclick="() => SelectSection(AdminSection.Certificates)">
             <span>Certificates</span>
@@ -76,20 +82,22 @@
         </button>
 
         <button type="button"
+                @ref="_tabSettingsRef"
                 role="tab"
                 id="tab-settings"
                 aria-controls="panel-settings"
                 aria-selected="@(activeSection == AdminSection.SettingsAndMaintenance ? "true" : "false")"
+                tabindex="@(activeSection == AdminSection.SettingsAndMaintenance ? 0 : -1)"
                 class="admin-tab-btn @(activeSection == AdminSection.SettingsAndMaintenance ? "active" : "")"
                 @onclick="() => SelectSection(AdminSection.SettingsAndMaintenance)">
             <span>Settings and maintenance</span>
         </button>
-    </nav>
+    </div>
 
     <!-- SECTION 1: CERTIFICATE AUTHORITY -->
     @if (activeSection == AdminSection.CertificateAuthority)
     {
-        <section id="panel-ca" role="tabpanel" aria-labelledby="tab-ca">
+        <section id="panel-ca" role="tabpanel" aria-labelledby="tab-ca" tabindex="0">
             <RadzenCard class="mb-4">
                 <div class="section-card-header">
                     <div>
@@ -396,7 +404,7 @@
     <!-- SECTION 2: USERS AND PERMISSIONS -->
     @if (activeSection == AdminSection.UsersAndPermissions)
     {
-        <section id="panel-users" role="tabpanel" aria-labelledby="tab-users">
+        <section id="panel-users" role="tabpanel" aria-labelledby="tab-users" tabindex="0">
             <RadzenCard class="mb-4">
                 <div class="section-card-header">
                     <div>
@@ -636,7 +644,7 @@
     <!-- SECTION 3: CERTIFICATES -->
     @if (activeSection == AdminSection.Certificates)
     {
-        <section id="panel-certs" role="tabpanel" aria-labelledby="tab-certs">
+        <section id="panel-certs" role="tabpanel" aria-labelledby="tab-certs" tabindex="0">
             <RadzenCard class="mb-4">
                 <div class="section-card-header">
                     <div>
@@ -755,7 +763,7 @@
     <!-- SECTION 4: SETTINGS AND MAINTENANCE -->
     @if (activeSection == AdminSection.SettingsAndMaintenance)
     {
-        <section id="panel-settings" role="tabpanel" aria-labelledby="tab-settings">
+        <section id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" tabindex="0">
             <!-- Group 1: X.509 Subject Defaults -->
             <RadzenCard class="mb-4" style="max-width: 920px;">
                 <div class="section-card-header">
@@ -920,6 +928,19 @@
         Import
     }
 
+    private static readonly AdminSection[] SectionOrder =
+    [
+        AdminSection.CertificateAuthority,
+        AdminSection.UsersAndPermissions,
+        AdminSection.Certificates,
+        AdminSection.SettingsAndMaintenance
+    ];
+
+    private ElementReference _tabCaRef;
+    private ElementReference _tabUsersRef;
+    private ElementReference _tabCertsRef;
+    private ElementReference _tabSettingsRef;
+
     private AdminSection activeSection = AdminSection.CertificateAuthority;
     private CaProvisionMode caProvisionMode = CaProvisionMode.None;
 
@@ -996,6 +1017,46 @@
         activeSection = section;
     }
 
+    private async Task OnTabKeyDownAsync(KeyboardEventArgs e)
+    {
+        int currentIndex = Array.IndexOf(SectionOrder, activeSection);
+        if (currentIndex < 0)
+        {
+            currentIndex = 0;
+        }
+
+        AdminSection? nextSection = e.Key switch
+        {
+            "ArrowRight" => SectionOrder[(currentIndex + 1) % SectionOrder.Length],
+            "ArrowLeft" => SectionOrder[(currentIndex - 1 + SectionOrder.Length) % SectionOrder.Length],
+            "Home" => SectionOrder[0],
+            "End" => SectionOrder[^1],
+            _ => null
+        };
+
+        if (nextSection.HasValue)
+        {
+            activeSection = nextSection.Value;
+            ElementReference targetRef = activeSection switch
+            {
+                AdminSection.CertificateAuthority => _tabCaRef,
+                AdminSection.UsersAndPermissions => _tabUsersRef,
+                AdminSection.Certificates => _tabCertsRef,
+                AdminSection.SettingsAndMaintenance => _tabSettingsRef,
+                _ => _tabCaRef
+            };
+
+            try
+            {
+                await targetRef.FocusAsync();
+            }
+            catch
+            {
+                // Ignore if focus occurs during disconnect
+            }
+        }
+    }
+
     private void ToggleCaProvisionMode(CaProvisionMode mode)
     {
         caProvisionMode = caProvisionMode == mode ? CaProvisionMode.None : mode;
@@ -1003,14 +1064,16 @@
 
     private void SelectUser(string userId)
     {
-        if (selectedUserId != userId)
-        {
-            selectedUserId = userId;
-            showPasswordResetForSelectedUser = false;
-            selectedUserNewPassword = "";
-            selectedUserDomainPattern = "";
-            selectedUserAllowedProfile = "*";
-        }
+        selectedUserId = userId;
+        ResetSelectedUserEditorState();
+    }
+
+    private void ResetSelectedUserEditorState()
+    {
+        showPasswordResetForSelectedUser = false;
+        selectedUserNewPassword = "";
+        selectedUserDomainPattern = "";
+        selectedUserAllowedProfile = "*";
     }
 
     private async Task ReloadAllAsync()
@@ -1258,7 +1321,11 @@
         showCreateUserForm = false;
         if (createdUser != null)
         {
-            selectedUserId = createdUser.Id;
+            SelectUser(createdUser.Id);
+        }
+        else
+        {
+            ResetSelectedUserEditorState();
         }
         await ReloadAllAsync();
         Notify(Radzen.NotificationSeverity.Success, "User Created", "Local account created.");
