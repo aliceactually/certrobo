@@ -2,53 +2,73 @@
 @implements IDisposable
 @using CertRobo.Data
 @inject CertRobo.Shared.ThemeService ThemeService
+@inject NavigationManager NavigationManager
 
 <PageTitle>CertRobo</PageTitle>
 <RadzenNotification />
 
 <div class="page">
-
     <main>
-        <table class="top-row auth">
-            <tr>
-                <td class="auth-cell">
-                    <AuthorizeView>
-                        <Authorized>
-                            <span>Hello @context.User.Identity?.Name</span>
-                            <a href="/" class="ms-3">Certificate Tool</a>
+        <header class="top-row" role="banner">
+            <div class="top-row-left">
+                <a href="/" class="brand-title">CertRobo</a>
+                <AuthorizeView>
+                    <Authorized>
+                        <nav class="primary-nav" aria-label="Main navigation">
+                            <NavLink class="nav-item-link" href="" Match="NavLinkMatch.All">
+                                Certificate Tool
+                            </NavLink>
                             @if (context.User.IsInRole(AppRoles.Administrator))
                             {
-                                <a href="/admin" class="ms-3">Administration</a>
+                                <NavLink class="nav-item-link" href="admin">
+                                    Administration
+                                </NavLink>
                             }
-                            <a href="/ca.crt" class="ms-3" target="_blank">CA Chain</a>
-                            <a href="/ca.crl" class="ms-3" target="_blank">CRL</a>
-                            <form method="post" action="/account/logout" style="display:inline" class="ms-3">
-                                <input type="hidden" name="__RequestVerificationToken" value="@AntiforgeryToken" />
-                                <button type="submit" class="btn btn-link p-0">Sign Out</button>
-                            </form>
-                        </Authorized>
-                        <NotAuthorized>
-                            @if (IsBootstrapRequired)
-                            {
-                                <a href="/setup" target="_top">Initial Setup</a>
-                            }
-                            else
-                            {
-                                <a href="/login" target="_top">Sign In</a>
-                            }
-                        </NotAuthorized>
-                    </AuthorizeView>
-                </td>
-                <td class="toggle-cell">
-                    @if (_initialized)
-                    {
-                        <button class="theme-toggle" @onclick="ToggleTheme" title="Toggle dark mode">
-                            <span class="theme-icon">@(ThemeService.CurrentTheme == "dark" ? "☀️" : "🌙")</span>
-                        </button>
-                    }
-                </td>
-            </tr>
-        </table>
+                        </nav>
+                        <div class="trust-links" role="group" aria-label="Public CA downloads">
+                            <a href="/ca.crt" class="trust-link" target="_blank" title="Download active CA certificate chain (PEM)">CA Chain</a>
+                            <a href="/ca.crl" class="trust-link" target="_blank" title="Download latest Certificate Revocation List (DER)">CRL</a>
+                        </div>
+                    </Authorized>
+                </AuthorizeView>
+            </div>
+
+            <div class="top-row-right">
+                <AuthorizeView>
+                    <Authorized>
+                        <span class="user-greeting" title="Signed-in local account">
+                            Signed in as <strong>@context.User.Identity?.Name</strong>
+                        </span>
+                        <form method="post" action="/account/logout" class="logout-form">
+                            <input type="hidden" name="__RequestVerificationToken" value="@AntiforgeryToken" />
+                            <button type="submit" class="btn btn-sm btn-outline-secondary logout-btn">Sign Out</button>
+                        </form>
+                    </Authorized>
+                    <NotAuthorized>
+                        @if (IsBootstrapRequired)
+                        {
+                            <a href="/setup" target="_top" class="btn btn-sm btn-primary">Initial Setup</a>
+                        }
+                        else
+                        {
+                            <a href="/login" target="_top" class="btn btn-sm btn-primary">Sign In</a>
+                        }
+                    </NotAuthorized>
+                </AuthorizeView>
+
+                @if (_initialized)
+                {
+                    <button type="button"
+                            class="theme-toggle"
+                            @onclick="ToggleTheme"
+                            aria-label="@(ThemeService.CurrentTheme == "dark" ? "Switch to light theme" : "Switch to dark theme")"
+                            title="@(ThemeService.CurrentTheme == "dark" ? "Switch to light theme" : "Switch to dark theme")">
+                        <span class="theme-icon" aria-hidden="true">@(ThemeService.CurrentTheme == "dark" ? "☀️" : "🌙")</span>
+                    </button>
+                }
+            </div>
+        </header>
+
         <article class="content px-4">
             @Body
         </article>
