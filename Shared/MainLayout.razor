@@ -1,5 +1,6 @@
 ﻿@inherits LayoutComponentBase
 @implements IDisposable
+@using CertRobo.Data
 @inject CertRobo.Shared.ThemeService ThemeService
 
 <PageTitle>CertRobo</PageTitle>
@@ -13,10 +14,28 @@
                 <td class="auth-cell">
                     <AuthorizeView>
                         <Authorized>
-                            <p>Hello @context.User.Identity?.Name</p>
+                            <span>Hello @context.User.Identity?.Name</span>
+                            <a href="/" class="ms-3">Certificate Tool</a>
+                            @if (context.User.IsInRole(AppRoles.Administrator))
+                            {
+                                <a href="/admin" class="ms-3">Administration</a>
+                            }
+                            <a href="/ca.crt" class="ms-3" target="_blank">CA Chain</a>
+                            <a href="/ca.crl" class="ms-3" target="_blank">CRL</a>
+                            <form method="post" action="/account/logout" style="display:inline" class="ms-3">
+                                <input type="hidden" name="__RequestVerificationToken" value="@AntiforgeryToken" />
+                                <button type="submit" class="btn btn-link p-0">Sign Out</button>
+                            </form>
                         </Authorized>
                         <NotAuthorized>
-                            <p>Not Authorized</p>
+                            @if (IsBootstrapRequired)
+                            {
+                                <a href="/setup" target="_top">Initial Setup</a>
+                            }
+                            else
+                            {
+                                <a href="/login" target="_top">Sign In</a>
+                            }
                         </NotAuthorized>
                     </AuthorizeView>
                 </td>
@@ -38,6 +57,12 @@
 
 @code {
     private bool _initialized;
+
+    [CascadingParameter(Name = "AntiforgeryToken")]
+    public string? AntiforgeryToken { get; set; }
+
+    [CascadingParameter(Name = "IsBootstrapRequired")]
+    public bool IsBootstrapRequired { get; set; }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {

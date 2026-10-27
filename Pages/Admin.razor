@@ -1,0 +1,710 @@
+@page "/admin"
+@attribute [Authorize(Roles = AppRoles.Administrator)]
+@using CertRobo.Data
+@using CertRobo.Models
+@using CertRobo.Services
+@using Microsoft.Extensions.Configuration
+@using System.Security.Claims
+@inject AccountManagementService AccountService
+@inject CertificateAuthorityService CaService
+@inject BackupRestoreService BackupService
+@inject LegacySettingsMigrationService MigrationService
+@inject IConfiguration Configuration
+@inject IWebHostEnvironment HostEnvironment
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject IJSRuntime JS
+@inject Radzen.NotificationService NotificationService
+
+<PageTitle>CertRobo — Administration</PageTitle>
+
+<div class="container-fluid">
+    <div class="row mb-3">
+        <div class="col d-flex justify-content-between align-items-center">
+            <h2>CertRobo Administration</h2>
+            <RadzenButton Text="Download Consistent Backup (.zip)" Click="@DownloadBackupClick" />
+        </div>
+    </div>
+
+    <!-- CA Status & Create / Import -->
+    <div class="row mb-4">
+        <div class="col-lg-4 mb-3">
+            <RadzenCard>
+                <h3>Certificate Authority Status</h3>
+                @if (activeCa == null)
+                {
+                    <p class="text-warning">No active Certificate Authority is configured yet.</p>
+                }
+                else
+                {
+                    <p><strong>Active CA:</strong> @activeCa.Name (@(activeCa.IsIntermediate ? "Intermediate CA" : "Root CA"))</p>
+                    <p><strong>Valid:</strong> @activeCa.NotBeforeUtc.ToString("yyyy-MM-dd") to @activeCa.NotAfterUtc.ToString("yyyy-MM-dd")</p>
+                    <p><strong>Last Serial:</strong> @activeCa.LastAllocatedSerial | <strong>Last CRL #:</strong> @activeCa.LastCrlNumber</p>
+                    <p>
+                        <strong>Signing Key State:</strong>
+                        @if (IsCaUnlocked)
+                        {
+                            <span class="text-success">Unlocked</span>
+                        }
+                        else
+                        {
+                            <span class="text-danger">Locked (passphrase required)</span>
+                        }
+                    </p>
+                    <div class="d-flex gap-2 mt-2">
+                        <input class="form-control" type="password" placeholder="CA Key Passphrase" @bind="unlockPassphrase" />
+                        <RadzenButton Text="Unlock CA" Click="@UnlockCaClick" />
+                        <RadzenButton Text="Refresh CRL" Click="@RefreshCrlClick" />
+                    </div>
+                }
+            </RadzenCard>
+        </div>
+
+        <div class="col-lg-4 mb-3">
+            <RadzenCard>
+                <h3>Create New CA (Root or Intermediate)</h3>
+                <div class="row mb-2">
+                    <div class="col-6">
+                        <label class="form-label">CA Name</label>
+                        <input class="form-control" @bind="newCaName" />
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label">Subject Common Name</label>
+                        <input class="form-control" @bind="newCaCommonName" />
+                    </div>
+                </div>
+                <div class="row mb-2">
+                    <div class="col-4">
+                        <label class="form-label">Key Type</label>
+                        <select class="form-select" @bind="newCaKeySpec">
+                            <option value="ECDSA-384">ECDSA P-384</option>
+                            <option value="ECDSA-256">ECDSA P-256</option>
+                            <option value="RSA-4096">RSA 4096</option>
+                            <option value="RSA-2048">RSA 2048</option>
+                        </select>
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label">Validity (Days)</label>
+                        <input class="form-control" type="number" @bind="newCaValidityDays" />
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label">Key Passphrase</label>
+                        <input class="form-control" type="password" @bind="newCaPassphrase" />
+                    </div>
+                </div>
+                <div class="row mb-2">
+                    <div class="col-6">
+                        <label class="form-label">CRL URL (CDP)</label>
+                        <input class="form-control" @bind="newCaCdpUrl" />
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label">Issuer URL (AIA)</label>
+                        <input class="form-control" @bind="newCaAiaUrl" />
+                    </div>
+                </div>
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="subordinateCheck" @bind="createAsSubordinateOfActive" disabled="@(activeCa == null || activeCa.IsIntermediate)" />
+                    <label class="form-check-label" for="subordinateCheck">
+                        Sign as Intermediate CA under current active Root CA
+                    </label>
+                </div>
+                <RadzenButton Text="Generate & Activate CA" Click="@CreateCaClick" Style="width:100%" />
+            </RadzenCard>
+        </div>
+
+        <div class="col-lg-4 mb-3">
+            <RadzenCard>
+                <h3>Import Existing CA Material (PEM)</h3>
+                <div class="row mb-2">
+                    <div class="col-4">
+                        <label class="form-label">CA Name</label>
+                        <input class="form-control" @bind="importCaName" />
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label">Serial Floor</label>
+                        <input class="form-control" type="number" @bind="importSerialFloor" />
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label">CRL # Floor</label>
+                        <input class="form-control" type="number" @bind="importCrlFloor" />
+                    </div>
+                </div>
+                <div class="mb-2">
+                    <label class="form-label">Issuer Certificate PEM</label>
+                    <textarea class="form-control" rows="2" style="font-family:monospace;font-size:x-small" @bind="importCertPem"></textarea>
+                </div>
+                <div class="mb-2">
+                    <label class="form-label">Parent/Root Chain PEM (required for Intermediate CA)</label>
+                    <textarea class="form-control" rows="2" style="font-family:monospace;font-size:x-small" @bind="importChainPem"></textarea>
+                </div>
+                <div class="mb-2">
+                    <label class="form-label">Private Key PEM</label>
+                    <textarea class="form-control" rows="2" style="font-family:monospace;font-size:x-small" @bind="importKeyPem"></textarea>
+                </div>
+                <div class="row mb-2">
+                    <div class="col-6">
+                        <label class="form-label">Input Key Passphrase (if encrypted)</label>
+                        <input class="form-control" type="password" @bind="importInputPassphrase" />
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label">New Storage Passphrase</label>
+                        <input class="form-control" type="password" @bind="importStoragePassphrase" />
+                    </div>
+                </div>
+                <RadzenButton Text="Import & Activate CA" Click="@ImportCaClick" Style="width:100%" />
+            </RadzenCard>
+        </div>
+    </div>
+
+    <!-- Accounts & Domain Policy -->
+    <div class="row mb-4">
+        <div class="col-lg-4 mb-3">
+            <RadzenCard>
+                <h3>Create Local Account</h3>
+                <div class="mb-2">
+                    <label class="form-label">Username</label>
+                    <input class="form-control" @bind="newUserName" />
+                </div>
+                <div class="mb-2">
+                    <label class="form-label">Email (optional)</label>
+                    <input class="form-control" @bind="newUserEmail" />
+                </div>
+                <div class="mb-2">
+                    <label class="form-label">Password (min 12 chars)</label>
+                    <input class="form-control" type="password" @bind="newUserPassword" />
+                </div>
+                <div class="mb-2">
+                    <label class="form-label">Role</label>
+                    <select class="form-select" @bind="newUserRole">
+                        <option value="@AppRoles.Issuer">Issuer</option>
+                        <option value="@AppRoles.Administrator">Administrator</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Allowed Domain Pattern(s) (comma-separated, e.g. *.contoso.com)</label>
+                    <input class="form-control" @bind="newUserDomains" />
+                </div>
+                <RadzenButton Text="Create User" Click="@CreateUserClick" Style="width:100%" />
+            </RadzenCard>
+        </div>
+
+        <div class="col-lg-8 mb-3">
+            <RadzenCard>
+                <h3>Local Accounts, Domain Policy & Password Reset</h3>
+                <table class="table table-sm">
+                    <thead>
+                        <tr>
+                            <th>User</th>
+                            <th>Roles</th>
+                            <th>Allowed Domains</th>
+                            <th>Status</th>
+                            <th>Actions / Password Reset</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var u in users)
+                        {
+                            <tr>
+                                <td>@u.UserName</td>
+                                <td>@string.Join(", ", u.Roles)</td>
+                                <td>
+                                    @foreach (var perm in u.DirectPermissions)
+                                    {
+                                        <span class="badge bg-secondary me-1">
+                                            @perm.DomainPattern (@perm.AllowedProfileId)
+                                            <button type="button" class="btn-close btn-close-white ms-1" style="font-size:0.5rem" @onclick="() => RemovePermissionClick(perm.Id)"></button>
+                                        </span>
+                                    }
+                                    <div class="input-group input-group-sm mt-1">
+                                        <input class="form-control" placeholder="Add domain pattern..." @bind="addDomainInputs[u.Id]" />
+                                        <button class="btn btn-outline-primary" type="button" @onclick="() => AddUserDomainClick(u.Id)">+</button>
+                                    </div>
+                                </td>
+                                <td>@(u.IsDisabled ? "Disabled" : "Active")</td>
+                                <td>
+                                    <div class="d-flex gap-1 align-items-center">
+                                        <button class="btn btn-sm @(u.IsDisabled ? "btn-success" : "btn-warning")"
+                                                @onclick="() => ToggleUserDisabledClick(u)">
+                                            @(u.IsDisabled ? "Enable" : "Disable")
+                                        </button>
+                                        <input class="form-control form-control-sm" type="password" placeholder="New password..." style="max-width:140px" @bind="resetPasswordInputs[u.Id]" />
+                                        <button class="btn btn-sm btn-outline-secondary" type="button" @onclick="() => ResetUserPasswordClick(u.Id, u.UserName)">Reset</button>
+                                    </div>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </RadzenCard>
+        </div>
+    </div>
+
+    <!-- Subject Defaults & Legacy Migration Worksheet -->
+    <div class="row mb-4">
+        <div class="col-lg-6 mb-3">
+            <RadzenCard>
+                <h3>X.509 Subject Defaults (Autofill)</h3>
+                <div class="row mb-2">
+                    <div class="col-4">
+                        <label class="form-label">Country (ISO-2)</label>
+                        <input class="form-control" maxlength="2" @bind="subjectDefaults.Country" />
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label">State or Province</label>
+                        <input class="form-control" @bind="subjectDefaults.StateOrProvince" />
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label">Locality</label>
+                        <input class="form-control" @bind="subjectDefaults.Locality" />
+                    </div>
+                </div>
+                <div class="row mb-2">
+                    <div class="col-4">
+                        <label class="form-label">Organisation</label>
+                        <input class="form-control" @bind="subjectDefaults.Organisation" />
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label">Organisational Unit</label>
+                        <input class="form-control" @bind="subjectDefaults.OrganisationalUnit" />
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label">Email Address</label>
+                        <input class="form-control" @bind="subjectDefaults.EmailAddress" />
+                    </div>
+                </div>
+                <div class="d-flex gap-2">
+                    <RadzenButton Text="Save Subject Defaults" Click="@SaveDefaultsClick" />
+                    <RadzenButton Text="Inspect Legacy settings.xml" Click="@InspectLegacySettingsClick" />
+                </div>
+                @if (!string.IsNullOrWhiteSpace(legacyWorksheetText))
+                {
+                    <pre class="mt-2 p-2 border rounded" style="font-size:x-small;max-height:180px;overflow:auto">@legacyWorksheetText</pre>
+                }
+            </RadzenCard>
+        </div>
+
+        <div class="col-lg-6 mb-3">
+            <RadzenCard>
+                <h3>Seed Legacy Revoked Serial (Imported CA Continuity)</h3>
+                <p class="small">Record serial numbers previously revoked under an imported CA identity and republish the CRL.</p>
+                <div class="row mb-2">
+                    <div class="col-4">
+                        <label class="form-label">Serial Number (Hex)</label>
+                        <input class="form-control" placeholder="e.g. 01A2B3C4" @bind="seedSerialHex" />
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label">Common Name (optional)</label>
+                        <input class="form-control" placeholder="legacy.contoso.com" @bind="seedCommonName" />
+                    </div>
+                    <div class="col-4">
+                        <label class="form-label">Reason</label>
+                        <select class="form-select" @bind="seedReasonCode">
+                            <option value="0">0 — Unspecified</option>
+                            <option value="1">1 — KeyCompromise</option>
+                            <option value="4">4 — Superseded</option>
+                            <option value="5">5 — CessationOfOperation</option>
+                        </select>
+                    </div>
+                </div>
+                <RadzenButton Text="Seed Revoked Serial & Update CRL" Click="@SeedRevokedSerialClick" Style="width:100%" />
+            </RadzenCard>
+        </div>
+    </div>
+
+    <!-- Certificate Ledger & Revocation -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <RadzenCard>
+                <h3>Issued Certificate Ledger & Revocation</h3>
+                <div class="d-flex gap-2 mb-3">
+                    <input class="form-control" placeholder="Search by CN, SAN, serial, or requester..." @bind="certSearchQuery" />
+                    <RadzenButton Text="Search" Click="@LoadCertificatesAsync" />
+                </div>
+                <table class="table table-sm">
+                    <thead>
+                        <tr>
+                            <th>Serial</th>
+                            <th>Common Name / SANs</th>
+                            <th>Profile</th>
+                            <th>Requester</th>
+                            <th>Status</th>
+                            <th>Valid Until</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var c in certificates)
+                        {
+                            <tr>
+                                <td><code>@c.SerialNumberHex</code></td>
+                                <td>
+                                    <strong>@c.CommonName</strong><br />
+                                    <small>@c.SubjectAlternativeNamesCsv</small>
+                                </td>
+                                <td>@c.ProfileId</td>
+                                <td>@c.RequestedByUserName</td>
+                                <td>@c.Status @(c.FailureOrDenialReason != null ? $"({c.FailureOrDenialReason})" : "")</td>
+                                <td>@(c.NotAfterUtc == default ? "-" : c.NotAfterUtc.ToString("yyyy-MM-dd"))</td>
+                                <td>
+                                    @if (c.Status == IssuanceStatus.Issued)
+                                    {
+                                        <button class="btn btn-sm btn-danger" @onclick="() => RevokeCertClick(c.Id)">Revoke</button>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </RadzenCard>
+        </div>
+    </div>
+</div>
+
+@code {
+    private CaAuthorityRecord? activeCa;
+    private IReadOnlyList<UserSummaryDto> users = [];
+    private IReadOnlyList<IssuedCertificateRecord> certificates = [];
+    private SubjectDefaultsConfig subjectDefaults = new();
+    private readonly Dictionary<string, string> addDomainInputs = new();
+    private readonly Dictionary<string, string> resetPasswordInputs = new();
+
+    private string unlockPassphrase = "";
+    private string newCaName = "CertRobo Root CA";
+    private string newCaCommonName = "ca.contoso.com";
+    private string newCaKeySpec = "ECDSA-384";
+    private int newCaValidityDays = 3650;
+    private string newCaPassphrase = "";
+    private string newCaCdpUrl = "/ca.crl";
+    private string newCaAiaUrl = "/ca.crt";
+    private bool createAsSubordinateOfActive = false;
+
+    private string importCaName = "Imported CA";
+    private long importSerialFloor = 1000;
+    private long importCrlFloor = 0;
+    private string importCertPem = "";
+    private string importChainPem = "";
+    private string importKeyPem = "";
+    private string importInputPassphrase = "";
+    private string importStoragePassphrase = "";
+
+    private string seedSerialHex = "";
+    private string seedCommonName = "";
+    private int seedReasonCode = 0;
+
+    private string newUserName = "";
+    private string newUserEmail = "";
+    private string newUserPassword = "";
+    private string newUserRole = AppRoles.Issuer;
+    private string newUserDomains = "*.contoso.com";
+
+    private string certSearchQuery = "";
+    private string legacyWorksheetText = "";
+
+    private bool IsCaUnlocked => !string.IsNullOrEmpty(CaService.ResolveEffectivePassphrase());
+
+    protected override async Task OnInitializedAsync()
+    {
+        await ReloadAllAsync();
+    }
+
+    private async Task ReloadAllAsync()
+    {
+        activeCa = await CaService.GetActiveAuthorityAsync();
+        subjectDefaults = await AccountService.GetSubjectDefaultsAsync();
+        users = await AccountService.ListUsersAsync();
+        foreach (var u in users)
+        {
+            if (!addDomainInputs.ContainsKey(u.Id))
+            {
+                addDomainInputs[u.Id] = "";
+            }
+            if (!resetPasswordInputs.ContainsKey(u.Id))
+            {
+                resetPasswordInputs[u.Id] = "";
+            }
+        }
+        await LoadCertificatesAsync();
+    }
+
+    private async Task LoadCertificatesAsync()
+    {
+        certificates = await CaService.SearchCertificatesAsync(certSearchQuery);
+    }
+
+    private void Notify(Radzen.NotificationSeverity severity, string summary, string detail)
+    {
+        NotificationService.Notify(new Radzen.NotificationMessage
+        {
+            Severity = severity,
+            Summary = summary,
+            Detail = detail,
+            Duration = 4000
+        });
+    }
+
+    private async Task DownloadBackupClick()
+    {
+        try
+        {
+            string appDataDir = Configuration["CertRobo:DataDirectory"]
+                ?? Path.Combine(HostEnvironment.ContentRootPath, "App_Data");
+            string sqliteDbPath = Configuration["CertRobo:SqliteFilePath"]
+                ?? Path.Combine(appDataDir, "certrobo.db");
+            string dpKeysDir = Path.Combine(appDataDir, "dataprotection-keys");
+
+            byte[] archiveBytes = await BackupService.CreateConsistentBackupArchiveAsync(sqliteDbPath, dpKeysDir);
+            string fileName = $"certrobo-backup-{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}.zip";
+            MemoryStream output = new(archiveBytes);
+            using DotNetStreamReference streamRef = new(output, false);
+            await JS.InvokeVoidAsync("downloadFileFromStream", fileName, streamRef);
+            Notify(Radzen.NotificationSeverity.Success, "Backup Ready", $"Downloaded {fileName}.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Backup Error", ex.Message);
+        }
+    }
+
+    private Task UnlockCaClick()
+    {
+        try
+        {
+            CaService.UnlockRuntimePassphrase(unlockPassphrase);
+            unlockPassphrase = "";
+            Notify(Radzen.NotificationSeverity.Success, "CA Unlocked", "CA passphrase set in runtime memory.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Error", ex.Message);
+        }
+        return Task.CompletedTask;
+    }
+
+    private async Task RefreshCrlClick()
+    {
+        try
+        {
+            var crl = await CaService.RefreshActiveCrlAsync();
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Success, "CRL Refreshed", $"Published CRL #{crl?.CrlNumber}.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "CRL Error", ex.Message);
+        }
+    }
+
+    private async Task CreateCaClick()
+    {
+        try
+        {
+            SubjectDefaultsConfig defaults = await AccountService.GetSubjectDefaultsAsync();
+            (CertificateKeyFamily family, int bits) = newCaKeySpec switch
+            {
+                "ECDSA-256" => (CertificateKeyFamily.Ecdsa, 256),
+                "ECDSA-384" => (CertificateKeyFamily.Ecdsa, 384),
+                "RSA-2048" => (CertificateKeyFamily.Rsa, 2048),
+                _ => (CertificateKeyFamily.Rsa, 4096)
+            };
+
+            CaAuthorityRecord? parent = createAsSubordinateOfActive ? activeCa : null;
+            await CaService.CreateSelfSignedOrIntermediateCaAsync(
+                newCaName,
+                newCaCommonName,
+                defaults.Country,
+                defaults.StateOrProvince,
+                defaults.Locality,
+                defaults.Organisation,
+                defaults.OrganisationalUnit,
+                family,
+                bits,
+                newCaValidityDays,
+                newCaPassphrase,
+                crlDistributionPointUrl: newCaCdpUrl,
+                authorityIssuerCertUrl: newCaAiaUrl,
+                parentAuthority: parent,
+                parentPassphrase: CaService.ResolveEffectivePassphrase() ?? newCaPassphrase);
+
+            newCaPassphrase = "";
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Success, "CA Created", $"Activated CA '{newCaName}'.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "CA Creation Error", ex.Message);
+        }
+    }
+
+    private async Task ImportCaClick()
+    {
+        try
+        {
+            await CaService.ImportCaAsync(
+                importCaName,
+                importCertPem,
+                string.IsNullOrWhiteSpace(importChainPem) ? null : importChainPem,
+                importKeyPem,
+                string.IsNullOrWhiteSpace(importInputPassphrase) ? null : importInputPassphrase,
+                importStoragePassphrase,
+                crlDistributionPointUrl: newCaCdpUrl,
+                authorityIssuerCertUrl: newCaAiaUrl,
+                initialSerialFloor: importSerialFloor,
+                initialCrlNumberFloor: importCrlFloor);
+
+            importKeyPem = "";
+            importInputPassphrase = "";
+            importStoragePassphrase = "";
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Success, "CA Imported", $"Imported and activated '{importCaName}'.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "CA Import Error", ex.Message);
+        }
+    }
+
+    private async Task SeedRevokedSerialClick()
+    {
+        AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        string actor = authState.User.Identity?.Name ?? "admin";
+        var (ok, err) = await CaService.SeedRevokedSerialAsync(
+            seedSerialHex,
+            seedCommonName,
+            seedReasonCode,
+            actor);
+
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Seed Error", err ?? "Failed to seed revoked serial.");
+            return;
+        }
+
+        seedSerialHex = "";
+        seedCommonName = "";
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "Serial Seeded", "Revoked serial recorded and CRL updated.");
+    }
+
+    private async Task SaveDefaultsClick()
+    {
+        try
+        {
+            await AccountService.UpdateSubjectDefaultsAsync(subjectDefaults);
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Success, "Defaults Saved", "Updated X.509 Subject Defaults.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Error", ex.Message);
+        }
+    }
+
+    private async Task InspectLegacySettingsClick()
+    {
+        try
+        {
+            string xmlPath = File.Exists("static/settings.xml")
+                ? "static/settings.xml"
+                : "static/settings.xml.example";
+            var report = await MigrationService.InspectAndOptionallyImportDefaultsAsync(xmlPath, importSubjectDefaults: true);
+            legacyWorksheetText = report.FormatWorksheetText();
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Info, "Legacy Settings Inspected", $"Loaded defaults and group mapping worksheet from {xmlPath}.");
+        }
+        catch (Exception ex)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Inspection Error", ex.Message);
+        }
+    }
+
+    private async Task CreateUserClick()
+    {
+        string[] patterns = newUserDomains
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        var (ok, err, _) = await AccountService.CreateUserAsync(
+            newUserName,
+            newUserPassword,
+            newUserEmail,
+            [newUserRole, AppRoles.Issuer],
+            patterns);
+
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "User Error", err ?? "Failed to create user.");
+            return;
+        }
+
+        newUserName = "";
+        newUserEmail = "";
+        newUserPassword = "";
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "User Created", "Account created.");
+    }
+
+    private async Task ToggleUserDisabledClick(UserSummaryDto user)
+    {
+        var (ok, err) = await AccountService.SetUserDisabledAsync(user.Id, !user.IsDisabled);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Error", err ?? "Update failed.");
+            return;
+        }
+        await ReloadAllAsync();
+    }
+
+    private async Task ResetUserPasswordClick(string userId, string userName)
+    {
+        if (!resetPasswordInputs.TryGetValue(userId, out string? newPass) || string.IsNullOrWhiteSpace(newPass))
+        {
+            Notify(Radzen.NotificationSeverity.Warning, "Password Required", "Enter a new password before clicking Reset.");
+            return;
+        }
+
+        var (ok, err) = await AccountService.ResetPasswordAsync(userId, newPass);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Reset Error", err ?? "Password reset failed.");
+            return;
+        }
+
+        resetPasswordInputs[userId] = "";
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "Password Reset", $"Password reset for '{userName}' and active sessions invalidated.");
+    }
+
+    private async Task AddUserDomainClick(string userId)
+    {
+        if (!addDomainInputs.TryGetValue(userId, out string? pattern) || string.IsNullOrWhiteSpace(pattern))
+        {
+            return;
+        }
+        var (ok, err) = await AccountService.AddDomainPermissionAsync("User", userId, pattern);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Policy Error", err ?? "Invalid pattern.");
+            return;
+        }
+        addDomainInputs[userId] = "";
+        await ReloadAllAsync();
+    }
+
+    private async Task RemovePermissionClick(int ruleId)
+    {
+        await AccountService.RemoveDomainPermissionAsync(ruleId);
+        await ReloadAllAsync();
+    }
+
+    private async Task RevokeCertClick(int certId)
+    {
+        AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        string actor = authState.User.Identity?.Name ?? "admin";
+        var (ok, err) = await CaService.RevokeCertificateAsync(certId, 0, actor);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Revocation Error", err ?? "Revocation failed.");
+            return;
+        }
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "Certificate Revoked", "Certificate revoked and CRL updated.");
+    }
+}
