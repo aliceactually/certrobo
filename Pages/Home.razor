@@ -16,6 +16,49 @@
 <PageTitle>CertRobo</PageTitle>
 
 <div class="container-fluid">
+    @if (activeCa == null)
+    {
+        <div class="row mb-3">
+            <div class="col" style="max-width: 1248px;">
+                @if (pendingCaEnrollment != null)
+                {
+                    <div class="alert alert-info" role="status">
+                        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-1">
+                            <h4 class="h5 mb-0">
+                                Pending Issuing CA Enrolment: @pendingCaEnrollment.CaName
+                                <span class="badge bg-primary ms-2">@FormatPendingStatusLabel(pendingCaEnrollment.Status)</span>
+                            </h4>
+                            <AuthorizeView Roles="@AppRoles.Administrator">
+                                <div class="d-flex flex-wrap gap-2">
+                                    <a href="/admin/pending-ca/csr" target="_blank" class="btn btn-sm btn-outline-primary">Download CA CSR (.csr)</a>
+                                    <a href="/admin" class="btn btn-sm btn-primary">Complete CA Enrolment in Administration</a>
+                                </div>
+                            </AuthorizeView>
+                        </div>
+                        <p class="mb-1 small">
+                            Leaf certificate issuance is unavailable until the pending Issuing CA (<code>@pendingCaEnrollment.SubjectDistinguishedName</code>, @pendingCaEnrollment.KeyAlgorithm @pendingCaEnrollment.KeySizeBits) is signed by its parent CA, validated, and activated.
+                        </p>
+                        @if (!string.IsNullOrWhiteSpace(pendingCaEnrollment.StatusDetailMessage))
+                        {
+                            <div class="small text-muted-theme">@pendingCaEnrollment.StatusDetailMessage</div>
+                        }
+                    </div>
+                }
+                else
+                {
+                    <div class="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-2" role="status">
+                        <div>
+                            <h4 class="h5 mb-1">Issuing CA Setup Required — Certificate Issuance Unavailable</h4>
+                            <p class="mb-0 small">Configure an Issuing CA (generate a self-signed Root CA, import an existing Issuing CA, or request an Issuing CA certificate from an external CA) to enable leaf certificate issuance.</p>
+                        </div>
+                        <AuthorizeView Roles="@AppRoles.Administrator">
+                            <a href="/admin" class="btn btn-sm btn-primary">Configure Issuing CA</a>
+                        </AuthorizeView>
+                    </div>
+                }
+            </div>
+        </div>
+    }
     <div class="row">
         <div class="col" style="width:624px;min-width:624px;max-width:624px">
             <RadzenCard>
@@ -143,7 +186,7 @@
                 <div class="row" style="height: 6px" />
                 <div class="row">
                     <div class="col" style="width:100%">
-                        <RadzenButton Text="Request certificate from CA" Style="width:100%" Click="@RequestClick" />
+                        <RadzenButton Text="Request certificate from Issuing CA" Style="width:100%" Click="@RequestClick" Disabled="@(activeCa == null)" />
                     </div>
                 </div>
                 <div class="row" style="height: 6px" />
@@ -192,6 +235,24 @@
     private string csr = "";
     private string certificate = "";
     private string? lastIssuedChainPem = null;
+    private CaAuthorityRecord? activeCa;
+    private PendingCaEnrollmentRecord? pendingCaEnrollment;
+
+    protected override async Task OnInitializedAsync()
+    {
+        activeCa = await CaService.GetActiveAuthorityAsync();
+        pendingCaEnrollment = await CaService.GetActivePendingEnrollmentAsync();
+    }
+
+    private static string FormatPendingStatusLabel(PendingCaEnrollmentStatus status) => status switch
+    {
+        PendingCaEnrollmentStatus.AwaitingSubmission => "Awaiting Submission",
+        PendingCaEnrollmentStatus.SubmissionUncertain => "Submission Outcome Uncertain",
+        PendingCaEnrollmentStatus.AwaitingApproval => "Awaiting Parent CA Approval",
+        PendingCaEnrollmentStatus.ReadyForActivation => "Ready for Activation",
+        PendingCaEnrollmentStatus.Failed => "Attention Required",
+        _ => status.ToString()
+    };
 
     private void ShowErrorDialogue(string message)
     {
@@ -460,15 +521,7 @@
         }
         try
         {
-            string? chainPem = lastIssuedChainPem;
-            if (string.IsNullOrWhiteSpace(chainPem))
-            {
-                CaAuthorityRecord? activeCa = await CaService.GetActiveAuthorityAsync();
-                if (activeCa != null)
-                {
-                    chainPem = CertificateAuthorityService.BuildOrderedCertificateChainPem(activeCa);
-                }
-            }
+            string? chainPem = await CaService.ResolveCertificateChainPemAsync(certificate, lastIssuedChainPem);
 
             Tuple<string, byte[]>? zipObj = PkcsBuilder.Export(
                 certificate,

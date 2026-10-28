@@ -2,6 +2,7 @@
 using Org.BouncyCastle.Asn1;
 using Org.BouncyCastle.Asn1.Pkcs;
 using Org.BouncyCastle.Asn1.X509;
+using Org.BouncyCastle.Cms;
 using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Generators;
 using Org.BouncyCastle.Crypto.Operators;
@@ -192,6 +193,10 @@ public class PkcsBuilder
             {
                 chainCerts[i].Verify(chainCerts[i + 1].GetPublicKey());
             }
+            if (chainCerts[^1].SubjectDN.Equivalent(chainCerts[^1].IssuerDN, inOrder: false))
+            {
+                chainCerts[^1].Verify(chainCerts[^1].GetPublicKey());
+            }
         }
         catch
         {
@@ -204,8 +209,27 @@ public class PkcsBuilder
             cn = "certificate";
         }
 
-        string normalizedLeafPem = NormalizePemEnding(certificate);
-        string normalizedChainPem = NormalizePemEnding(resolvedChainPem);
+        string normalizedLeafPem = NormalizePemEnding(ExportCertificateToPem(cert));
+
+        // Separate intermediate CA(s) from the self-signed trust anchor root CA so TLS server-chain files
+        // (-chained.crt / -chained.pem) carry leaf + intermediate(s) without indiscriminately inserting the trust root,
+        // while providing the trust root separately (rootca.crt) and carrying the full chain in PKCS#12 / PKCS#7 bundles.
+        bool hasExplicitTrustAnchor = chainCerts.Count > 0
+            && chainCerts[^1].SubjectDN.Equivalent(chainCerts[^1].IssuerDN, inOrder: false);
+
+        IList<X509Certificate> tlsServerChainIssuers = hasExplicitTrustAnchor
+            ? chainCerts.Take(chainCerts.Count - 1).ToList()
+            : chainCerts;
+
+        X509Certificate trustAnchorRootCert = chainCerts[^1];
+
+        StringBuilder tlsChainPemBuilder = new();
+        foreach (X509Certificate issuerCert in tlsServerChainIssuers)
+        {
+            tlsChainPemBuilder.Append(NormalizePemEnding(ExportCertificateToPem(issuerCert)));
+        }
+        string normalizedTlsChainIssuersPem = tlsChainPemBuilder.ToString();
+        string normalizedRootAnchorPem = NormalizePemEnding(ExportCertificateToPem(trustAnchorRootCert));
 
         using MemoryStream output = new();
         using (ZipOutputStream zipStream = new(output))
@@ -216,12 +240,36 @@ public class PkcsBuilder
             zipStream.PutNextEntry(new ZipEntry(cn + ".crt"));
             zipStream.Write(Encoding.ASCII.GetBytes(normalizedLeafPem));
 
-            // Base64 chained (leaf + intermediate(s) + root)
+            // PKCS #7 leaf (.p7b)
+            byte[] leafP7b = BuildPkcs7Der([cert]);
+            zipStream.PutNextEntry(new ZipEntry(cn + ".p7b"));
+            zipStream.Write(leafP7b);
+
             if (chainValid)
             {
+                // TLS server chain: leaf + intermediate(s), excluding the self-signed trust anchor.
                 zipStream.PutNextEntry(new ZipEntry(cn + "-chained.crt"));
                 zipStream.Write(Encoding.ASCII.GetBytes(normalizedLeafPem));
-                zipStream.Write(Encoding.ASCII.GetBytes(normalizedChainPem));
+                if (!string.IsNullOrEmpty(normalizedTlsChainIssuersPem))
+                {
+                    zipStream.Write(Encoding.ASCII.GetBytes(normalizedTlsChainIssuersPem));
+                }
+
+                // Separate trust root certificate
+                zipStream.PutNextEntry(new ZipEntry("rootca.crt"));
+                zipStream.Write(Encoding.ASCII.GetBytes(normalizedRootAnchorPem));
+
+                if (tlsServerChainIssuers.Count > 0)
+                {
+                    zipStream.PutNextEntry(new ZipEntry("ca-chain.crt"));
+                    zipStream.Write(Encoding.ASCII.GetBytes(normalizedTlsChainIssuersPem));
+                }
+
+                // PKCS #7 chained (.p7b): leaf + intermediate(s) + root
+                List<X509Certificate> fullP7bCerts = [cert, .. chainCerts];
+                byte[] chainedP7b = BuildPkcs7Der(fullP7bCerts);
+                zipStream.PutNextEntry(new ZipEntry(cn + "-chained.p7b"));
+                zipStream.Write(chainedP7b);
             }
 
             if (!string.IsNullOrWhiteSpace(privateKey))
@@ -249,7 +297,10 @@ public class PkcsBuilder
                         {
                             zipStream.PutNextEntry(new ZipEntry(cn + "-chained.pem"));
                             zipStream.Write(Encoding.ASCII.GetBytes(normalizedLeafPem));
-                            zipStream.Write(Encoding.ASCII.GetBytes(normalizedChainPem));
+                            if (!string.IsNullOrEmpty(normalizedTlsChainIssuersPem))
+                            {
+                                zipStream.Write(Encoding.ASCII.GetBytes(normalizedTlsChainIssuersPem));
+                            }
                             zipStream.Write(Encoding.ASCII.GetBytes(normalizedKeyPem));
                         }
 
@@ -292,6 +343,36 @@ public class PkcsBuilder
         }
 
         return new Tuple<string, byte[]>(cn + ".zip", output.ToArray());
+    }
+
+    public static byte[] BuildPkcs7Der(IEnumerable<X509Certificate> certificates)
+    {
+        CmsSignedDataGenerator gen = new();
+        foreach (X509Certificate c in certificates)
+        {
+            gen.AddCertificate(c);
+        }
+        CmsSignedData signedData = gen.Generate(new CmsProcessableByteArray([]), encapsulate: false);
+        return signedData.GetEncoded();
+    }
+
+    public static byte[] BuildPkcs7DerFromPemBundle(string pemBundle)
+    {
+        IList<X509Certificate> certs = ParseCertificateBundle(pemBundle);
+        if (certs.Count == 0)
+        {
+            throw new ArgumentException("No certificates found in PEM bundle.");
+        }
+        return BuildPkcs7Der(certs);
+    }
+
+    private static string ExportCertificateToPem(X509Certificate cert)
+    {
+        using StringWriter sw = new();
+        PemWriter pw = new(sw);
+        pw.WriteObject(cert);
+        pw.Writer.Flush();
+        return sw.ToString().Replace("\r\n", "\n");
     }
 
     private static X509Certificate ParseFirstCertificate(string pem)

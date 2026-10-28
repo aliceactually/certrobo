@@ -16,32 +16,27 @@ public sealed class CrlRefreshBackgroundService(
         {
             try
             {
-                var latest = await caService.GetLatestCrlAsync(stoppingToken);
-                var activeCa = await caService.GetActiveAuthorityAsync(stoppingToken);
-                if (activeCa != null)
+                IReadOnlyList<CrlRefreshOutcome> outcomes = await caService.RefreshDueCrlsAsync(
+                    TimeSpan.FromHours(24),
+                    stoppingToken);
+                foreach (CrlRefreshOutcome outcome in outcomes)
                 {
-                    DateTimeOffset now = DateTimeOffset.UtcNow;
-                    bool shouldRefresh = latest == null
-                        || latest.NextUpdateUtc <= now.AddHours(24);
-
-                    if (shouldRefresh && !string.IsNullOrEmpty(caService.ResolveEffectivePassphrase()))
+                    if (outcome.Succeeded && outcome.PublishedCrl != null)
                     {
-                        var refreshed = await caService.RefreshActiveCrlAsync(stoppingToken);
-                        if (refreshed != null)
-                        {
-                            logger.LogInformation(
-                                "Published refreshed CRL #{CrlNumber} for CA '{CaName}' (NextUpdateUtc={NextUpdateUtc:O}).",
-                                refreshed.CrlNumber,
-                                activeCa.Name,
-                                refreshed.NextUpdateUtc);
-                        }
+                        logger.LogInformation(
+                            "Published refreshed CRL #{CrlNumber} for CA '{CaName}' (AuthorityId={AuthorityId}, NextUpdateUtc={NextUpdateUtc:O}).",
+                            outcome.PublishedCrl.CrlNumber,
+                            outcome.CaName,
+                            outcome.CaAuthorityId,
+                            outcome.PublishedCrl.NextUpdateUtc);
                     }
-                    else if (shouldRefresh)
+                    else
                     {
                         logger.LogWarning(
-                            "CRL for CA '{CaName}' is due for refresh (NextUpdateUtc={NextUpdateUtc:O}), but the CA signing key is locked.",
-                            activeCa.Name,
-                            latest?.NextUpdateUtc);
+                            "CRL refresh failed for CA '{CaName}' (AuthorityId={AuthorityId}): {ErrorMessage}",
+                            outcome.CaName,
+                            outcome.CaAuthorityId,
+                            outcome.ErrorMessage);
                     }
                 }
             }

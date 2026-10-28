@@ -260,7 +260,11 @@ public static class WebEndpoints
         // Public CA Certificate & CRL endpoints (support both GET and HEAD for health checks & PKI probes)
         Func<HttpContext, CertificateAuthorityService, Task> serveCaChain = async (HttpContext ctx, CertificateAuthorityService caService) =>
         {
-            CaAuthorityRecord? ca = await caService.GetActiveAuthorityAsync();
+            int? requestedCaId = ResolveRequestedAuthorityId(ctx);
+            CaAuthorityRecord? ca = requestedCaId.HasValue
+                ? await caService.GetAuthorityByIdAsync(requestedCaId.Value, ctx.RequestAborted)
+                : await caService.GetActiveAuthorityAsync(ctx.RequestAborted);
+
             if (ca == null)
             {
                 ctx.Response.StatusCode = StatusCodes.Status404NotFound;
@@ -280,11 +284,102 @@ public static class WebEndpoints
         };
 
         app.MapMethods("/ca.crt", ["GET", "HEAD"], serveCaChain).AllowAnonymous();
-        app.MapMethods("/rootca.crt", ["GET", "HEAD"], serveCaChain).AllowAnonymous();
+        app.MapMethods("/authorities/{caId:int}/ca.crt", ["GET", "HEAD"], serveCaChain).AllowAnonymous();
 
-        app.MapMethods("/ca.crl", ["GET", "HEAD"], async (HttpContext ctx, CertificateAuthorityService caService) =>
+        Func<HttpContext, CertificateAuthorityService, Task> serveIssuerDer = async (HttpContext ctx, CertificateAuthorityService caService) =>
         {
-            PublishedCrlRecord? crl = await caService.GetLatestCrlAsync();
+            int? requestedCaId = ResolveRequestedAuthorityId(ctx);
+            CaAuthorityRecord? ca = requestedCaId.HasValue
+                ? await caService.GetAuthorityByIdAsync(requestedCaId.Value, ctx.RequestAborted)
+                : await caService.GetActiveAuthorityAsync(ctx.RequestAborted);
+            if (ca == null)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+
+            using System.Security.Cryptography.X509Certificates.X509Certificate2 issuer =
+                System.Security.Cryptography.X509Certificates.X509Certificate2.CreateFromPem(ca.IssuerCertificatePem);
+            byte[] der = issuer.RawData;
+            ctx.Response.ContentType = "application/pkix-cert";
+            ctx.Response.ContentLength = der.Length;
+            if (!HttpMethods.IsHead(ctx.Request.Method))
+            {
+                await ctx.Response.Body.WriteAsync(der);
+            }
+        };
+
+        app.MapMethods("/issuer.crt", ["GET", "HEAD"], serveIssuerDer).AllowAnonymous();
+        app.MapMethods("/authorities/{caId:int}/issuer.crt", ["GET", "HEAD"], serveIssuerDer).AllowAnonymous();
+
+        app.MapMethods("/rootca.crt", ["GET", "HEAD"], async (HttpContext ctx, CertificateAuthorityService caService) =>
+        {
+            int? requestedCaId = ResolveRequestedAuthorityId(ctx);
+            CaAuthorityRecord? ca = requestedCaId.HasValue
+                ? await caService.GetAuthorityByIdAsync(requestedCaId.Value, ctx.RequestAborted)
+                : await caService.GetActiveAuthorityAsync(ctx.RequestAborted);
+            if (ca == null)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+
+            List<System.Security.Cryptography.X509Certificates.X509Certificate2> chain =
+                CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
+                    null,
+                    CertificateAuthorityService.BuildOrderedCertificateChainPem(ca),
+                    "stored CA chain");
+            try
+            {
+                System.Security.Cryptography.X509Certificates.X509Certificate2 root = chain[^1];
+                string rootPem = root.ExportCertificatePem() + "\n";
+                ctx.Response.ContentType = "application/x-x509-ca-cert";
+                ctx.Response.ContentLength = System.Text.Encoding.ASCII.GetByteCount(rootPem);
+                if (!HttpMethods.IsHead(ctx.Request.Method))
+                {
+                    await ctx.Response.WriteAsync(rootPem);
+                }
+            }
+            finally
+            {
+                foreach (var cert in chain) cert.Dispose();
+            }
+        }).AllowAnonymous();
+
+        Func<HttpContext, CertificateAuthorityService, Task> serveCaP7b = async (HttpContext ctx, CertificateAuthorityService caService) =>
+        {
+            int? requestedCaId = ResolveRequestedAuthorityId(ctx);
+            CaAuthorityRecord? ca = requestedCaId.HasValue
+                ? await caService.GetAuthorityByIdAsync(requestedCaId.Value, ctx.RequestAborted)
+                : await caService.GetActiveAuthorityAsync(ctx.RequestAborted);
+
+            if (ca == null)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+                if (!HttpMethods.IsHead(ctx.Request.Method))
+                {
+                    await ctx.Response.WriteAsync("No active CA is configured.");
+                }
+                return;
+            }
+
+            string pem = CertificateAuthorityService.BuildOrderedCertificateChainPem(ca);
+            byte[] p7bDer = PkcsBuilder.BuildPkcs7DerFromPemBundle(pem);
+            ctx.Response.ContentType = "application/x-pkcs7-certificates";
+            ctx.Response.ContentLength = p7bDer.Length;
+            if (!HttpMethods.IsHead(ctx.Request.Method))
+            {
+                await ctx.Response.Body.WriteAsync(p7bDer);
+            }
+        };
+
+        app.MapMethods("/ca.p7b", ["GET", "HEAD"], serveCaP7b).AllowAnonymous();
+        app.MapMethods("/authorities/{caId:int}/ca.p7b", ["GET", "HEAD"], serveCaP7b).AllowAnonymous();
+
+        Func<HttpContext, CertificateAuthorityService, Task> serveCrlDer = async (HttpContext ctx, CertificateAuthorityService caService) =>
+        {
+            int? requestedCaId = ResolveRequestedAuthorityId(ctx);
+            PublishedCrlRecord? crl = await caService.GetLatestCrlAsync(ctx.RequestAborted, requestedCaId);
             if (crl == null)
             {
                 ctx.Response.StatusCode = StatusCodes.Status404NotFound;
@@ -300,11 +395,15 @@ public static class WebEndpoints
             {
                 await ctx.Response.Body.WriteAsync(crl.CrlDer);
             }
-        }).AllowAnonymous();
+        };
 
-        app.MapMethods("/ca.crl.pem", ["GET", "HEAD"], async (HttpContext ctx, CertificateAuthorityService caService) =>
+        app.MapMethods("/ca.crl", ["GET", "HEAD"], serveCrlDer).AllowAnonymous();
+        app.MapMethods("/authorities/{caId:int}/ca.crl", ["GET", "HEAD"], serveCrlDer).AllowAnonymous();
+
+        Func<HttpContext, CertificateAuthorityService, Task> serveCrlPem = async (HttpContext ctx, CertificateAuthorityService caService) =>
         {
-            PublishedCrlRecord? crl = await caService.GetLatestCrlAsync();
+            int? requestedCaId = ResolveRequestedAuthorityId(ctx);
+            PublishedCrlRecord? crl = await caService.GetLatestCrlAsync(ctx.RequestAborted, requestedCaId);
             if (crl == null)
             {
                 ctx.Response.StatusCode = StatusCodes.Status404NotFound;
@@ -320,6 +419,41 @@ public static class WebEndpoints
             {
                 await ctx.Response.WriteAsync(crl.CrlPem);
             }
-        }).AllowAnonymous();
+        };
+
+        app.MapMethods("/ca.crl.pem", ["GET", "HEAD"], serveCrlPem).AllowAnonymous();
+        app.MapMethods("/authorities/{caId:int}/ca.crl.pem", ["GET", "HEAD"], serveCrlPem).AllowAnonymous();
+
+        // Administrator-only endpoint to download the pending external CA PKCS #10 CSR (never exports private keys)
+        app.MapGet("/admin/pending-ca/csr", async (HttpContext ctx, CertificateAuthorityService caService) =>
+        {
+            int? id = int.TryParse(ctx.Request.Query["id"], out int parsedId) ? parsedId : null;
+            var csrResult = await caService.GetPendingCaCsrForDownloadAsync(id, ctx.RequestAborted);
+            if (csrResult == null)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+                await ctx.Response.WriteAsync("No pending CA enrolment CSR was found.");
+                return;
+            }
+
+            byte[] csrBytes = System.Text.Encoding.ASCII.GetBytes(csrResult.Value.CsrPem);
+            ctx.Response.ContentType = "application/pkcs10";
+            ctx.Response.Headers.ContentDisposition = $"attachment; filename=\"{csrResult.Value.FileName}\"";
+            ctx.Response.ContentLength = csrBytes.Length;
+            await ctx.Response.Body.WriteAsync(csrBytes);
+        }).RequireAuthorization(policy => policy.RequireRole(AppRoles.Administrator));
+    }
+
+    private static int? ResolveRequestedAuthorityId(HttpContext context)
+    {
+        if (context.Request.RouteValues.TryGetValue("caId", out object? routeValue)
+            && int.TryParse(routeValue?.ToString(), out int routeCaId))
+        {
+            return routeCaId;
+        }
+
+        return int.TryParse(context.Request.Query["caId"], out int queryCaId)
+            ? queryCaId
+            : null;
     }
 }

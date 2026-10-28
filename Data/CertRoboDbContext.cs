@@ -115,6 +115,164 @@ public class CaAuthorityRecord
     public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
 }
 
+public enum PendingCaEnrollmentStatus
+{
+    AwaitingSubmission = 0,
+    SubmissionUncertain = 1,
+    AwaitingApproval = 2,
+    ReadyForActivation = 3,
+    Failed = 4,
+    Activated = 5,
+    Cancelled = 6
+}
+
+public class PendingCaEnrollmentRecord
+{
+    [Key]
+    public int Id { get; set; }
+
+    [Required]
+    [MaxLength(256)]
+    public string CaName { get; set; } = string.Empty;
+
+    [Required]
+    [MaxLength(256)]
+    public string SubjectCommonName { get; set; } = string.Empty;
+
+    [Required]
+    [MaxLength(512)]
+    public string SubjectDistinguishedName { get; set; } = string.Empty;
+
+    [Required]
+    [MaxLength(64)]
+    public string KeyAlgorithm { get; set; } = string.Empty;
+
+    public int KeySizeBits { get; set; }
+
+    public int? RequestedPathLengthConstraint { get; set; } = 0;
+
+    [Required]
+    [MaxLength(128)]
+    public string SubjectKeyIdentifierHex { get; set; } = string.Empty;
+
+    [Required]
+    [MaxLength(128)]
+    public string PublicKeySpkiSha256Hex { get; set; } = string.Empty;
+
+    [Required]
+    public string CsrPem { get; set; } = string.Empty;
+
+    /// <summary>
+    /// File path to the encrypted private key on disk (never stored unencrypted in DB).
+    /// </summary>
+    [Required]
+    [MaxLength(512)]
+    public string EncryptedPrivateKeyPath { get; set; } = string.Empty;
+
+    [MaxLength(512)]
+    public string CrlDistributionPointUrl { get; set; } = "/ca.crl";
+
+    [MaxLength(512)]
+    public string AuthorityIssuerCertUrl { get; set; } = "/ca.crt";
+
+    public long InitialSerialFloor { get; set; } = 1000;
+    public long InitialCrlNumberFloor { get; set; } = 0;
+
+    public PendingCaEnrollmentStatus Status { get; set; } = PendingCaEnrollmentStatus.AwaitingSubmission;
+
+    [MaxLength(128)]
+    public string? LastOutcomeCategory { get; set; }
+
+    public string? StatusDetailMessage { get; set; }
+
+    [MaxLength(512)]
+    public string? UpstreamEndpointUrl { get; set; }
+
+    [MaxLength(256)]
+    public string? UpstreamTemplateName { get; set; }
+
+    [MaxLength(128)]
+    public string? UpstreamRequestId { get; set; }
+
+    [MaxLength(128)]
+    public string? UpstreamErrorCode { get; set; }
+
+    [MaxLength(128)]
+    public string? LastMessageId { get; set; }
+
+    public DateTimeOffset? LastSubmittedAtUtc { get; set; }
+    public DateTimeOffset? LastCheckedAtUtc { get; set; }
+
+    /// <summary>
+    /// Holds a signed CA certificate received from CES or manual upload even before full chain validation completes,
+    /// or the validated certificate once Status == ReadyForActivation.
+    /// </summary>
+    public string? ReceivedIssuerCertificatePem { get; set; }
+
+    /// <summary>
+    /// Holds any intermediate/root certificates received alongside the signed CA certificate.
+    /// </summary>
+    public string? ReceivedChainCertificatesPem { get; set; }
+
+    public string? ValidatedIssuerCertificatePem { get; set; }
+    public string? ValidatedChainCertificatesPem { get; set; }
+    public string? ActivationSummaryJson { get; set; }
+
+    public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? ActivatedAtUtc { get; set; }
+    public int? ActivatedCaAuthorityId { get; set; }
+}
+
+public class AdCsCesConnectorConfig
+{
+    [Key]
+    public int Id { get; set; } = 1;
+
+    public bool IsEnabled { get; set; }
+
+    [MaxLength(512)]
+    public string EndpointUrl { get; set; } = string.Empty;
+
+    [MaxLength(256)]
+    public string CertificateTemplate { get; set; } = string.Empty;
+
+    /// <summary>
+    /// "UsernamePassword" or "ClientCertificate"
+    /// </summary>
+    [Required]
+    [MaxLength(64)]
+    public string AuthenticationMode { get; set; } = "UsernamePassword";
+
+    [MaxLength(256)]
+    public string Username { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Encrypted using ASP.NET Core DataProtection; never stored in plaintext.
+    /// </summary>
+    public string ProtectedPassword { get; set; } = string.Empty;
+
+    public string ClientCertificatePem { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Encrypted using ASP.NET Core DataProtection; never stored in plaintext.
+    /// </summary>
+    public string ProtectedClientPrivateKeyPem { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Optional PEM bundle of internal Root/Intermediate CA certificates trusted for validating the CES HTTPS endpoint's TLS certificate.
+    /// </summary>
+    public string CustomServerTlsTrustPem { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Optional PEM bundle of parent/root CA certificates used to complete chain validation when CES returns only the subordinate CA certificate.
+    /// </summary>
+    public string DefaultParentChainTrustPem { get; set; } = string.Empty;
+
+    public int RequestTimeoutSeconds { get; set; } = 30;
+
+    public DateTimeOffset UpdatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public enum IssuanceStatus
 {
     Pending = 0,
@@ -214,6 +372,8 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
     public DbSet<DomainPermissionRule> DomainPermissionRules => Set<DomainPermissionRule>();
     public DbSet<SubjectDefaultsConfig> SubjectDefaults => Set<SubjectDefaultsConfig>();
     public DbSet<CaAuthorityRecord> CaAuthorities => Set<CaAuthorityRecord>();
+    public DbSet<PendingCaEnrollmentRecord> PendingCaEnrollments => Set<PendingCaEnrollmentRecord>();
+    public DbSet<AdCsCesConnectorConfig> AdCsCesConfigs => Set<AdCsCesConnectorConfig>();
     public DbSet<IssuedCertificateRecord> IssuedCertificates => Set<IssuedCertificateRecord>();
     public DbSet<PublishedCrlRecord> PublishedCrls => Set<PublishedCrlRecord>();
 
@@ -235,5 +395,82 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
         builder.Entity<PublishedCrlRecord>()
             .HasIndex(c => new { c.CaAuthorityId, c.CrlNumber })
             .IsUnique();
+
+        builder.Entity<PendingCaEnrollmentRecord>()
+            .HasIndex(p => p.Status);
+    }
+
+    public async Task EnsureSchemaUpgradedAsync(CancellationToken cancellationToken = default)
+    {
+        await Database.EnsureCreatedAsync(cancellationToken);
+
+        const string createPendingTableSql = """
+            CREATE TABLE IF NOT EXISTS "PendingCaEnrollments" (
+                "Id" INTEGER NOT NULL CONSTRAINT "PK_PendingCaEnrollments" PRIMARY KEY AUTOINCREMENT,
+                "CaName" TEXT NOT NULL,
+                "SubjectCommonName" TEXT NOT NULL,
+                "SubjectDistinguishedName" TEXT NOT NULL,
+                "KeyAlgorithm" TEXT NOT NULL,
+                "KeySizeBits" INTEGER NOT NULL,
+                "RequestedPathLengthConstraint" INTEGER NULL,
+                "SubjectKeyIdentifierHex" TEXT NOT NULL,
+                "PublicKeySpkiSha256Hex" TEXT NOT NULL,
+                "CsrPem" TEXT NOT NULL,
+                "EncryptedPrivateKeyPath" TEXT NOT NULL,
+                "CrlDistributionPointUrl" TEXT NOT NULL,
+                "AuthorityIssuerCertUrl" TEXT NOT NULL,
+                "InitialSerialFloor" INTEGER NOT NULL,
+                "InitialCrlNumberFloor" INTEGER NOT NULL,
+                "Status" INTEGER NOT NULL,
+                "LastOutcomeCategory" TEXT NULL,
+                "StatusDetailMessage" TEXT NULL,
+                "UpstreamEndpointUrl" TEXT NULL,
+                "UpstreamTemplateName" TEXT NULL,
+                "UpstreamRequestId" TEXT NULL,
+                "UpstreamErrorCode" TEXT NULL,
+                "LastMessageId" TEXT NULL,
+                "LastSubmittedAtUtc" TEXT NULL,
+                "LastCheckedAtUtc" TEXT NULL,
+                "ReceivedIssuerCertificatePem" TEXT NULL,
+                "ReceivedChainCertificatesPem" TEXT NULL,
+                "ValidatedIssuerCertificatePem" TEXT NULL,
+                "ValidatedChainCertificatesPem" TEXT NULL,
+                "ActivationSummaryJson" TEXT NULL,
+                "CreatedAtUtc" TEXT NOT NULL,
+                "ActivatedAtUtc" TEXT NULL,
+                "ActivatedCaAuthorityId" INTEGER NULL
+            );
+            CREATE INDEX IF NOT EXISTS "IX_PendingCaEnrollments_Status" ON "PendingCaEnrollments" ("Status");
+            """;
+
+        const string createCesConfigTableSql = """
+            CREATE TABLE IF NOT EXISTS "AdCsCesConfigs" (
+                "Id" INTEGER NOT NULL CONSTRAINT "PK_AdCsCesConfigs" PRIMARY KEY AUTOINCREMENT,
+                "IsEnabled" INTEGER NOT NULL,
+                "EndpointUrl" TEXT NOT NULL,
+                "CertificateTemplate" TEXT NOT NULL,
+                "AuthenticationMode" TEXT NOT NULL,
+                "Username" TEXT NOT NULL,
+                "ProtectedPassword" TEXT NOT NULL,
+                "ClientCertificatePem" TEXT NOT NULL,
+                "ProtectedClientPrivateKeyPem" TEXT NOT NULL,
+                "CustomServerTlsTrustPem" TEXT NOT NULL,
+                "DefaultParentChainTrustPem" TEXT NOT NULL,
+                "RequestTimeoutSeconds" INTEGER NOT NULL,
+                "UpdatedAtUtc" TEXT NOT NULL
+            );
+            """;
+
+        await Database.ExecuteSqlRawAsync(createPendingTableSql, cancellationToken);
+        await Database.ExecuteSqlRawAsync(createCesConfigTableSql, cancellationToken);
+        await Database.ExecuteSqlRawAsync(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS "IX_CaAuthorities_SingleActive"
+                ON "CaAuthorities" ("IsActive") WHERE "IsActive" = 1;
+            CREATE UNIQUE INDEX IF NOT EXISTS "IX_PendingCaEnrollments_SingleUnfinished"
+                ON "PendingCaEnrollments" ((1))
+                WHERE "Status" NOT IN (5, 6);
+            """,
+            cancellationToken);
     }
 }
