@@ -468,6 +468,10 @@ public sealed class AdCsCesEnrollmentService
         pending.UpstreamRequestId = requestIdToQuery;
         pending.LastMessageId = messageId;
         pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
+        if (pending.Status == PendingCaEnrollmentStatus.AwaitingSubmission)
+        {
+            pending.Status = PendingCaEnrollmentStatus.SubmissionUncertain;
+        }
         await db.SaveChangesAsync(cancellationToken);
 
         return await SendAndProcessWstepRequestAsync(
@@ -664,13 +668,17 @@ public sealed class AdCsCesEnrollmentService
     {
         if (string.IsNullOrWhiteSpace(xmlBody))
         {
-            string emptyMsg = $"AD CS CES returned an empty response body (HTTP {(int)httpStatus}).";
-            SetFailureStatusForOperation(pending, isInitialIssueSubmission);
-            pending.LastOutcomeCategory = "TransportFailure";
-            pending.StatusDetailMessage = emptyMsg;
-            pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
+            string emptyMsg = isInitialIssueSubmission
+                ? $"AD CS CES returned an empty response body (HTTP {(int)httpStatus}) after request transmission. Whether the parent CA recorded the request is uncertain; reconcile with the parent CA Request ID or use Force Resubmit."
+                : $"AD CS CES returned an empty response body (HTTP {(int)httpStatus}) when querying pending status.";
+            AdCsCesOutcomeKind outcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
+                pending,
+                isInitialIssueSubmission,
+                queryFailureCategory: "TransportFailure",
+                queryFailureKind: AdCsCesOutcomeKind.TransportFailure,
+                emptyMsg);
             await db.SaveChangesAsync(cancellationToken);
-            return new(false, AdCsCesOutcomeKind.TransportFailure, emptyMsg, pending.UpstreamRequestId, null, null, pending);
+            return new(false, outcomeKind, emptyMsg, pending.UpstreamRequestId, null, null, pending);
         }
 
         XDocument doc;
@@ -680,13 +688,17 @@ public sealed class AdCsCesEnrollmentService
         }
         catch (Exception)
         {
-            string parseMsg = $"AD CS CES returned a non-XML response (HTTP {(int)httpStatus}). Ensure the endpoint URL points to the WSTEP service.svc/CES endpoint, not /certsrv.";
-            SetFailureStatusForOperation(pending, isInitialIssueSubmission);
-            pending.LastOutcomeCategory = "TransportFailure";
-            pending.StatusDetailMessage = parseMsg;
-            pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
+            string parseMsg = isInitialIssueSubmission
+                ? $"AD CS CES returned a non-XML response (HTTP {(int)httpStatus}) after request transmission. Whether the parent CA recorded the request is uncertain; reconcile with the parent CA Request ID or use Force Resubmit."
+                : $"AD CS CES returned a non-XML response (HTTP {(int)httpStatus}). Ensure the endpoint URL points to the WSTEP service.svc/CES endpoint, not /certsrv.";
+            AdCsCesOutcomeKind outcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
+                pending,
+                isInitialIssueSubmission,
+                queryFailureCategory: "TransportFailure",
+                queryFailureKind: AdCsCesOutcomeKind.TransportFailure,
+                parseMsg);
             await db.SaveChangesAsync(cancellationToken);
-            return new(false, AdCsCesOutcomeKind.TransportFailure, parseMsg, pending.UpstreamRequestId, null, null, pending);
+            return new(false, outcomeKind, parseMsg, pending.UpstreamRequestId, null, null, pending);
         }
 
         // 1. Check for SOAP Fault
@@ -706,27 +718,34 @@ public sealed class AdCsCesEnrollmentService
         XElement? rstrCollection = doc.Descendants(WstNs + "RequestSecurityTokenResponseCollection").FirstOrDefault();
         if (rstrCollection == null)
         {
-            string wrapperMsg =
-                "AD CS CES response did not contain the required WS-Trust RequestSecurityTokenResponseCollection wrapper.";
-            SetFailureStatusForOperation(pending, isInitialIssueSubmission);
-            pending.LastOutcomeCategory = "ValidationFailure";
-            pending.StatusDetailMessage = wrapperMsg;
-            pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
+            string wrapperMsg = isInitialIssueSubmission
+                ? "AD CS CES response did not contain the required WS-Trust RequestSecurityTokenResponseCollection wrapper after request transmission. Whether the parent CA recorded the request is uncertain; reconcile with the parent CA Request ID or use Force Resubmit."
+                : "AD CS CES response did not contain the required WS-Trust RequestSecurityTokenResponseCollection wrapper.";
+            AdCsCesOutcomeKind outcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
+                pending,
+                isInitialIssueSubmission,
+                queryFailureCategory: "ValidationFailure",
+                queryFailureKind: AdCsCesOutcomeKind.ValidationFailure,
+                wrapperMsg);
             await db.SaveChangesAsync(cancellationToken);
-            return new(false, AdCsCesOutcomeKind.ValidationFailure, wrapperMsg, pending.UpstreamRequestId, null, null, pending);
+            return new(false, outcomeKind, wrapperMsg, pending.UpstreamRequestId, null, null, pending);
         }
 
         string? responseAction = doc.Descendants(WsaNs + "Action").FirstOrDefault()?.Value.Trim();
         if (!string.IsNullOrWhiteSpace(responseAction)
             && !responseAction.Contains("/RSTRC/wstep", StringComparison.OrdinalIgnoreCase))
         {
-            string actionMsg = $"AD CS CES returned an unexpected WS-Addressing Action '{responseAction}'.";
-            SetFailureStatusForOperation(pending, isInitialIssueSubmission);
-            pending.LastOutcomeCategory = "ValidationFailure";
-            pending.StatusDetailMessage = actionMsg;
-            pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
+            string actionMsg = isInitialIssueSubmission
+                ? $"AD CS CES returned an unexpected WS-Addressing Action '{responseAction}' after request transmission. Whether the parent CA recorded the request is uncertain; reconcile with the parent CA Request ID or use Force Resubmit."
+                : $"AD CS CES returned an unexpected WS-Addressing Action '{responseAction}'.";
+            AdCsCesOutcomeKind outcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
+                pending,
+                isInitialIssueSubmission,
+                queryFailureCategory: "ValidationFailure",
+                queryFailureKind: AdCsCesOutcomeKind.ValidationFailure,
+                actionMsg);
             await db.SaveChangesAsync(cancellationToken);
-            return new(false, AdCsCesOutcomeKind.ValidationFailure, actionMsg, pending.UpstreamRequestId, null, null, pending);
+            return new(false, outcomeKind, actionMsg, pending.UpstreamRequestId, null, null, pending);
         }
 
         string? relatesTo = doc.Descendants(WsaNs + "RelatesTo").FirstOrDefault()?.Value.Trim();
@@ -734,28 +753,36 @@ public sealed class AdCsCesEnrollmentService
             && !string.IsNullOrWhiteSpace(pending.LastMessageId)
             && !relatesTo.Equals(pending.LastMessageId, StringComparison.OrdinalIgnoreCase))
         {
-            string correlationMsg = "AD CS CES response WS-Addressing RelatesTo does not match the submitted MessageID.";
-            SetFailureStatusForOperation(pending, isInitialIssueSubmission);
-            pending.LastOutcomeCategory = "ValidationFailure";
-            pending.StatusDetailMessage = correlationMsg;
-            pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
+            string correlationMsg = isInitialIssueSubmission
+                ? "AD CS CES response WS-Addressing RelatesTo does not match the submitted MessageID. Whether the parent CA recorded the request is uncertain; reconcile with the parent CA Request ID or use Force Resubmit."
+                : "AD CS CES response WS-Addressing RelatesTo does not match the submitted MessageID.";
+            AdCsCesOutcomeKind outcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
+                pending,
+                isInitialIssueSubmission,
+                queryFailureCategory: "ValidationFailure",
+                queryFailureKind: AdCsCesOutcomeKind.ValidationFailure,
+                correlationMsg);
             await db.SaveChangesAsync(cancellationToken);
-            return new(false, AdCsCesOutcomeKind.ValidationFailure, correlationMsg, pending.UpstreamRequestId, null, null, pending);
+            return new(false, outcomeKind, correlationMsg, pending.UpstreamRequestId, null, null, pending);
         }
 
         // 2. Parse RequestSecurityTokenResponse
-        XElement? rstrEl = doc.Descendants(WstNs + "RequestSecurityTokenResponse").FirstOrDefault()
-            ?? doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "RequestSecurityTokenResponse");
+        XElement? rstrEl = rstrCollection.Elements(WstNs + "RequestSecurityTokenResponse").FirstOrDefault()
+            ?? rstrCollection.Elements().FirstOrDefault(e => e.Name.LocalName == "RequestSecurityTokenResponse");
 
         if (rstrEl == null)
         {
-            string unexpectedMsg = "AD CS CES response did not contain a WS-Trust RequestSecurityTokenResponse or SOAP Fault.";
-            SetFailureStatusForOperation(pending, isInitialIssueSubmission);
-            pending.LastOutcomeCategory = "TransportFailure";
-            pending.StatusDetailMessage = unexpectedMsg;
-            pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
+            string unexpectedMsg = isInitialIssueSubmission
+                ? "AD CS CES response did not contain a WS-Trust RequestSecurityTokenResponse or SOAP Fault after request transmission. Whether the parent CA recorded the request is uncertain; reconcile with the parent CA Request ID or use Force Resubmit."
+                : "AD CS CES response did not contain a WS-Trust RequestSecurityTokenResponse or SOAP Fault.";
+            AdCsCesOutcomeKind outcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
+                pending,
+                isInitialIssueSubmission,
+                queryFailureCategory: "TransportFailure",
+                queryFailureKind: AdCsCesOutcomeKind.TransportFailure,
+                unexpectedMsg);
             await db.SaveChangesAsync(cancellationToken);
-            return new(false, AdCsCesOutcomeKind.TransportFailure, unexpectedMsg, pending.UpstreamRequestId, null, null, pending);
+            return new(false, outcomeKind, unexpectedMsg, pending.UpstreamRequestId, null, null, pending);
         }
 
         string? disposition = rstrEl.Elements().FirstOrDefault(e => e.Name.LocalName == "DispositionMessage")?.Value.Trim();
@@ -814,6 +841,7 @@ public sealed class AdCsCesEnrollmentService
             if (extractedCerts.Count > 0)
             {
                 // Issued! Combine extracted certificates with configured DefaultParentChainTrustPem and validate via shared validator
+                PendingCaEnrollmentStatus statusBeforeValidation = pending.Status;
                 StringBuilder returnedBundlePem = new();
                 foreach (X509Certificate2 c in extractedCerts)
                 {
@@ -890,6 +918,22 @@ public sealed class AdCsCesEnrollmentService
                 string invalidCertMsg =
                     $"AD CS CES returned a certificate (Request ID #{requestId ?? "n/a"}), but it failed CA validation: {validation.ErrorMessage}";
 
+                PendingCaEnrollmentStatus preservedStatus = isInitialIssueSubmission
+                    ? PendingCaEnrollmentStatus.SubmissionUncertain
+                    : (statusBeforeValidation is PendingCaEnrollmentStatus.AwaitingApproval or PendingCaEnrollmentStatus.SubmissionUncertain
+                        ? statusBeforeValidation
+                        : PendingCaEnrollmentStatus.SubmissionUncertain);
+
+                await UpdatePendingStatusMetadataAsync(
+                    pending.Id,
+                    preservedStatus,
+                    "ValidationFailure",
+                    invalidCertMsg,
+                    requestId,
+                    null,
+                    cancellationToken);
+
+                refreshed = await _caService.GetPendingEnrollmentByIdAsync(pending.Id, cancellationToken);
                 return new(
                     false,
                     AdCsCesOutcomeKind.ValidationFailure,
@@ -905,14 +949,16 @@ public sealed class AdCsCesEnrollmentService
                 string invalidTokenMsg =
                     "AD CS CES returned certificate token data that could not be parsed safely: "
                     + string.Join(" ", tokenParseErrors.Distinct());
-                SetFailureStatusForOperation(pending, isInitialIssueSubmission);
-                pending.LastOutcomeCategory = "ValidationFailure";
-                pending.StatusDetailMessage = invalidTokenMsg;
-                pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
+                AdCsCesOutcomeKind outcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
+                    pending,
+                    isInitialIssueSubmission,
+                    queryFailureCategory: "ValidationFailure",
+                    queryFailureKind: AdCsCesOutcomeKind.ValidationFailure,
+                    invalidTokenMsg);
                 await db.SaveChangesAsync(cancellationToken);
                 return new(
                     false,
-                    AdCsCesOutcomeKind.ValidationFailure,
+                    outcomeKind,
                     invalidTokenMsg,
                     requestId,
                     null,
@@ -949,13 +995,15 @@ public sealed class AdCsCesEnrollmentService
             }
 
             string unknownDispositionMsg = $"AD CS CES returned a response without an issued certificate (Disposition: '{disposition ?? "none"}').";
-            pending.Status = PendingCaEnrollmentStatus.Failed;
-            pending.LastOutcomeCategory = "ValidationFailure";
-            pending.StatusDetailMessage = unknownDispositionMsg;
-            pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
+            AdCsCesOutcomeKind dispOutcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
+                pending,
+                isInitialIssueSubmission,
+                queryFailureCategory: "ValidationFailure",
+                queryFailureKind: AdCsCesOutcomeKind.ValidationFailure,
+                unknownDispositionMsg);
             await db.SaveChangesAsync(cancellationToken);
 
-            return new(false, AdCsCesOutcomeKind.ValidationFailure, unknownDispositionMsg, requestId, null, disposition, pending);
+            return new(false, dispOutcomeKind, unknownDispositionMsg, requestId, null, disposition, pending);
         }
         finally
         {
@@ -1087,15 +1135,17 @@ public sealed class AdCsCesEnrollmentService
         string genericFaultMsg = $"AD CS CES returned a SOAP fault: {SanitizeDiagnosticMessage(faultReason)}"
             + (!string.IsNullOrWhiteSpace(errorCode) ? $" [ErrorCode: {errorCode}]" : "");
 
-        SetFailureStatusForOperation(pending, isInitialIssueSubmission);
-        pending.LastOutcomeCategory = "TransportFailure";
-        pending.StatusDetailMessage = genericFaultMsg;
-        pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
+        AdCsCesOutcomeKind faultOutcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
+            pending,
+            isInitialIssueSubmission,
+            queryFailureCategory: "TransportFailure",
+            queryFailureKind: AdCsCesOutcomeKind.TransportFailure,
+            genericFaultMsg);
         await db.SaveChangesAsync(cancellationToken);
 
         return new(
             false,
-            AdCsCesOutcomeKind.TransportFailure,
+            faultOutcomeKind,
             genericFaultMsg,
             pending.UpstreamRequestId,
             errorCode,
@@ -1107,12 +1157,39 @@ public sealed class AdCsCesEnrollmentService
         PendingCaEnrollmentRecord pending,
         bool isInitialIssueSubmission)
     {
-        // A failed status query does not change the parent CA's pending request. Preserve
-        // AwaitingApproval/SubmissionUncertain so an administrator cannot accidentally resubmit.
+        // Used only for pre-send transport/TLS failures or definitive authentication rejections.
+        // A failed status query does not change the parent CA's pending request.
         if (isInitialIssueSubmission)
         {
             pending.Status = PendingCaEnrollmentStatus.Failed;
         }
+    }
+
+    private static AdCsCesOutcomeKind ApplyAmbiguousPostSendOrQueryFailure(
+        PendingCaEnrollmentRecord pending,
+        bool isInitialIssueSubmission,
+        string queryFailureCategory,
+        AdCsCesOutcomeKind queryFailureKind,
+        string detailMessage)
+    {
+        pending.StatusDetailMessage = detailMessage;
+        pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
+
+        if (isInitialIssueSubmission)
+        {
+            pending.Status = PendingCaEnrollmentStatus.SubmissionUncertain;
+            pending.LastOutcomeCategory = "SubmissionUncertain";
+            return AdCsCesOutcomeKind.SubmissionUncertain;
+        }
+
+        // For status queries, preserve AwaitingApproval or SubmissionUncertain so an unreadable
+        // or failed query response never makes an outstanding request appear safe to resubmit.
+        if (pending.Status is not (PendingCaEnrollmentStatus.AwaitingApproval or PendingCaEnrollmentStatus.SubmissionUncertain))
+        {
+            pending.Status = PendingCaEnrollmentStatus.SubmissionUncertain;
+        }
+        pending.LastOutcomeCategory = queryFailureCategory;
+        return queryFailureKind;
     }
 
     private async Task UpdatePendingStatusMetadataAsync(
@@ -1329,77 +1406,7 @@ public sealed class AdCsCesEnrollmentService
         {
             string trustPem = options.CustomServerTlsTrustPem;
             handler.SslOptions.RemoteCertificateValidationCallback = (sender, certificate, remoteChain, sslPolicyErrors) =>
-            {
-                if (certificate == null)
-                {
-                    return false;
-                }
-
-                // Always enforce server hostname matching
-                if ((sslPolicyErrors & SslPolicyErrors.RemoteCertificateNameMismatch) != 0)
-                {
-                    return false;
-                }
-
-                List<X509Certificate2> customTrustCerts = [];
-                try
-                {
-                    customTrustCerts = CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
-                        null, trustPem, "custom TLS trust store");
-
-                    using X509Certificate2 serverCert = X509CertificateLoader.LoadCertificate(certificate.GetRawCertData());
-                    using X509Chain chain = new();
-                    chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-                    chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
-
-                    foreach (X509Certificate2 trustCert in customTrustCerts)
-                    {
-                        if (CaChainAndConstraintValidator.IsSelfIssued(trustCert))
-                        {
-                            chain.ChainPolicy.CustomTrustStore.Add(trustCert);
-                        }
-                        else
-                        {
-                            chain.ChainPolicy.ExtraStore.Add(trustCert);
-                        }
-                    }
-
-                    if (remoteChain != null)
-                    {
-                        for (int i = 1; i < remoteChain.ChainElements.Count; i++)
-                        {
-                            chain.ChainPolicy.ExtraStore.Add(remoteChain.ChainElements[i].Certificate);
-                        }
-                    }
-
-                    if (!chain.Build(serverCert))
-                    {
-                        return false;
-                    }
-
-                    for (int i = 0; i < chain.ChainElements.Count - 1; i++)
-                    {
-                        if (!CaChainAndConstraintValidator.VerifySignatureCryptographically(
-                                chain.ChainElements[i].Certificate,
-                                chain.ChainElements[i + 1].Certificate,
-                                out _))
-                        {
-                            return false;
-                        }
-                    }
-
-                    X509Certificate2 root = chain.ChainElements[^1].Certificate;
-                    return CaChainAndConstraintValidator.VerifySignatureCryptographically(root, root, out _);
-                }
-                catch
-                {
-                    return false;
-                }
-                finally
-                {
-                    foreach (X509Certificate2 c in customTrustCerts) c.Dispose();
-                }
-            };
+                ValidateCustomServerTlsCertificate(certificate, remoteChain, sslPolicyErrors, trustPem);
         }
 
         if (string.Equals(options.AuthenticationMode, "ClientCertificate", StringComparison.OrdinalIgnoreCase)
@@ -1413,6 +1420,179 @@ public sealed class AdCsCesEnrollmentService
         }
 
         return handler;
+    }
+
+    public static bool ValidateCustomServerTlsCertificate(
+        X509Certificate? certificate,
+        X509Chain? remoteChain,
+        SslPolicyErrors sslPolicyErrors,
+        string customServerTlsTrustPem)
+    {
+        if (certificate == null)
+        {
+            return false;
+        }
+
+        // Always enforce peer certificate availability and server hostname matching
+        if ((sslPolicyErrors & (SslPolicyErrors.RemoteCertificateNotAvailable | SslPolicyErrors.RemoteCertificateNameMismatch)) != 0)
+        {
+            return false;
+        }
+
+        List<X509Certificate2> customTrustCerts = [];
+        try
+        {
+            customTrustCerts = CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
+                null, customServerTlsTrustPem, "custom TLS trust store");
+
+            if (customTrustCerts.Count == 0)
+            {
+                return false;
+            }
+
+            using X509Certificate2 serverCert = X509CertificateLoader.LoadCertificate(certificate.GetRawCertData());
+
+            // 1. Leaf certificate must not be a CA and, if KeyUsage is present, must allow TLS server usage
+            X509BasicConstraintsExtension? leafBc = serverCert.Extensions
+                .OfType<X509BasicConstraintsExtension>()
+                .FirstOrDefault();
+            if (leafBc is { CertificateAuthority: true })
+            {
+                return false;
+            }
+
+            X509KeyUsageExtension? leafKu = serverCert.Extensions
+                .OfType<X509KeyUsageExtension>()
+                .FirstOrDefault();
+            if (leafKu != null
+                && (leafKu.KeyUsages & (X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment | X509KeyUsageFlags.KeyAgreement)) == 0)
+            {
+                return false;
+            }
+
+            // 2. Leaf certificate must permit TLS Server Authentication (1.3.6.1.5.5.7.3.1)
+            HashSet<string>? leafEkus = CaChainAndConstraintValidator.ExtractCaEkuConstraintOids(serverCert);
+            if (leafEkus == null || !leafEkus.Contains(Models.CertificateProfiles.ServerAuthOid))
+            {
+                return false;
+            }
+
+            // 3. Build chain to an explicitly configured custom root with serverAuth ApplicationPolicy
+            using X509Chain chain = new();
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+            chain.ChainPolicy.ApplicationPolicy.Add(new Oid(Models.CertificateProfiles.ServerAuthOid));
+
+            HashSet<string> customRootThumbprints = new(StringComparer.OrdinalIgnoreCase);
+            foreach (X509Certificate2 trustCert in customTrustCerts)
+            {
+                if (CaChainAndConstraintValidator.IsSelfSignedCryptographically(trustCert))
+                {
+                    chain.ChainPolicy.CustomTrustStore.Add(trustCert);
+                    customRootThumbprints.Add(trustCert.GetCertHashString(HashAlgorithmName.SHA256));
+                }
+                else
+                {
+                    chain.ChainPolicy.ExtraStore.Add(trustCert);
+                }
+            }
+
+            if (customRootThumbprints.Count == 0)
+            {
+                return false;
+            }
+
+            if (remoteChain != null)
+            {
+                for (int i = 1; i < remoteChain.ChainElements.Count; i++)
+                {
+                    chain.ChainPolicy.ExtraStore.Add(remoteChain.ChainElements[i].Certificate);
+                }
+            }
+
+            if (!chain.Build(serverCert) || chain.ChainElements.Count < 2)
+            {
+                return false;
+            }
+
+            X509Certificate2 root = chain.ChainElements[^1].Certificate;
+            if (!customRootThumbprints.Contains(root.GetCertHashString(HashAlgorithmName.SHA256)))
+            {
+                return false;
+            }
+
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            if (now < serverCert.NotBefore.ToUniversalTime() || now > serverCert.NotAfter.ToUniversalTime())
+            {
+                return false;
+            }
+
+            // 4. Verify ancestor validity, BasicConstraints, KeyUsage, pathLen, and ancestor EKU/ApplicationPolicy restrictions
+            int nonSelfIssuedIntermediatesBelow = 0;
+            for (int i = 1; i < chain.ChainElements.Count; i++)
+            {
+                X509Certificate2 ancestor = chain.ChainElements[i].Certificate;
+                if (now < ancestor.NotBefore.ToUniversalTime() || now > ancestor.NotAfter.ToUniversalTime())
+                {
+                    return false;
+                }
+
+                X509BasicConstraintsExtension? ancBc = ancestor.Extensions
+                    .OfType<X509BasicConstraintsExtension>()
+                    .FirstOrDefault();
+                if (ancBc == null || !ancBc.CertificateAuthority)
+                {
+                    return false;
+                }
+                if (ancBc.HasPathLengthConstraint && ancBc.PathLengthConstraint < nonSelfIssuedIntermediatesBelow)
+                {
+                    return false;
+                }
+
+                X509KeyUsageExtension? ancKu = ancestor.Extensions
+                    .OfType<X509KeyUsageExtension>()
+                    .FirstOrDefault();
+                if (ancKu != null && (ancKu.KeyUsages & X509KeyUsageFlags.KeyCertSign) == 0)
+                {
+                    return false;
+                }
+
+                HashSet<string>? ancEkus = CaChainAndConstraintValidator.ExtractCaEkuConstraintOids(ancestor);
+                if (ancEkus != null
+                    && !ancEkus.Contains(Models.CertificateProfiles.ServerAuthOid)
+                    && !ancEkus.Contains(CaChainAndConstraintValidator.AnyExtendedKeyUsageOid))
+                {
+                    return false;
+                }
+
+                if (!CaChainAndConstraintValidator.IsSelfIssued(ancestor))
+                {
+                    nonSelfIssuedIntermediatesBelow++;
+                }
+            }
+
+            // 5. Verify cryptographic signatures across every link and root self-signature
+            for (int i = 0; i < chain.ChainElements.Count - 1; i++)
+            {
+                if (!CaChainAndConstraintValidator.VerifySignatureCryptographically(
+                        chain.ChainElements[i].Certificate,
+                        chain.ChainElements[i + 1].Certificate,
+                        out _))
+                {
+                    return false;
+                }
+            }
+
+            return CaChainAndConstraintValidator.VerifySignatureCryptographically(root, root, out _);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            foreach (X509Certificate2 c in customTrustCerts) c.Dispose();
+        }
     }
 
     private static bool IsPreSendConnectionError(HttpRequestException ex, bool wasWrittenToStream)
@@ -1441,6 +1621,24 @@ public sealed class AdCsCesEnrollmentService
             Headers.TryAddWithoutValidation(
                 "Content-Type",
                 $"application/soap+xml; charset=utf-8; action=\"{actionUri}\"");
+        }
+
+        protected override Stream CreateContentReadStream(CancellationToken cancellationToken)
+        {
+            WasWrittenToStream = true;
+            return base.CreateContentReadStream(cancellationToken);
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync()
+        {
+            WasWrittenToStream = true;
+            return base.CreateContentReadStreamAsync();
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync(CancellationToken cancellationToken)
+        {
+            WasWrittenToStream = true;
+            return base.CreateContentReadStreamAsync(cancellationToken);
         }
 
         protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)

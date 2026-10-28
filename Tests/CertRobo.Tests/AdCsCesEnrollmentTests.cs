@@ -307,6 +307,162 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
         Assert.True(completed.IsValid, completed.ErrorMessage);
     }
 
+    [Fact]
+    public void Review_CustomTlsTrust_AcceptsServerAuthLeaf_AndRejectsClientAuthOnlyAndAncestorRestrictedChains()
+    {
+        using RSA rootKey = RSA.Create(2048);
+        using X509Certificate2 rootCert = CreateRoot(rootKey, pathLen: 2);
+
+        AdCsCesTransportOptions options = new(
+            new Uri("https://ces.example.test/EnrollmentServer/service.svc/CES"),
+            "UsernamePassword",
+            rootCert.ExportCertificatePem(),
+            ClientCertificatePem: null,
+            ClientPrivateKeyPem: null,
+            TimeSpan.FromSeconds(5));
+
+        using SocketsHttpHandler handler = Assert.IsType<SocketsHttpHandler>(
+            AdCsCesEnrollmentService.CreateDefaultSocketsHttpHandler(options));
+        var callback = handler.SslOptions.RemoteCertificateValidationCallback;
+        Assert.NotNull(callback);
+
+        // Positive control: serverAuth (1.3.6.1.5.5.7.3.1) endpoint certificate
+        using X509Certificate2 serverAuthLeaf = CreateTlsEndpointCertificate(
+            rootCert,
+            rootKey,
+            "ces.example.test",
+            [CertificateProfiles.ServerAuthOid]);
+        Assert.True(callback!(
+            this,
+            serverAuthLeaf,
+            null,
+             System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors));
+
+        // Negative control 1 (PR #9 P1 reproduction): clientAuth-only (1.3.6.1.5.5.7.3.2) endpoint certificate
+        using X509Certificate2 clientAuthOnlyLeaf = CreateTlsEndpointCertificate(
+            rootCert,
+            rootKey,
+            "ces.example.test",
+            [CertificateProfiles.ClientAuthOid]);
+        Assert.False(callback(
+            this,
+            clientAuthOnlyLeaf,
+            null,
+            System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors));
+
+        // Negative control 2: endpoint certificate without any EKU
+        using X509Certificate2 noEkuLeaf = CreateTlsEndpointCertificate(
+            rootCert,
+            rootKey,
+            "ces.example.test",
+            []);
+        Assert.False(callback(
+            this,
+            noEkuLeaf,
+            null,
+            System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors));
+
+        // Negative control 3: hostname mismatch must always be rejected even if cert has serverAuth
+        Assert.False(callback(
+            this,
+            serverAuthLeaf,
+            null,
+            System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch));
+
+        // Negative control 4: intermediate CA restricted to clientAuth EKU issuing a serverAuth leaf
+        using RSA restrictedInterKey = RSA.Create(2048);
+        using X509Certificate2 restrictedInterCert = CreateIntermediateCa(
+            rootCert,
+            rootKey,
+            restrictedInterKey,
+            "CN=ClientAuth Only Intermediate CA,O=CertRobo Tests,C=US",
+            [CertificateProfiles.ClientAuthOid]);
+        using X509Certificate2 leafUnderRestrictedInter = CreateTlsEndpointCertificate(
+            restrictedInterCert,
+            restrictedInterKey,
+            "ces.example.test",
+            [CertificateProfiles.ServerAuthOid]);
+
+        string rootAndRestrictedInterPem =
+            rootCert.ExportCertificatePem() + "\n" + restrictedInterCert.ExportCertificatePem();
+        Assert.False(AdCsCesEnrollmentService.ValidateCustomServerTlsCertificate(
+            leafUnderRestrictedInter,
+            null,
+            System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors,
+            rootAndRestrictedInterPem));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("not XML")]
+    [InlineData("<html>upstream response lost</html>")]
+    [InlineData("<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\"><s:Body /></s:Envelope>")]
+    [InlineData("<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:a=\"http://www.w3.org/2005/08/addressing\" xmlns:wst=\"http://docs.oasis-open.org/ws-sx/ws-trust/200512\"><s:Header><a:Action>http://example.test/unexpected/action</a:Action></s:Header><s:Body><wst:RequestSecurityTokenResponseCollection><wst:RequestSecurityTokenResponse /></wst:RequestSecurityTokenResponseCollection></s:Body></s:Envelope>")]
+    [InlineData("<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:a=\"http://www.w3.org/2005/08/addressing\" xmlns:wst=\"http://docs.oasis-open.org/ws-sx/ws-trust/200512\"><s:Header><a:Action>http://schemas.microsoft.com/windows/pki/2009/01/enrollment/RSTRC/wstep</a:Action><a:RelatesTo>urn:uuid:00000000-0000-0000-0000-000000000000</a:RelatesTo></s:Header><s:Body><wst:RequestSecurityTokenResponseCollection><wst:RequestSecurityTokenResponse /></wst:RequestSecurityTokenResponseCollection></s:Body></s:Envelope>")]
+    public async Task Review_UnreadableOrAmbiguousInitialResponses_PreserveSubmissionUncertain_AndBlockDuplicateSubmit(
+        string ambiguousBody)
+    {
+        PendingCaEnrollmentRecord pending = await CreatePendingAsync();
+        ScriptedTransport transport = new(
+            _ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(ambiguousBody, System.Text.Encoding.UTF8, "text/plain")
+            },
+            _ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(ambiguousBody, System.Text.Encoding.UTF8, "text/plain")
+            });
+
+        AdCsCesEnrollmentService ces = CreateCesService(transport);
+        await ConfigureUsernamePasswordAsync(ces);
+
+        AdCsCesOperationResult first = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        Assert.False(first.Succeeded);
+        Assert.Equal(AdCsCesOutcomeKind.SubmissionUncertain, first.OutcomeKind);
+        Assert.Equal(PendingCaEnrollmentStatus.SubmissionUncertain, first.UpdatedRecord!.Status);
+        Assert.Single(transport.Requests);
+
+        // Second ordinary submit without forceResubmit must not send the CSR a second time
+        AdCsCesOperationResult second = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        Assert.False(second.Succeeded);
+        Assert.Equal(AdCsCesOutcomeKind.SubmissionUncertain, second.OutcomeKind);
+        Assert.Equal(PendingCaEnrollmentStatus.SubmissionUncertain, second.UpdatedRecord!.Status);
+        Assert.Single(transport.Requests);
+
+        await _services.GetRequiredService<CertificateAuthorityService>()
+            .CancelPendingCaEnrollmentAsync(pending.Id);
+    }
+
+    [Fact]
+    public async Task Review_UnreadableStatusQueryResponses_KeepAwaitingApproval_AndBlockOrdinaryResubmit()
+    {
+        PendingCaEnrollmentRecord pending = await CreatePendingAsync();
+        ScriptedTransport transport = new(
+            _ => SoapResponse(PendingRstr("99", "Taken Under Submission")),
+            _ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("<html>proxy error</html>", System.Text.Encoding.UTF8, "text/html")
+            });
+
+        AdCsCesEnrollmentService ces = CreateCesService(transport);
+        await ConfigureUsernamePasswordAsync(ces);
+
+        AdCsCesOperationResult submitted = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        Assert.Equal(AdCsCesOutcomeKind.PendingApproval, submitted.OutcomeKind);
+        Assert.Equal(PendingCaEnrollmentStatus.AwaitingApproval, submitted.UpdatedRecord!.Status);
+        Assert.Single(transport.Requests);
+
+        AdCsCesOperationResult queryFailed = await ces.QueryPendingStatusAsync(pending.Id);
+        Assert.False(queryFailed.Succeeded);
+        Assert.Equal(PendingCaEnrollmentStatus.AwaitingApproval, queryFailed.UpdatedRecord!.Status);
+        Assert.Equal(2, transport.Requests.Count);
+
+        AdCsCesOperationResult blockedSubmit = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        Assert.False(blockedSubmit.Succeeded);
+        Assert.Equal(AdCsCesOutcomeKind.PendingApproval, blockedSubmit.OutcomeKind);
+        Assert.Equal(2, transport.Requests.Count);
+    }
+
     private AdCsCesEnrollmentService CreateCesService(ScriptedTransport transport)
     {
         return new AdCsCesEnrollmentService(
@@ -372,6 +528,80 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
         return rootReq.CreateSelfSigned(
             DateTimeOffset.UtcNow.AddDays(-1),
             DateTimeOffset.UtcNow.AddYears(2));
+    }
+
+    private static X509Certificate2 CreateIntermediateCa(
+        X509Certificate2 issuerCert,
+        RSA issuerKey,
+        RSA interKey,
+        string subject,
+        IReadOnlyList<string> ekuOids)
+    {
+        CertificateRequest req = new(
+            subject,
+            interKey,
+            HashAlgorithmName.SHA256,
+            RSASignaturePadding.Pkcs1);
+        req.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, true, 0, true));
+        req.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign,
+            true));
+        if (ekuOids.Count > 0)
+        {
+            OidCollection oids = [];
+            foreach (string oid in ekuOids)
+            {
+                oids.Add(new Oid(oid));
+            }
+            req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(oids, false));
+        }
+        req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
+        req.CertificateExtensions.Add(
+            X509AuthorityKeyIdentifierExtension.CreateFromSubjectKeyIdentifier(
+                issuerCert.Extensions.OfType<X509SubjectKeyIdentifierExtension>().Single()));
+        return req.Create(
+            issuerCert.SubjectName,
+            X509SignatureGenerator.CreateForRSA(issuerKey, RSASignaturePadding.Pkcs1),
+            DateTimeOffset.UtcNow.AddHours(-1),
+            DateTimeOffset.UtcNow.AddDays(365),
+            RandomNumberGenerator.GetBytes(16));
+    }
+
+    private static X509Certificate2 CreateTlsEndpointCertificate(
+        X509Certificate2 issuerCert,
+        RSA issuerKey,
+        string dnsName,
+        IReadOnlyList<string> ekuOids)
+    {
+        using ECDsa leafKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        CertificateRequest req = new(
+            $"CN={dnsName},O=CertRobo Tests,C=US",
+            leafKey,
+            HashAlgorithmName.SHA256);
+        req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
+        req.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, true));
+        if (ekuOids.Count > 0)
+        {
+            OidCollection oids = [];
+            foreach (string oid in ekuOids)
+            {
+                oids.Add(new Oid(oid));
+            }
+            req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(oids, false));
+        }
+        SubjectAlternativeNameBuilder san = new();
+        san.AddDnsName(dnsName);
+        req.CertificateExtensions.Add(san.Build());
+        req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
+        req.CertificateExtensions.Add(
+            X509AuthorityKeyIdentifierExtension.CreateFromSubjectKeyIdentifier(
+                issuerCert.Extensions.OfType<X509SubjectKeyIdentifierExtension>().Single()));
+        return req.Create(
+            issuerCert.SubjectName,
+            X509SignatureGenerator.CreateForRSA(issuerKey, RSASignaturePadding.Pkcs1),
+            DateTimeOffset.UtcNow.AddMinutes(-5),
+            DateTimeOffset.UtcNow.AddDays(30),
+            RandomNumberGenerator.GetBytes(16));
     }
 
     private static X509Certificate2 SignPending(

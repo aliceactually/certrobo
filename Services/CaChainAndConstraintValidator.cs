@@ -1269,7 +1269,7 @@ public static class CaChainAndConstraintValidator
         return (true, null, leadingDot ? "." + hostPart : hostPart);
     }
 
-    private static HashSet<string>? ExtractCaEkuConstraintOids(X509Certificate2 cert)
+    public static HashSet<string>? ExtractCaEkuConstraintOids(X509Certificate2 cert)
     {
         HashSet<string>? combined = null;
 
@@ -1284,7 +1284,7 @@ public static class CaChainAndConstraintValidator
                 StringComparer.Ordinal);
         }
 
-        // Also check Microsoft Application Policies (1.3.6.1.4.1.311.21.10) if present on an AD CS-issued CA certificate
+        // Also check Microsoft Application Policies (1.3.6.1.4.1.311.21.10) if present on an AD CS-issued certificate
         System.Security.Cryptography.X509Certificates.X509Extension? msAppPol = cert.Extensions
             .FirstOrDefault(e => e.Oid?.Value == MsAppPoliciesOid);
 
@@ -1302,7 +1302,12 @@ public static class CaChainAndConstraintValidator
                     }
                 }
 
-                if (appPolicyOids.Count > 0 && !appPolicyOids.Contains(AnyExtendedKeyUsageOid))
+                if (appPolicyOids.Count == 0)
+                {
+                    return [];
+                }
+
+                if (!appPolicyOids.Contains(AnyExtendedKeyUsageOid))
                 {
                     if (combined == null)
                     {
@@ -1317,13 +1322,14 @@ public static class CaChainAndConstraintValidator
                         combined = appPolicyOids;
                     }
                 }
+                else
+                {
+                    combined ??= appPolicyOids;
+                }
             }
             catch
             {
-                if (msAppPol.Critical)
-                {
-                    return []; // Force failure if critical MS Application Policies cannot be parsed
-                }
+                return [];
             }
         }
 
