@@ -153,6 +153,147 @@ public class WebUiAndNavigationTests : IDisposable
     }
 
     [Fact]
+    public async Task AdminOffersThreeCaPaths_AndPendingCsrDownloadRequiresAdministratorAuthentication()
+    {
+        using (IServiceScope scope = _factory.Services.CreateScope())
+        {
+            AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+            await acct.BootstrapFirstAdminAsync(
+                "admin",
+                "AdminPass!2026",
+                "admin@contoso.com",
+                "*.contoso.com");
+        }
+
+        using HttpClient adminClient = _factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false
+        });
+        HttpResponseMessage loginGet = await adminClient.GetAsync("/login");
+        string loginHtml = await loginGet.Content.ReadAsStringAsync();
+        string loginToken = ExtractAntiforgeryToken(loginHtml);
+        CopyCookies(loginGet, adminClient);
+        HttpResponseMessage loginPost = await adminClient.PostAsync(
+            "/account/login",
+            new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["__RequestVerificationToken"] = loginToken,
+                ["userName"] = "admin",
+                ["password"] = "AdminPass!2026",
+                ["returnUrl"] = "/admin"
+            }));
+        CopyCookies(loginPost, adminClient);
+
+        string adminHtml = await adminClient.GetStringAsync("/admin");
+        Assert.Contains("Generate Self-Signed Root CA", adminHtml);
+        Assert.Contains("Import Existing Issuing CA", adminHtml);
+        Assert.Contains("Request Issuing CA from External CA", adminHtml);
+
+        PendingCaEnrollmentRecord pending;
+        using (IServiceScope scope = _factory.Services.CreateScope())
+        {
+            CertificateAuthorityService ca = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
+            pending = await ca.CreatePendingCaEnrollmentAsync(
+                "External Issuing CA",
+                "issuing-ca.contoso.com",
+                "US",
+                "Washington",
+                "Redmond",
+                "Contoso",
+                "PKI",
+                CertificateKeyFamily.Ecdsa,
+                256,
+                "TestCaPassphrase!2026");
+        }
+
+        using HttpClient unauthenticated = _factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false
+        });
+        HttpResponseMessage deniedCsr = await unauthenticated.GetAsync($"/admin/pending-ca/csr?id={pending.Id}");
+        Assert.Equal(HttpStatusCode.Redirect, deniedCsr.StatusCode);
+        Assert.Contains("/login", deniedCsr.Headers.Location?.OriginalString);
+
+        adminHtml = await adminClient.GetStringAsync("/admin");
+        Assert.Contains("Pending External Issuing CA Enrolment", adminHtml);
+        Assert.DoesNotContain("PRIVATE KEY", adminHtml);
+
+        HttpResponseMessage csrResponse = await adminClient.GetAsync($"/admin/pending-ca/csr?id={pending.Id}");
+        Assert.Equal(HttpStatusCode.OK, csrResponse.StatusCode);
+        Assert.Equal("application/pkcs10", csrResponse.Content.Headers.ContentType?.MediaType);
+        string csr = await csrResponse.Content.ReadAsStringAsync();
+        Assert.Equal(pending.CsrPem, csr);
+        Assert.DoesNotContain("PRIVATE KEY", csr);
+    }
+
+    [Fact]
+    public async Task IssuerSpecificCaAndCrlEndpointsRemainAvailableAfterRollover()
+    {
+        CaAuthorityRecord oldCa;
+        CaAuthorityRecord newCa;
+        using (IServiceScope scope = _factory.Services.CreateScope())
+        {
+            CertificateAuthorityService ca = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
+            oldCa = await ca.CreateSelfSignedOrIntermediateCaAsync(
+                "Old Public CA",
+                "old-public-ca.contoso.com",
+                "US", "Washington", "Redmond", "Contoso", "PKI",
+                CertificateKeyFamily.Rsa,
+                2048,
+                365,
+                "TestCaPassphrase!2026",
+                crlDistributionPointUrl: "http://localhost/ca.crl",
+                authorityIssuerCertUrl: "http://localhost/ca.crt");
+            newCa = await ca.CreateSelfSignedOrIntermediateCaAsync(
+                "New Public CA",
+                "new-public-ca.contoso.com",
+                "US", "Washington", "Redmond", "Contoso", "PKI",
+                CertificateKeyFamily.Ecdsa,
+                256,
+                365,
+                "TestCaPassphrase!2026",
+                crlDistributionPointUrl: "http://localhost/ca.crl",
+                authorityIssuerCertUrl: "http://localhost/ca.crt");
+        }
+
+        Assert.Equal($"http://localhost/authorities/{oldCa.Id}/ca.crl", oldCa.CrlDistributionPointUrl);
+        Assert.Equal($"http://localhost/authorities/{oldCa.Id}/issuer.crt", oldCa.AuthorityIssuerCertUrl);
+        Assert.Equal($"http://localhost/authorities/{newCa.Id}/ca.crl", newCa.CrlDistributionPointUrl);
+
+        using HttpClient client = _factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            AllowAutoRedirect = false
+        });
+
+        string oldPem = await client.GetStringAsync($"/authorities/{oldCa.Id}/ca.crt");
+        string activePem = await client.GetStringAsync("/ca.crt");
+        Assert.Contains(oldCa.IssuerCertificatePem.Trim(), oldPem);
+        Assert.Contains(newCa.IssuerCertificatePem.Trim(), activePem);
+        Assert.DoesNotContain(oldCa.IssuerCertificatePem.Trim(), activePem);
+
+        byte[] oldIssuerDer = await client.GetByteArrayAsync($"/authorities/{oldCa.Id}/issuer.crt");
+        using var oldIssuerCert =
+            System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadCertificate(oldIssuerDer);
+        Assert.Equal(
+            oldCa.ThumbprintOrSerialHex,
+            oldIssuerCert.GetCertHashString(System.Security.Cryptography.HashAlgorithmName.SHA256));
+
+        HttpResponseMessage oldCrlHead = await client.SendAsync(
+            new HttpRequestMessage(HttpMethod.Head, $"/authorities/{oldCa.Id}/ca.crl"));
+        Assert.Equal(HttpStatusCode.OK, oldCrlHead.StatusCode);
+        Assert.True(oldCrlHead.Content.Headers.ContentLength > 0);
+
+        byte[] p7b = await client.GetByteArrayAsync($"/authorities/{oldCa.Id}/ca.p7b");
+        List<System.Security.Cryptography.X509Certificates.X509Certificate2> parsed =
+            CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(p7b, null, "historical endpoint P7B");
+        Assert.Single(parsed);
+        Assert.Equal(
+            oldCa.ThumbprintOrSerialHex,
+            parsed[0].GetCertHashString(System.Security.Cryptography.HashAlgorithmName.SHA256));
+        foreach (var cert in parsed) cert.Dispose();
+    }
+
+    [Fact]
     public async Task AdminComponent_ClearsPendingAccountEditorState_OnCreateUser_And_ImplementsTabKeyboardNavigation()
     {
         using IServiceScope scope = _factory.Services.CreateScope();
@@ -165,11 +306,12 @@ public class WebUiAndNavigationTests : IDisposable
         Type adminType = typeof(CertRobo.Pages.Admin);
         SetProperty(adminPage, "AccountService", acct);
         SetProperty(adminPage, "CaService", scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>());
+        SetProperty(adminPage, "CesService", scope.ServiceProvider.GetRequiredService<AdCsCesEnrollmentService>());
         SetProperty(adminPage, "BackupService", scope.ServiceProvider.GetRequiredService<BackupRestoreService>());
         SetProperty(adminPage, "MigrationService", scope.ServiceProvider.GetRequiredService<LegacySettingsMigrationService>());
         SetProperty(adminPage, "Configuration", scope.ServiceProvider.GetRequiredService<IConfiguration>());
         SetProperty(adminPage, "HostEnvironment", scope.ServiceProvider.GetRequiredService<Microsoft.AspNetCore.Hosting.IWebHostEnvironment>());
-        SetProperty(adminPage, "AuthenticationStateProvider", scope.ServiceProvider.GetRequiredService< Microsoft.AspNetCore.Components.Authorization.AuthenticationStateProvider>());
+        SetProperty(adminPage, "AuthenticationStateProvider", scope.ServiceProvider.GetRequiredService<Microsoft.AspNetCore.Components.Authorization.AuthenticationStateProvider>());
         SetProperty(adminPage, "NotificationService", scope.ServiceProvider.GetRequiredService<Radzen.NotificationService>());
 
         await InvokeMethodAsync(adminPage, "OnInitializedAsync");

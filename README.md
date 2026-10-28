@@ -65,6 +65,7 @@ ASPNETCORE_URLS=http://127.0.0.1:5000
 CertRobo__DataDirectory=/var/lib/certrobo
 CertRobo__CaStorageDirectory=/var/lib/certrobo/ca
 CertRobo__CaPassphraseFile=/etc/certrobo/ca.pass
+CertRobo__PublicBaseUrl=http://pki.contoso.com
 CertRobo__CrlValidityHours=168
 ```
 
@@ -132,9 +133,71 @@ sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /
 sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --init-ca "Contoso Issuing Intermediate CA" "issuing-ca.contoso.com" ECDSA-384 1825 "http://pki.contoso.com/ca.crl" "http://pki.contoso.com/ca.crt" --subordinate'
 ```
 
+### 5A. Externally Signed Issuing CA
+
+CertRobo can generate and retain an encrypted Issuing CA key locally while an external parent CA signs its PKCS #10 request. This supports initial setup and replacement; during replacement, the current CA continues issuing until the validated replacement is explicitly activated.
+
+In **Administration → Certificate authority**, choose:
+
+1. **Generate Self-Signed Root CA** for a standalone trust hierarchy.
+2. **Import Existing Issuing CA** when certificate and private key material already exist.
+3. **Request Issuing CA from External CA** to generate the key and CSR inside CertRobo.
+
+For the third path:
+
+1. Choose the RSA/ECDSA key parameters and create the pending request.
+2. Download the existing `.csr`. Repeated downloads, page refreshes, and restarts return the same CSR and do not regenerate its key.
+3. Have the parent CA issue a subordinate CA certificate. Supply the signed certificate and complete parent/root chain as PEM, DER, or certificate-only PKCS #7/P7B.
+4. Review the validated subject, issuer, SHA-256 fingerprint, validity, authoritative KeyUsage/path-length, name/EKU constraints, and ordered chain.
+5. Explicitly activate it. A failed upload or cancellation does not replace the active CA.
+
+The equivalent headless flow is:
+
+```bash
+sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --request-external-ca "Contoso Issuing CA" "issuing-ca.contoso.com" ECDSA-384 /tmp/issuing-ca.csr'
+
+# After the parent returns the signed certificate and chain:
+sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --complete-external-ca /tmp/issuing-ca.crt /tmp/parent-chain.p7b'
+```
+
+#### Parent CA Requirements
+
+The parent must return a currently valid subordinate CA certificate whose public key matches the CSR, with:
+
+* critical `BasicConstraints: CA=true`;
+* `KeyUsage` containing both `keyCertSign` and `cRLSign`;
+* a complete, cryptographically valid path to an explicitly supplied self-signed trust anchor;
+* sufficient `pathLenConstraint` to permit this Issuing CA; and
+* no critical restrictions CertRobo cannot safely enforce.
+
+Returned permissions are authoritative. CertRobo enforces supported DNS NameConstraints and EKU restrictions on subsequent leaf issuance and rejects unsupported NameConstraints forms or critical extensions. Leaf validity is bounded by the earliest expiry and latest start date across the complete usable issuing chain, including the trust anchor. Operational policy is therefore that an expired trust anchor stops new issuance even if the Issuing CA certificate itself remains valid.
+
+#### Optional Microsoft AD CS CES Connector
+
+The pending-request view can optionally submit the same local CSR to Microsoft **Certificate Enrollment Web Service (CES)** using HTTPS and [MS-WSTEP]. It does not use LDAP, domain membership, GPO, `/certsrv` page scraping, or Windows-only enrollment APIs.
+
+Configure the direct `service.svc/CES` HTTPS endpoint, certificate template name, bounded timeout, and one authentication mode:
+
+* **Username/password**: sent as a WS-Security UsernameToken (`PasswordText`) inside the SOAP 1.2 request, not HTTP Basic authentication. The account needs only the CA/template enrollment permissions required by your policy.
+* **TLS client certificate**: optional; configure a matching certificate/private key accepted by the CES endpoint.
+
+Connector passwords/client private keys are encrypted with the persisted ASP.NET Core Data Protection key ring. `CERTROBO_ADCS_CES_PASSWORD` may supply a runtime-only username/password secret instead. For an internally issued CES HTTPS certificate, configure the internal self-signed Root CA and any required intermediates as **Custom Server TLS Trust**. Hostname and chain validation remain mandatory; there is no skip-validation option and redirects are refused.
+
+The AD CS certificate template should:
+
+* be published on the target Enterprise CA and permit the connector account to enroll;
+* use **Supply in the request** for the subject when the submitted PKCS #10 subject is authoritative;
+* issue a subordinate CA certificate with `BasicConstraints CA=true`, `keyCertSign`, and `cRLSign`;
+* set a path-length compatible with CertRobo's requested role; and
+* either issue immediately or use normal CA manager approval.
+
+CES outcomes are persisted as issued, pending approval, denied, authentication failure, transport failure, or submission outcome uncertain. Pending requests can be retrieved with WSTEP `QueryTokenStatus` when CES supplies/accepts the AD CS Request ID. After a timeout or connection loss following transmission, CertRobo does not automatically resubmit because the CA might already have accepted the request; reconcile by Request ID or use manual completion.
+
+Manual completion remains available whenever CES is disabled, unavailable, denied, or cannot retrieve a pending request.
+
 ### 6. Issue Portal TLS Certificate and Configure Nginx (`:80` AIA/CDP + `:443` Portal)
 
-Per RFC 5280, relying parties fetching AIA (`/ca.crt`) and CDP (`/ca.crl`, `/ca.crl.pem`) must be able to reach those endpoints over plain HTTP (`:80`) without being redirected to HTTPS, while all interactive portal traffic (`/`, `/login`, `/admin`, `/_blazor`) is served over HTTPS (`:443`) with WebSocket upgrade support.
+Per RFC 5280, relying parties fetching AIA (`/issuer.crt` or `/authorities/{id}/issuer.crt`) and CDP (`/ca.crl` or `/authorities/{id}/ca.crl`) must be able to reach those endpoints over plain HTTP (`:80`) without being redirected to HTTPS, while all interactive portal traffic (`/`, `/login`, `/admin`, `/_blazor`) is served over HTTPS (`:443`) with WebSocket upgrade support.
 
 ```bash
 sudo mkdir -p /etc/pki/nginx/private
@@ -167,7 +230,7 @@ server {
     server_name _;
 
     # Serve public CA chain and CRL endpoints over plain HTTP (RFC 5280)
-    location ~ ^/(ca\.crt|rootca\.crt|ca\.crl|ca\.crl\.pem)$ {
+    location ~ ^/(ca\.crt|ca\.p7b|issuer\.crt|rootca\.crt|ca\.crl|ca\.crl\.pem|authorities/[0-9]+/(ca\.(crt|p7b|crl|crl\.pem)|issuer\.crt))$ {
         proxy_pass http://127.0.0.1:5000;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -243,12 +306,36 @@ sudo systemctl enable --now nginx.service
      ```
 
 4. **Consistent Backup, Restore, and Cutover Notes**
-   * `BackupRestoreService` creates a consistent online snapshot (`VACUUM INTO`) of `certrobo.db` together with `ca/*.p8.enc` and `dataprotection-keys/*.xml`. You can download a backup archive from `/admin` or run from the CLI:
+   * `BackupRestoreService` creates a consistent online snapshot (`VACUUM INTO`) of `certrobo.db` together with `ca/*.p8.enc` and `dataprotection-keys/*.xml`. This includes pending external-enrolment records, pending encrypted keys, non-secret WSTEP continuation data, encrypted connector credentials, and the Data Protection keys needed to recover those credentials. You can download a backup archive from `/admin` or run from the CLI:
      ```bash
      sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --backup /var/lib/certrobo/backups/certrobo-backup.zip'
      sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --restore /var/lib/certrobo/backups/certrobo-backup.zip'
      ```
    * Note that rolling back to an earlier backup after certificates have been delivered to clients cannot undo trust in already-issued certificates; if importing an existing CA identity from AD CS, fence the old signer first, set the initial serial and CRL number floors above the highest previously issued values, and seed any unexpired revoked serials in `/admin`.
+
+5. **Issuer-Specific Publication and Export Behavior**
+   * Set `CertRobo__PublicBaseUrl` to the externally reachable plain-HTTP PKI origin. New authorities using default publication paths then receive stable issuer URLs such as `http://pki.contoso.com/authorities/3/issuer.crt` (DER AIA certificate) and `http://pki.contoso.com/authorities/3/ca.crl`. `/ca.crt`, `/ca.p7b`, `/issuer.crt`, `/ca.crl`, and `/ca.crl.pem` remain compatibility aliases for the active issuer; `/rootca.crt` returns only the trust anchor.
+   * Historical issuer chains and CRLs remain available by authority ID after rollover. Each issued record retains its actual `CaAuthorityId` and chain, so later downloads do not silently switch to the current issuer.
+   * Export ZIPs include leaf PEM, leaf-only PKCS #12 and PKCS #7, full-chain PKCS #12/P7B, a TLS server-chain PEM containing the leaf plus intermediate CA(s), and a separate `rootca.crt` trust anchor. A self-signed root is not inserted into the TLS server-chain file.
+   * Certificates issued before issuer-specific URLs were introduced may contain the legacy `/ca.crt` or `/ca.crl` active aliases. Their original issuer records and signed CRLs are preserved, but those already-encoded URLs cannot be changed retrospectively. Pin legacy relying parties to the corresponding `/authorities/{id}/...` resource during rollover.
+   * CertRobo publishes CRLs only for certificates it issues under each stored CA identity. It does not mirror a parent CA's CRL/OCSP service and never copies the parent's revocation URL onto leaf certificates.
+
+6. **Disposable AD CS CES Integration Test Procedure**
+   * This repository's automated tests validate WSTEP envelopes/parsing and issued, pending, denied, authentication, TLS, transport, ambiguous-submission, restart, retrieval, and manual-fallback states using disposable HTTPS handlers. They do not prove interoperability with a real CES deployment.
+   * On an explicitly authorized disposable Windows Server Enterprise CA:
+     1. Publish a subordinate-CA template as described above and grant a non-privileged test account Enroll permission.
+     2. Install/configure CES with Username/Password authentication and a valid HTTPS Server Authentication certificate.
+     3. Trust the HTTPS issuing chain in CertRobo via **Custom Server TLS Trust** if it is private.
+     4. Generate a pending Issuing CA request in CertRobo, configure the exact `https://.../service.svc/CES` URL and template name, and submit.
+     5. For immediate issuance, expect **Ready for Activation** and verify the displayed fingerprint against `certutil -dump`.
+     6. Enable CA manager approval, submit a fresh request, expect **Awaiting Parent CA Approval** with a persisted Request ID, approve it in the CA console, then use **Check Pending Status** and expect **Ready for Activation**.
+     7. Deny a fresh request and expect a distinct denied state; use a wrong password and expect authentication failure; present an untrusted or name-mismatched HTTPS certificate and expect TLS/trust failure.
+     8. Interrupt the connection after submission and confirm **Submission Outcome Uncertain** blocks ordinary resubmission. Reconcile using the CA Request ID or manual certificate upload.
+     9. Before activation, confirm the existing issuer still signs. After explicit activation, issue a test leaf and verify with:
+        ```bash
+        openssl verify -CAfile parent-root.pem -untrusted certrobo-issuing-ca.pem issued-leaf.crt
+        openssl verify -crl_check -CAfile parent-root.pem -untrusted certrobo-issuing-ca.pem -CRLfile certrobo.crl.pem issued-leaf.crt
+        ```
 
 ## Licence
 

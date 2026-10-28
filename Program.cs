@@ -72,6 +72,7 @@ CaKeyCustodyOptions caOptions = new()
     PassphraseEnvironmentVariable = builder.Configuration["CertRobo:CaPassphraseEnv"] ?? "CERTROBO_CA_PASSPHRASE",
     PassphraseFilePath = builder.Configuration["CertRobo:CaPassphraseFile"],
     ConfiguredPassphrase = builder.Configuration["CertRobo:CaPassphrase"],
+    PublicBaseUrl = builder.Configuration["CertRobo:PublicBaseUrl"],
     CrlValidityHours = int.TryParse(builder.Configuration["CertRobo:CrlValidityHours"], out int crlHrs) ? crlHrs : 168
 };
 builder.Services.AddSingleton(caOptions);
@@ -93,6 +94,7 @@ builder.Services.AddScoped<AccountManagementService>();
 builder.Services.AddScoped<LegacySettingsMigrationService>();
 builder.Services.AddScoped<IssuancePolicyService>();
 builder.Services.AddSingleton<CertificateAuthorityService>();
+builder.Services.AddSingleton<AdCsCesEnrollmentService>();
 builder.Services.AddSingleton<BackupRestoreService>();
 builder.Services.AddHostedService<CrlRefreshBackgroundService>();
 
@@ -125,7 +127,7 @@ if (restoreFlagIdx >= 0)
 using (IServiceScope scope = app.Services.CreateScope())
 {
     CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
-    await db.Database.EnsureCreatedAsync();
+    await db.EnsureSchemaUpgradedAsync();
 
     AccountManagementService accountService = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
     await accountService.EnsureRolesAndDefaultsAsync();
@@ -283,6 +285,111 @@ using (IServiceScope scope = app.Services.CreateScope())
             parentPassphrase: passphrase);
 
         Console.WriteLine($"Initialized and activated {(created.IsIntermediate ? "Intermediate" : "Root")} CA '{created.Name}' (SKI={created.SubjectKeyIdentifierHex}).");
+        return;
+    }
+
+    // Handle CLI external CA CSR generation:
+    // dotnet run -- --request-external-ca <caName> <commonName> <RSA-4096|RSA-2048|ECDSA-384|ECDSA-256> <outCsrPath> [<cdpUrl>] [<aiaUrl>]
+    int reqExtCaIdx = Array.IndexOf(args, "--request-external-ca");
+    if (reqExtCaIdx >= 0)
+    {
+        if (reqExtCaIdx + 4 >= args.Length)
+        {
+            Console.Error.WriteLine("Usage: --request-external-ca <caName> <commonName> <RSA-4096|RSA-2048|ECDSA-384|ECDSA-256> <outCsrPath> [<cdpUrl>] [<aiaUrl>]");
+            Environment.ExitCode = 1;
+            return;
+        }
+        string caName = args[reqExtCaIdx + 1];
+        string commonName = args[reqExtCaIdx + 2];
+        string keySpec = args[reqExtCaIdx + 3].ToUpperInvariant();
+        string outCsrPath = args[reqExtCaIdx + 4];
+        string cdpUrl = reqExtCaIdx + 5 < args.Length && !args[reqExtCaIdx + 5].StartsWith("--") ? args[reqExtCaIdx + 5] : "/ca.crl";
+        string aiaUrl = reqExtCaIdx + 6 < args.Length && !args[reqExtCaIdx + 6].StartsWith("--") ? args[reqExtCaIdx + 6] : "/ca.crt";
+
+        (CertificateKeyFamily family, int bits) = keySpec switch
+        {
+            "ECDSA-256" => (CertificateKeyFamily.Ecdsa, 256),
+            "ECDSA-384" => (CertificateKeyFamily.Ecdsa, 384),
+            "RSA-2048" => (CertificateKeyFamily.Rsa, 2048),
+            "RSA-4096" => (CertificateKeyFamily.Rsa, 4096),
+            _ => throw new ArgumentException($"Unsupported keySpec '{keySpec}'.")
+        };
+
+        CertificateAuthorityService caService = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
+        string? passphrase = caService.ResolveEffectivePassphrase();
+        if (string.IsNullOrEmpty(passphrase))
+        {
+            Console.Error.WriteLine("CA passphrase must be configured via CERTROBO_CA_PASSPHRASE or CertRobo:CaPassphraseFile.");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        SubjectDefaultsConfig defaults = await accountService.GetSubjectDefaultsAsync();
+        PendingCaEnrollmentRecord pending = await caService.CreatePendingCaEnrollmentAsync(
+            caName,
+            commonName,
+            defaults.Country,
+            defaults.StateOrProvince,
+            defaults.Locality,
+            defaults.Organisation,
+            defaults.OrganisationalUnit,
+            family,
+            bits,
+            passphrase,
+            requestedPathLengthConstraint: 0,
+            crlDistributionPointUrl: cdpUrl,
+            authorityIssuerCertUrl: aiaUrl,
+            emailAddress: defaults.EmailAddress);
+
+        await File.WriteAllTextAsync(outCsrPath, pending.CsrPem);
+        Console.WriteLine($"Generated pending Issuing CA request #{pending.Id} '{pending.CaName}' (SKI={pending.SubjectKeyIdentifierHex}) -> {outCsrPath}");
+        return;
+    }
+
+    // Handle CLI external CA completion & activation:
+    // dotnet run -- --complete-external-ca <signedCertOrBundlePath> [<parentChainPath>]
+    int completeExtCaIdx = Array.IndexOf(args, "--complete-external-ca");
+    if (completeExtCaIdx >= 0)
+    {
+        if (completeExtCaIdx + 1 >= args.Length)
+        {
+            Console.Error.WriteLine("Usage: --complete-external-ca <signedCertOrBundlePath> [<parentChainPath>]");
+            Environment.ExitCode = 1;
+            return;
+        }
+        string signedPath = args[completeExtCaIdx + 1];
+        string? chainPath = completeExtCaIdx + 2 < args.Length && !args[completeExtCaIdx + 2].StartsWith("--")
+            ? args[completeExtCaIdx + 2]
+            : null;
+
+        CertificateAuthorityService caService = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
+        PendingCaEnrollmentRecord? pending = await caService.GetActivePendingEnrollmentAsync();
+        if (pending == null)
+        {
+            Console.Error.WriteLine("No active pending external CA enrolment request was found.");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        byte[] signedBytes = await File.ReadAllBytesAsync(signedPath);
+        byte[]? chainBytes = !string.IsNullOrEmpty(chainPath) ? await File.ReadAllBytesAsync(chainPath) : null;
+
+        CaBundleValidationResult valResult = await caService.ValidateAndStageSignedCaBundleAsync(
+            pending.Id,
+            signedBytes,
+            signedCertText: null,
+            chainBytes,
+            chainCertText: null);
+
+        if (!valResult.IsValid)
+        {
+            Console.Error.WriteLine($"External CA validation failed: {valResult.ErrorMessage}");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        CaAuthorityRecord activated = await caService.ActivatePendingCaEnrollmentAsync(pending.Id);
+        Console.WriteLine($"Validated and activated external Issuing CA '{activated.Name}' (SKI={activated.SubjectKeyIdentifierHex}).");
         return;
     }
 

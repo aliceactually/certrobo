@@ -19,6 +19,7 @@ public sealed class BackupRestoreService(
         CancellationToken cancellationToken = default)
     {
         string tempSnapshotDb = Path.Combine(Path.GetTempPath(), $"certrobo-backup-{Guid.NewGuid():N}.db");
+        await CertificateAuthorityService.AcquireLifecycleLockAsync(cancellationToken);
         try
         {
             await using (CertRoboDbContext db = await dbFactory.CreateDbContextAsync(cancellationToken))
@@ -62,9 +63,16 @@ public sealed class BackupRestoreService(
         }
         finally
         {
-            if (File.Exists(tempSnapshotDb))
+            try
             {
-                File.Delete(tempSnapshotDb);
+                if (File.Exists(tempSnapshotDb))
+                {
+                    File.Delete(tempSnapshotDb);
+                }
+            }
+            finally
+            {
+                CertificateAuthorityService.ReleaseLifecycleLock();
             }
         }
     }
@@ -104,6 +112,54 @@ public sealed class BackupRestoreService(
                 string destPath = Path.Combine(targetDataProtectionKeysDir, fileName);
                 entry.ExtractToFile(destPath, overwrite: true);
                 RestrictFilePermissionsIfUnix(destPath);
+            }
+        }
+
+        RewriteRestoredKeyPaths(targetSqliteFilePath, targetCaStorageDir);
+    }
+
+    private static void RewriteRestoredKeyPaths(string sqliteFilePath, string caStorageDir)
+    {
+        if (!File.Exists(sqliteFilePath))
+        {
+            return;
+        }
+
+        using SqliteConnection connection = new($"Data Source={sqliteFilePath}");
+        connection.Open();
+
+        RewriteTableKeyPaths(connection, "CaAuthorities");
+        RewriteTableKeyPaths(connection, "PendingCaEnrollments");
+
+        void RewriteTableKeyPaths(SqliteConnection db, string tableName)
+        {
+            using SqliteCommand exists = db.CreateCommand();
+            exists.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=$tableName";
+            exists.Parameters.AddWithValue("$tableName", tableName);
+            if (Convert.ToInt64(exists.ExecuteScalar()) == 0)
+            {
+                return;
+            }
+
+            List<(long Id, string ExistingPath)> records = [];
+            using (SqliteCommand select = db.CreateCommand())
+            {
+                select.CommandText = $"SELECT Id, EncryptedPrivateKeyPath FROM \"{tableName}\"";
+                using SqliteDataReader reader = select.ExecuteReader();
+                while (reader.Read())
+                {
+                    records.Add((reader.GetInt64(0), reader.GetString(1)));
+                }
+            }
+
+            foreach ((long id, string existingPath) in records)
+            {
+                string restoredPath = Path.Combine(caStorageDir, Path.GetFileName(existingPath));
+                using SqliteCommand update = db.CreateCommand();
+                update.CommandText = $"UPDATE \"{tableName}\" SET EncryptedPrivateKeyPath=$path WHERE Id=$id";
+                update.Parameters.AddWithValue("$path", restoredPath);
+                update.Parameters.AddWithValue("$id", id);
+                update.ExecuteNonQuery();
             }
         }
     }
