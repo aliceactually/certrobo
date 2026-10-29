@@ -1699,7 +1699,11 @@ public sealed class AdCsCesEnrollmentService
             buffer.Write(chunk, 0, read);
         }
 
-        return (false, Encoding.UTF8.GetString(buffer.GetBuffer(), 0, (int)buffer.Length));
+        // Bound the raw response first, then retain HttpContent's charset and BOM
+        // handling. SOAP responses are not necessarily UTF-8.
+        using ByteArrayContent boundedContent = new(buffer.GetBuffer(), 0, (int)buffer.Length);
+        boundedContent.Headers.ContentType = content.Headers.ContentType;
+        return (false, await boundedContent.ReadAsStringAsync(cancellationToken));
     }
 
     private static string SanitizeDiagnosticMessage(string message)
