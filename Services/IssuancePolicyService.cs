@@ -9,6 +9,7 @@ using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.OpenSsl;
 using Org.BouncyCastle.Pkcs;
+using PemObject = Org.BouncyCastle.Utilities.IO.Pem.PemObject;
 
 namespace CertRobo.Services;
 
@@ -35,6 +36,13 @@ public sealed class IssuancePolicyService(
     UserManager<ApplicationUser> userManager,
     CertRoboDbContext dbContext)
 {
+    public const int MaxCsrPemLength = 32 * 1024;
+    public const int MaxCsrDerBytes = 16 * 1024;
+    public const int MaxCsrSubjectRdns = 32;
+    public const int MaxCsrAttributes = 16;
+    public const int MaxCsrExtensions = 16;
+    public const int MaxCsrDnsSanEntries = 128;
+
     public async Task<PolicyEvaluationResult> EvaluateCsrRequestAsync(
         string? userId,
         string? csrPem,
@@ -128,15 +136,35 @@ public sealed class IssuancePolicyService(
             return (false, "You must provide a CSR before requesting a certificate", null);
         }
 
+        if (csrPem.Length > MaxCsrPemLength)
+        {
+            return (false, $"The CSR provided exceeds the maximum permitted length ({MaxCsrPemLength} characters)", null);
+        }
+
         Pkcs10CertificationRequest decoded;
         try
         {
-            object? pemObj = new PemReader(new StringReader(csrPem)).ReadObject();
-            if (pemObj is not Pkcs10CertificationRequest req)
+            using StringReader sr = new(csrPem);
+            PemReader pemReader = new(sr);
+            PemObject? pemObj = pemReader.ReadPemObject();
+            if (pemObj == null
+                || (!string.Equals(pemObj.Type, "CERTIFICATE REQUEST", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(pemObj.Type, "NEW CERTIFICATE REQUEST", StringComparison.OrdinalIgnoreCase)))
             {
                 return (false, "The CSR provided could not be decoded", null);
             }
-            decoded = req;
+
+            if (pemObj.Content is not { Length: > 0 } || pemObj.Content.Length > MaxCsrDerBytes)
+            {
+                return (false, $"The CSR provided exceeds the maximum permitted decoded size ({MaxCsrDerBytes} bytes)", null);
+            }
+
+            if (pemReader.ReadPemObject() != null)
+            {
+                return (false, "The CSR provided must contain a single certificate signing request", null);
+            }
+
+            decoded = new Pkcs10CertificationRequest(pemObj.Content);
         }
         catch (Exception)
         {
@@ -220,91 +248,147 @@ public sealed class IssuancePolicyService(
             }
         }
 
-        CertificationRequestInfo info = decoded.GetCertificationRequestInfo();
-        X509Name subject = info.Subject;
-
-        // Extract and validate CN
+        CertificationRequestInfo info;
+        X509Name subject;
         List<string> rawDnsNames = [];
         string commonName = string.Empty;
-        var oids = subject.GetOidList();
-        var values = subject.GetValueList();
-        for (int i = 0; i < oids.Count; i++)
-        {
-            if (X509Name.CN.Equals(oids[i]))
-            {
-                string cnVal = ((string)values[i]!).Trim();
-                if (!string.IsNullOrEmpty(cnVal))
-                {
-                    if (string.IsNullOrEmpty(commonName))
-                    {
-                        commonName = cnVal;
-                    }
-                    rawDnsNames.Add(cnVal);
-                }
-            }
-            else if (X509Name.C.Equals(oids[i]))
-            {
-                string countryVal = ((string)values[i]!).Trim();
-                if (!string.IsNullOrEmpty(countryVal) && countryVal.Length != 2)
-                {
-                    return (false, "Subject Country (C) must be a two-letter ISO 3166 country code", null);
-                }
-            }
-        }
 
-        // Inspect attributes and requested extensions; reject unsupported extensions (like CA BasicConstraints) and non-DNS SANs
-        Asn1Set? attributes = info.Attributes;
-        if (attributes != null)
+        try
         {
-            foreach (Asn1Encodable attr in attributes)
+            info = decoded.GetCertificationRequestInfo();
+            subject = info.Subject ?? throw new ArgumentException("CSR subject is missing.");
+
+            // Extract and validate CN
+            var oids = subject.GetOidList();
+            var values = subject.GetValueList();
+            if (oids.Count > MaxCsrSubjectRdns || values.Count != oids.Count)
             {
-                AttributePkcs pkcsAttr = AttributePkcs.GetInstance(attr);
-                if (PkcsObjectIdentifiers.Pkcs9AtExtensionRequest.Equals(pkcsAttr.AttrType))
+                return (false, $"CSR subject contains too many relative distinguished names (maximum {MaxCsrSubjectRdns})", null);
+            }
+
+            for (int i = 0; i < oids.Count; i++)
+            {
+                if (X509Name.CN.Equals(oids[i]))
                 {
-                    foreach (Asn1Encodable extSet in pkcsAttr.AttrValues)
+                    string cnVal = ((string)values[i]!).Trim();
+                    if (!string.IsNullOrEmpty(cnVal))
                     {
-                        X509Extensions extensions = X509Extensions.GetInstance(extSet);
-                        foreach (DerObjectIdentifier extOid in extensions.ExtensionOids)
+                        if (string.IsNullOrEmpty(commonName))
                         {
-                            if (X509Extensions.SubjectAlternativeName.Equals(extOid))
+                            commonName = cnVal;
+                        }
+                        rawDnsNames.Add(cnVal);
+                    }
+                }
+                else if (X509Name.C.Equals(oids[i]))
+                {
+                    string countryVal = ((string)values[i]!).Trim();
+                    if (!string.IsNullOrEmpty(countryVal) && countryVal.Length != 2)
+                    {
+                        return (false, "Subject Country (C) must be a two-letter ISO 3166 country code", null);
+                    }
+                }
+            }
+
+            // Inspect attributes and requested extensions; reject unsupported extensions (like CA BasicConstraints) and non-DNS SANs
+            Asn1Set? attributes = info.Attributes;
+            if (attributes != null)
+            {
+                if (attributes.Count > MaxCsrAttributes)
+                {
+                    return (false, $"CSR contains too many attributes (maximum {MaxCsrAttributes})", null);
+                }
+
+                foreach (Asn1Encodable attr in attributes)
+                {
+                    AttributePkcs pkcsAttr = AttributePkcs.GetInstance(attr);
+                    if (PkcsObjectIdentifiers.Pkcs9AtExtensionRequest.Equals(pkcsAttr.AttrType))
+                    {
+                        if (pkcsAttr.AttrValues.Count > MaxCsrExtensions)
+                        {
+                            return (false, $"CSR contains too many extension attribute values (maximum {MaxCsrExtensions})", null);
+                        }
+
+                        foreach (Asn1Encodable extSet in pkcsAttr.AttrValues)
+                        {
+                            X509Extensions extensions = X509Extensions.GetInstance(extSet);
+                            List<DerObjectIdentifier> extOids = extensions.ExtensionOids.Cast<DerObjectIdentifier>().ToList();
+                            if (extOids.Count > MaxCsrExtensions)
                             {
-                                X509Extension sanExt = extensions.GetExtension(extOid);
-                                GeneralNames sans = GeneralNames.GetInstance(Asn1OctetString.GetInstance(sanExt.Value).GetOctets());
-                                foreach (GeneralName gn in sans.GetNames())
+                                return (false, $"CSR contains too many requested extensions (maximum {MaxCsrExtensions})", null);
+                            }
+
+                            foreach (DerObjectIdentifier extOid in extOids)
+                            {
+                                if (X509Extensions.SubjectAlternativeName.Equals(extOid))
                                 {
-                                    if (gn.TagNo != GeneralName.DnsName)
+                                    X509Extension sanExt = extensions.GetExtension(extOid);
+                                    byte[] sanOctets = Asn1OctetString.GetInstance(sanExt.Value).GetOctets();
+                                    if (sanOctets.Length == 0 || sanOctets.Length > MaxCsrDerBytes)
                                     {
-                                        return (false, $"Unsupported Subject Alternative Name type (tag {gn.TagNo}); only DNS names are permitted", null);
+                                        return (false, "The CSR provided could not be decoded", null);
                                     }
-                                    string dnsVal = gn.Name.ToString()!.Trim();
-                                    if (string.IsNullOrWhiteSpace(dnsVal))
+
+                                    GeneralNames sans = GeneralNames.GetInstance(Asn1Object.FromByteArray(sanOctets));
+                                    GeneralName[] sanEntries = sans.GetNames();
+                                    if (sanEntries.Length > MaxCsrDnsSanEntries
+                                        || rawDnsNames.Count + sanEntries.Length > MaxCsrDnsSanEntries + 1)
                                     {
-                                        return (false, "Subject Alternative Name contains an empty DNS name", null);
+                                        return (false, $"CSR contains too many Subject Alternative Name entries (maximum {MaxCsrDnsSanEntries})", null);
                                     }
-                                    rawDnsNames.Add(dnsVal);
+
+                                    foreach (GeneralName gn in sanEntries)
+                                    {
+                                        if (gn.TagNo != GeneralName.DnsName)
+                                        {
+                                            return (false, $"Unsupported Subject Alternative Name type (tag {gn.TagNo}); only DNS names are permitted", null);
+                                        }
+                                        string dnsVal = DerIA5String.GetInstance(gn.Name).GetString().Trim();
+                                        if (string.IsNullOrWhiteSpace(dnsVal))
+                                        {
+                                            return (false, "Subject Alternative Name contains an empty DNS name", null);
+                                        }
+                                        rawDnsNames.Add(dnsVal);
+                                    }
                                 }
-                            }
-                            else if (X509Extensions.BasicConstraints.Equals(extOid))
-                            {
-                                X509Extension bcExt = extensions.GetExtension(extOid);
-                                BasicConstraints bc = BasicConstraints.GetInstance(Asn1OctetString.GetInstance(bcExt.Value).GetOctets());
-                                if (bc.IsCA())
+                                else if (X509Extensions.BasicConstraints.Equals(extOid))
                                 {
-                                    return (false, "CSR requests CA BasicConstraints, which is forbidden for leaf issuance", null);
+                                    X509Extension bcExt = extensions.GetExtension(extOid);
+                                    byte[] bcOctets = Asn1OctetString.GetInstance(bcExt.Value).GetOctets();
+                                    if (bcOctets.Length == 0 || bcOctets.Length > MaxCsrDerBytes)
+                                    {
+                                        return (false, "The CSR provided could not be decoded", null);
+                                    }
+
+                                    BasicConstraints bc = BasicConstraints.GetInstance(Asn1Object.FromByteArray(bcOctets));
+                                    if (bc.IsCA())
+                                    {
+                                        return (false, "CSR requests CA BasicConstraints, which is forbidden for leaf issuance", null);
+                                    }
                                 }
-                            }
-                            else if (X509Extensions.KeyUsage.Equals(extOid) || X509Extensions.ExtendedKeyUsage.Equals(extOid))
-                            {
-                                // Allowed in CSR if non-CA, though the issuer enforces profile KU/EKU rather than trusting CSR values.
-                            }
-                            else
-                            {
-                                return (false, $"CSR contains unsupported extension OID '{extOid.Id}'", null);
+                                else if (X509Extensions.KeyUsage.Equals(extOid) || X509Extensions.ExtendedKeyUsage.Equals(extOid))
+                                {
+                                    X509Extension kuOrEkuExt = extensions.GetExtension(extOid);
+                                    byte[] extOctets = Asn1OctetString.GetInstance(kuOrEkuExt.Value).GetOctets();
+                                    if (extOctets.Length == 0 || extOctets.Length > MaxCsrDerBytes)
+                                    {
+                                        return (false, "The CSR provided could not be decoded", null);
+                                    }
+                                    _ = Asn1Object.FromByteArray(extOctets);
+                                }
+                                else
+                                {
+                                    return (false, $"CSR contains unsupported extension OID '{extOid.Id}'", null);
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+        catch (Exception)
+        {
+            return (false, "The CSR provided could not be decoded", null);
         }
 
         if (rawDnsNames.Count == 0)

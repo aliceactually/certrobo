@@ -8,6 +8,7 @@ using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Xml;
 using System.Xml.Linq;
 
 namespace CertRobo.Services;
@@ -57,6 +58,8 @@ public sealed class AdCsCesEnrollmentService
     public const string Pkcs10ValueTypeUri = "http://schemas.microsoft.com/windows/pki/2009/01/enrollment#PKCS10";
     public const string Base64EncodingTypeUri = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd#base64binary";
     public const string UsernameTokenPasswordTextUri = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText";
+    public const int MaxCesResponseBytes = 2 * 1024 * 1024;
+    public const int MaxBinarySecurityTokensPerResponse = 16;
 
     private static readonly XNamespace Soap12Ns = "http://www.w3.org/2003/05/soap-envelope";
     private static readonly XNamespace WsaNs = "http://www.w3.org/2005/08/addressing";
@@ -521,10 +524,14 @@ public sealed class AdCsCesEnrollmentService
 
         HttpResponseMessage response;
         string responseBody;
+        bool responseOversized;
         try
         {
-            response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, timeoutCts.Token);
-            responseBody = await response.Content.ReadAsStringAsync(timeoutCts.Token);
+            response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
+            (responseOversized, responseBody) = await ReadBoundedResponseBodyAsync(
+                response.Content,
+                MaxCesResponseBytes,
+                timeoutCts.Token);
         }
         catch (AuthenticationException ex)
         {
@@ -630,6 +637,21 @@ public sealed class AdCsCesEnrollmentService
                 return new(false, AdCsCesOutcomeKind.AuthenticationFailure, authMsg, pending.UpstreamRequestId, null, null, pending);
             }
 
+            if (responseOversized)
+            {
+                string oversizedMsg = isInitialIssueSubmission
+                    ? $"AD CS CES response exceeded the maximum permitted size of {MaxCesResponseBytes} bytes (HTTP {statusCode}) after request transmission. Whether the parent CA recorded the request is uncertain; reconcile with the parent CA Request ID or use Force Resubmit."
+                    : $"AD CS CES response exceeded the maximum permitted size of {MaxCesResponseBytes} bytes (HTTP {statusCode}) when querying pending status.";
+                AdCsCesOutcomeKind outcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
+                    pending,
+                    isInitialIssueSubmission,
+                    queryFailureCategory: "ValidationFailure",
+                    queryFailureKind: AdCsCesOutcomeKind.ValidationFailure,
+                    oversizedMsg);
+                await db.SaveChangesAsync(cancellationToken);
+                return new(false, outcomeKind, oversizedMsg, pending.UpstreamRequestId, null, null, pending);
+            }
+
             // Gateway timeouts / 502 / 503 / 504 on an initial Issue request when body is non-SOAP mean outcome is uncertain
             if (isInitialIssueSubmission
                 && statusCode is 502 or 503 or 504
@@ -681,10 +703,34 @@ public sealed class AdCsCesEnrollmentService
             return new(false, outcomeKind, emptyMsg, pending.UpstreamRequestId, null, null, pending);
         }
 
+        if (xmlBody.Length > MaxCesResponseBytes)
+        {
+            string oversizedMsg = isInitialIssueSubmission
+                ? $"AD CS CES response exceeded the maximum permitted size of {MaxCesResponseBytes} characters (HTTP {(int)httpStatus}) after request transmission. Whether the parent CA recorded the request is uncertain; reconcile with the parent CA Request ID or use Force Resubmit."
+                : $"AD CS CES response exceeded the maximum permitted size of {MaxCesResponseBytes} characters (HTTP {(int)httpStatus}) when querying pending status.";
+            AdCsCesOutcomeKind outcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
+                pending,
+                isInitialIssueSubmission,
+                queryFailureCategory: "ValidationFailure",
+                queryFailureKind: AdCsCesOutcomeKind.ValidationFailure,
+                oversizedMsg);
+            await db.SaveChangesAsync(cancellationToken);
+            return new(false, outcomeKind, oversizedMsg, pending.UpstreamRequestId, null, null, pending);
+        }
+
         XDocument doc;
         try
         {
-            doc = XDocument.Parse(xmlBody);
+            XmlReaderSettings xmlSettings = new()
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null,
+                MaxCharactersInDocument = MaxCesResponseBytes,
+                MaxCharactersFromEntities = 1024
+            };
+            using StringReader sr = new(xmlBody);
+            using XmlReader xmlReader = XmlReader.Create(sr, xmlSettings);
+            doc = XDocument.Load(xmlReader);
         }
         catch (Exception)
         {
@@ -803,36 +849,55 @@ public sealed class AdCsCesEnrollmentService
         List<string> tokenParseErrors = [];
         try
         {
-            foreach (XElement bst in bstElements)
+            if (bstElements.Count > MaxBinarySecurityTokensPerResponse)
             {
-                string? valueType = bst.Attributes()
-                    .FirstOrDefault(a => a.Name.LocalName == "ValueType")?.Value;
-                if (!string.IsNullOrWhiteSpace(valueType)
-                    && valueType.Contains("PKCS10", StringComparison.OrdinalIgnoreCase))
+                tokenParseErrors.Add($"WSTEP response contained {bstElements.Count} BinarySecurityToken elements, exceeding the maximum permitted count ({MaxBinarySecurityTokensPerResponse}).");
+            }
+            else
+            {
+                foreach (XElement bst in bstElements)
                 {
-                    // MS-WSTEP may echo the original request token in the response.
-                    continue;
-                }
+                    string? valueType = bst.Attributes()
+                        .FirstOrDefault(a => a.Name.LocalName == "ValueType")?.Value;
+                    if (!string.IsNullOrWhiteSpace(valueType)
+                        && valueType.Contains("PKCS10", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // MS-WSTEP may echo the original request token in the response.
+                        continue;
+                    }
 
-                string? encodingType = bst.Attributes()
-                    .FirstOrDefault(a => a.Name.LocalName == "EncodingType")?.Value;
-                if (!string.IsNullOrWhiteSpace(encodingType)
-                    && !encodingType.Equals(Base64EncodingTypeUri, StringComparison.OrdinalIgnoreCase))
-                {
-                    tokenParseErrors.Add($"Unsupported BinarySecurityToken EncodingType '{encodingType}'.");
-                    continue;
-                }
+                    string? encodingType = bst.Attributes()
+                        .FirstOrDefault(a => a.Name.LocalName == "EncodingType")?.Value;
+                    if (!string.IsNullOrWhiteSpace(encodingType)
+                        && !encodingType.Equals(Base64EncodingTypeUri, StringComparison.OrdinalIgnoreCase))
+                    {
+                        tokenParseErrors.Add($"Unsupported BinarySecurityToken EncodingType '{encodingType}'.");
+                        continue;
+                    }
 
-                string rawB64 = bst.Value.Trim();
-                try
-                {
-                    List<X509Certificate2> parsedFromToken = CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
-                        null, rawB64, "WSTEP BinarySecurityToken");
-                    extractedCerts.AddRange(parsedFromToken);
-                }
-                catch (Exception ex)
-                {
-                    tokenParseErrors.Add(SanitizeDiagnosticMessage(ex.Message));
+                    string rawB64 = bst.Value.Trim();
+                    if (rawB64.Length > CaChainAndConstraintValidator.MaxBundleTextLength)
+                    {
+                        tokenParseErrors.Add($"WSTEP BinarySecurityToken exceeds the maximum permitted length of {CaChainAndConstraintValidator.MaxBundleTextLength} characters.");
+                        continue;
+                    }
+
+                    try
+                    {
+                        List<X509Certificate2> parsedFromToken = CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
+                            null, rawB64, "WSTEP BinarySecurityToken");
+                        if (extractedCerts.Count + parsedFromToken.Count > CaChainAndConstraintValidator.MaxCertificatesPerBundle)
+                        {
+                            foreach (X509Certificate2 c in parsedFromToken) c.Dispose();
+                            tokenParseErrors.Add($"WSTEP response exceeds the maximum permitted certificate count ({CaChainAndConstraintValidator.MaxCertificatesPerBundle}).");
+                            break;
+                        }
+                        extractedCerts.AddRange(parsedFromToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        tokenParseErrors.Add(SanitizeDiagnosticMessage(ex.Message));
+                    }
                 }
             }
 
@@ -1600,6 +1665,41 @@ public sealed class AdCsCesEnrollmentService
         // Once serialization has begun, a connection failure can occur after CES accepted the
         // request, so it must be treated as uncertain rather than safe to retry automatically.
         return !wasWrittenToStream;
+    }
+
+    private static async Task<(bool IsOversized, string Body)> ReadBoundedResponseBodyAsync(
+        HttpContent content,
+        int maxBytes,
+        CancellationToken cancellationToken)
+    {
+        if (content.Headers.ContentLength is long contentLength && contentLength > maxBytes)
+        {
+            return (true, string.Empty);
+        }
+
+        await using Stream stream = await content.ReadAsStreamAsync(cancellationToken);
+        using MemoryStream buffer = new();
+        byte[] chunk = new byte[8192];
+        int totalRead = 0;
+
+        while (true)
+        {
+            int read = await stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken);
+            if (read == 0)
+            {
+                break;
+            }
+
+            totalRead += read;
+            if (totalRead > maxBytes)
+            {
+                return (true, string.Empty);
+            }
+
+            buffer.Write(chunk, 0, read);
+        }
+
+        return (false, Encoding.UTF8.GetString(buffer.GetBuffer(), 0, (int)buffer.Length));
     }
 
     private static string SanitizeDiagnosticMessage(string message)

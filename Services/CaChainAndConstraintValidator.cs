@@ -9,6 +9,7 @@ using Org.BouncyCastle.OpenSsl;
 using Org.BouncyCastle.Pkcs;
 using Org.BouncyCastle.Security;
 using Org.BouncyCastle.X509;
+using PemObject = Org.BouncyCastle.Utilities.IO.Pem.PemObject;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -71,6 +72,16 @@ public static class CaChainAndConstraintValidator
     public const string MsCertTemplateNameOid = "1.3.6.1.4.1.311.20.2";
     public const string MsCertTemplateInfoOid = "1.3.6.1.4.1.311.21.7";
 
+    public const int MaxBundleRawBytes = 512 * 1024;
+    public const int MaxBundleTextLength = 1024 * 1024;
+    public const int MaxSingleCertificateDerBytes = 64 * 1024;
+    public const int MaxCertificatesPerBundle = 32;
+    public const int MaxAsn1TraversalDepth = 32;
+    public const int MaxAsn1TraversalNodes = 8192;
+    public const int MaxNameConstraintSubtreesPerCa = 128;
+
+    private static readonly TimeSpan PemRegexTimeout = TimeSpan.FromSeconds(2);
+
     private static readonly HashSet<string> SupportedCriticalCaExtensionOids = new(StringComparer.Ordinal)
     {
         "2.5.29.19", // BasicConstraints
@@ -95,23 +106,48 @@ public static class CaChainAndConstraintValidator
         string? textInput,
         string inputLabel)
     {
+        if (rawBytes is { Length: > MaxBundleRawBytes })
+        {
+            throw new ArgumentException($"{inputLabel} exceeds the maximum permitted size of {MaxBundleRawBytes} bytes.");
+        }
+
+        if (textInput is { Length: > MaxBundleTextLength })
+        {
+            throw new ArgumentException($"{inputLabel} exceeds the maximum permitted length of {MaxBundleTextLength} characters.");
+        }
+
         List<X509Certificate2> results = [];
-
-        if (rawBytes is { Length: > 0 })
+        try
         {
-            ParseFromBytes(rawBytes, inputLabel, results);
-        }
+            if (rawBytes is { Length: > 0 })
+            {
+                ParseFromBytes(rawBytes, inputLabel, results);
+            }
 
-        if (!string.IsNullOrWhiteSpace(textInput))
+            if (!string.IsNullOrWhiteSpace(textInput))
+            {
+                ParseFromText(textInput, inputLabel, results);
+            }
+
+            return DeduplicateCertificates(results);
+        }
+        catch
         {
-            ParseFromText(textInput, inputLabel, results);
+            foreach (X509Certificate2 cert in results)
+            {
+                cert.Dispose();
+            }
+            throw;
         }
-
-        return DeduplicateCertificates(results);
     }
 
     private static void ParseFromBytes(byte[] data, string inputLabel, List<X509Certificate2> results)
     {
+        if (data.Length > MaxBundleRawBytes)
+        {
+            throw new ArgumentException($"{inputLabel} exceeds the maximum permitted size of {MaxBundleRawBytes} bytes.");
+        }
+
         // Check if the bytes are actually UTF-8/ASCII text containing PEM or Base64
         if (LooksLikePemOrBase64Text(data, out string? asText) && !string.IsNullOrWhiteSpace(asText))
         {
@@ -127,13 +163,22 @@ public static class CaChainAndConstraintValidator
 
         try
         {
-            X509Certificate2 single = X509CertificateLoader.LoadCertificate(data);
+            X509Certificate2 single = LoadValidatedSingleCertificate(data);
+            if (results.Count >= MaxCertificatesPerBundle)
+            {
+                single.Dispose();
+                throw new ArgumentException($"{inputLabel} exceeds the maximum permitted certificate count ({MaxCertificatesPerBundle}).");
+            }
             results.Add(single);
             return;
         }
+        catch (ArgumentException)
+        {
+            throw;
+        }
         catch
         {
-            // Check if the user accidentally uploaded a PKCS#12 (.p12/.pfx) archive
+            // Check if the user accidentally uploaded a PKCS#12 (.p12/.pfx) archive or malformed DER
         }
 
         throw new ArgumentException($"Could not parse any X.509 certificates from {inputLabel} (supported formats: PEM, DER, and certificate-only PKCS #7 / P7B).");
@@ -141,6 +186,11 @@ public static class CaChainAndConstraintValidator
 
     private static void ParseFromText(string text, string inputLabel, List<X509Certificate2> results)
     {
+        if (text.Length > MaxBundleTextLength)
+        {
+            throw new ArgumentException($"{inputLabel} exceeds the maximum permitted length of {MaxBundleTextLength} characters.");
+        }
+
         if (text.Contains("PRIVATE KEY", StringComparison.OrdinalIgnoreCase))
         {
             throw new ArgumentException($"{inputLabel} contains a private key. External CA enrolment uses the locally generated key; use 'Import Existing Issuing CA' to import external private keys.");
@@ -151,13 +201,19 @@ public static class CaChainAndConstraintValidator
         // 1. Extract all -----BEGIN CERTIFICATE----- blocks
         MatchCollection certMatches = Regex.Matches(
             text,
-            @"-----BEGIN\s+(?:X509\s+)?CERTIFICATE-----\s*([A-Za-z0-9+/=\r\n\t ]+?)\s*-----END\s+(?:X509\s+)?CERTIFICATE-----",
-            RegexOptions.CultureInvariant);
+            @"-----BEGIN\s+(?:X509\s+)?CERTIFICATE-----([A-Za-z0-9+/=\r\n\t ]+?)-----END\s+(?:X509\s+)?CERTIFICATE-----",
+            RegexOptions.CultureInvariant,
+            PemRegexTimeout);
 
         foreach (Match m in certMatches)
         {
             foundPemBlock = true;
-            string b64 = Regex.Replace(m.Groups[1].Value, @"\s+", "");
+            if (results.Count >= MaxCertificatesPerBundle)
+            {
+                throw new ArgumentException($"{inputLabel} exceeds the maximum permitted certificate count ({MaxCertificatesPerBundle}).");
+            }
+
+            string b64 = StripWhitespace(m.Groups[1].Value);
             byte[] der;
             try
             {
@@ -168,9 +224,14 @@ public static class CaChainAndConstraintValidator
                 throw new ArgumentException($"Invalid Base64 in CERTIFICATE PEM block of {inputLabel}: {ex.Message}");
             }
 
+            if (der.Length == 0 || der.Length > MaxSingleCertificateDerBytes)
+            {
+                throw new ArgumentException($"Certificate in {inputLabel} exceeds the maximum permitted size of {MaxSingleCertificateDerBytes} bytes.");
+            }
+
             try
             {
-                results.Add(X509CertificateLoader.LoadCertificate(der));
+                results.Add(LoadValidatedSingleCertificate(der));
             }
             catch (Exception ex)
             {
@@ -181,13 +242,14 @@ public static class CaChainAndConstraintValidator
         // 2. Extract all -----BEGIN PKCS7----- or -----BEGIN CMS----- blocks
         MatchCollection pkcs7Matches = Regex.Matches(
             text,
-            @"-----BEGIN\s+(?:PKCS7|PKCS\s*#7|CMS)-----\s*([A-Za-z0-9+/=\r\n\t ]+?)\s*-----END\s+(?:PKCS7|PKCS\s*#7|CMS)-----",
-            RegexOptions.CultureInvariant);
+            @"-----BEGIN\s+(?:PKCS7|PKCS\s*#7|CMS)-----([A-Za-z0-9+/=\r\n\t ]+?)-----END\s+(?:PKCS7|PKCS\s*#7|CMS)-----",
+            RegexOptions.CultureInvariant,
+            PemRegexTimeout);
 
         foreach (Match m in pkcs7Matches)
         {
             foundPemBlock = true;
-            string b64 = Regex.Replace(m.Groups[1].Value, @"\s+", "");
+            string b64 = StripWhitespace(m.Groups[1].Value);
             byte[] cmsDer;
             try
             {
@@ -196,6 +258,11 @@ public static class CaChainAndConstraintValidator
             catch (FormatException ex)
             {
                 throw new ArgumentException($"Invalid Base64 in PKCS#7 PEM block of {inputLabel}: {ex.Message}");
+            }
+
+            if (cmsDer.Length == 0 || cmsDer.Length > MaxBundleRawBytes)
+            {
+                throw new ArgumentException($"PKCS #7 / P7B block in {inputLabel} exceeds the maximum permitted size of {MaxBundleRawBytes} bytes.");
             }
 
             if (!TryExtractCertificatesFromCmsDer(cmsDer, results))
@@ -215,7 +282,7 @@ public static class CaChainAndConstraintValidator
         }
 
         // 3. Try raw Base64 (without PEM headers) of either DER certificate or DER PKCS#7
-        string cleanedBase64 = Regex.Replace(text.Trim(), @"\s+", "");
+        string cleanedBase64 = StripWhitespace(text);
         if (cleanedBase64.Length > 0)
         {
             byte[] rawDer;
@@ -228,6 +295,11 @@ public static class CaChainAndConstraintValidator
                 throw new ArgumentException($"Could not parse {inputLabel} as PEM or Base64-encoded DER/PKCS#7.");
             }
 
+            if (rawDer.Length == 0 || rawDer.Length > MaxBundleRawBytes)
+            {
+                throw new ArgumentException($"Decoded payload in {inputLabel} exceeds the maximum permitted size of {MaxBundleRawBytes} bytes.");
+            }
+
             if (TryExtractCertificatesFromCmsDer(rawDer, results))
             {
                 return;
@@ -235,8 +307,16 @@ public static class CaChainAndConstraintValidator
 
             try
             {
-                results.Add(X509CertificateLoader.LoadCertificate(rawDer));
+                if (results.Count >= MaxCertificatesPerBundle)
+                {
+                    throw new ArgumentException($"{inputLabel} exceeds the maximum permitted certificate count ({MaxCertificatesPerBundle}).");
+                }
+                results.Add(LoadValidatedSingleCertificate(rawDer));
                 return;
+            }
+            catch (ArgumentException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -247,38 +327,88 @@ public static class CaChainAndConstraintValidator
 
     public static bool TryExtractCertificatesFromCmsDer(byte[] derBytes, List<X509Certificate2> target)
     {
+        if (derBytes is not { Length: > 0 }
+            || derBytes.Length > MaxBundleRawBytes
+            || target == null
+            || target.Count >= MaxCertificatesPerBundle)
+        {
+            return false;
+        }
+
+        int visitedNodes = 0;
+        if (!TryValidateDerAsn1Bounds(derBytes, MaxBundleRawBytes, MaxAsn1TraversalDepth, ref visitedNodes))
+        {
+            return false;
+        }
+
+        int maxRemainingCerts = MaxCertificatesPerBundle - target.Count;
+
         // First try BouncyCastle CmsSignedData (handles standard PKCS#7, degenerate certs-only P7B, and CMC SignedData)
+        CmsSignedData? cms = null;
         try
         {
-            CmsSignedData cms = new(derBytes);
-            var certStore = cms.GetCertificates();
-            var matches = certStore.EnumerateMatches(null);
-            int countBefore = target.Count;
-            foreach (BcX509Certificate bcCert in matches)
-            {
-                target.Add(X509CertificateLoader.LoadCertificate(bcCert.GetEncoded()));
-            }
-
-            // Also check if the encapsulated content itself is a nested CMC / PKCS#7 or X.509 cert
-            if (cms.SignedContent != null)
-            {
-                using MemoryStream contentStream = new();
-                cms.SignedContent.Write(contentStream);
-                byte[] innerBytes = contentStream.ToArray();
-                if (innerBytes.Length > 0)
-                {
-                    InspectCmcOrInnerAsn1ForCertificates(innerBytes, target);
-                }
-            }
-
-            if (target.Count > countBefore)
-            {
-                return true;
-            }
+            cms = new CmsSignedData(derBytes);
         }
         catch
         {
-            // Fallback to BouncyCastle X509CertificateParser.ReadCertificates (which also parses PKCS#7 cert streams)
+            // Not a CMS SignedData structure; fall back to X509CertificateParser / bounded CMC traversal below.
+        }
+
+        if (cms != null)
+        {
+            List<X509Certificate2> staged = [];
+            try
+            {
+                var certStore = cms.GetCertificates();
+                var matches = certStore.EnumerateMatches(null);
+                foreach (BcX509Certificate bcCert in matches)
+                {
+                    if (staged.Count >= maxRemainingCerts)
+                    {
+                        DisposeAll(staged);
+                        return false;
+                    }
+                    staged.Add(LoadValidatedSingleCertificate(bcCert.GetEncoded()));
+                }
+
+                // Also check if the encapsulated content itself is a nested CMC / PKCS#7 or X.509 cert
+                if (cms.SignedContent != null)
+                {
+                    using MemoryStream contentStream = new();
+                    cms.SignedContent.Write(contentStream);
+                    if (contentStream.Length > MaxBundleRawBytes)
+                    {
+                        DisposeAll(staged);
+                        return false;
+                    }
+
+                    byte[] innerBytes = contentStream.ToArray();
+                    if (innerBytes.Length > 0
+                        && !TryInspectCmcOrInnerAsn1ForCertificates(
+                            innerBytes,
+                            staged,
+                            currentDepth: 1,
+                            ref visitedNodes,
+                            maxRemainingCerts))
+                    {
+                        DisposeAll(staged);
+                        return false;
+                    }
+                }
+
+                if (staged.Count == 0)
+                {
+                    return false;
+                }
+
+                target.AddRange(staged);
+                return true;
+            }
+            catch
+            {
+                DisposeAll(staged);
+                return false;
+            }
         }
 
         try
@@ -286,73 +416,379 @@ public static class CaChainAndConstraintValidator
             var bcCerts = new X509CertificateParser().ReadCertificates(derBytes);
             if (bcCerts is { Count: > 0 })
             {
-                foreach (BcX509Certificate bcCert in bcCerts)
+                if (bcCerts.Count > maxRemainingCerts)
                 {
-                    target.Add(X509CertificateLoader.LoadCertificate(bcCert.GetEncoded()));
+                    return false;
                 }
-                return true;
+
+                List<X509Certificate2> staged = [];
+                try
+                {
+                    foreach (BcX509Certificate bcCert in bcCerts)
+                    {
+                        staged.Add(LoadValidatedSingleCertificate(bcCert.GetEncoded()));
+                    }
+                    target.AddRange(staged);
+                    return true;
+                }
+                catch
+                {
+                    DisposeAll(staged);
+                    return false;
+                }
             }
         }
         catch
         {
-            // Not a valid CMS/PKCS#7 structure
+            // Not a standard certificate stream; try bounded CMC/ASN.1 extraction below
         }
 
+        List<X509Certificate2> cmcStaged = [];
+        if (TryInspectCmcOrInnerAsn1ForCertificates(
+                derBytes,
+                cmcStaged,
+                currentDepth: 0,
+                ref visitedNodes,
+                maxRemainingCerts)
+            && cmcStaged.Count > 0)
+        {
+            target.AddRange(cmcStaged);
+            return true;
+        }
+
+        DisposeAll(cmcStaged);
         return false;
     }
 
-    private static void InspectCmcOrInnerAsn1ForCertificates(byte[] bytes, List<X509Certificate2> target)
+    private static bool TryInspectCmcOrInnerAsn1ForCertificates(
+        byte[] bytes,
+        List<X509Certificate2> target,
+        int currentDepth,
+        ref int visitedNodes,
+        int maxAllowedCertificates)
     {
+        if (bytes.Length == 0)
+        {
+            return true;
+        }
+
+        if (bytes.Length > MaxBundleRawBytes || currentDepth > MaxAsn1TraversalDepth)
+        {
+            return false;
+        }
+
+        Asn1Object obj;
         try
         {
-            Asn1Object obj = Asn1Object.FromByteArray(bytes);
-            ExtractCertificatesFromAsn1Recursive(obj, target);
+            obj = Asn1Object.FromByteArray(bytes);
         }
         catch
         {
-            // Ignore non-ASN.1 inner payload
+            return false;
         }
+
+        return TryExtractCertificatesFromAsn1Bounded(
+            obj,
+            target,
+            currentDepth,
+            ref visitedNodes,
+            maxAllowedCertificates);
     }
 
-    private static void ExtractCertificatesFromAsn1Recursive(Asn1Object obj, List<X509Certificate2> target)
+    private static bool TryExtractCertificatesFromAsn1Bounded(
+        Asn1Object obj,
+        List<X509Certificate2> target,
+        int currentDepth,
+        ref int visitedNodes,
+        int maxAllowedCertificates)
     {
+        visitedNodes++;
+        if (currentDepth > MaxAsn1TraversalDepth || visitedNodes > MaxAsn1TraversalNodes)
+        {
+            return false;
+        }
+
         if (obj is Asn1Sequence seq)
         {
-            try
+            if (seq.Count > MaxAsn1TraversalNodes)
             {
-                if (seq.Count == 3
-                    && seq[0] is Asn1Sequence
-                    && seq[1] is Asn1Sequence
-                    && seq[2] is DerBitString)
+                return false;
+            }
+
+            if (seq.Count == 3
+                && seq[0] is Asn1Sequence tbsSeq && tbsSeq.Count >= 6
+                && seq[1] is Asn1Sequence algSeq && algSeq.Count is >= 1 and <= 2
+                && seq[2] is DerBitString)
+            {
+                try
                 {
                     X509CertificateStructure certStruct = X509CertificateStructure.GetInstance(seq);
                     if (certStruct.Version >= 1 && certStruct.Subject != null && certStruct.Issuer != null)
                     {
-                        target.Add(X509CertificateLoader.LoadCertificate(certStruct.GetDerEncoded()));
-                        return;
+                        if (target.Count >= maxAllowedCertificates)
+                        {
+                            return false;
+                        }
+                        byte[] certDer = certStruct.GetDerEncoded();
+                        target.Add(LoadValidatedSingleCertificate(certDer));
+                        return true;
                     }
                 }
+                catch
+                {
+                    // Continue bounded traversal of children
+                }
             }
-            catch
+
+            // Unwrap nested CMS/CMC EncapsulatedContentInfo / ContentInfo: SEQUENCE { OID, [0] EXPLICIT OCTET STRING }
+            if (seq.Count == 2
+                && seq[0] is DerObjectIdentifier
+                && seq[1] is Asn1TaggedObject { TagNo: 0 } contentTag)
             {
-                // Continue traversing children
+                Asn1Object baseObj;
+                try
+                {
+                    baseObj = contentTag.GetBaseObject().ToAsn1Object();
+                }
+                catch
+                {
+                    return false;
+                }
+
+                if (baseObj is Asn1OctetString encapsulatedOctets)
+                {
+                    visitedNodes += 2;
+                    if (visitedNodes > MaxAsn1TraversalNodes || currentDepth + 2 > MaxAsn1TraversalDepth)
+                    {
+                        return false;
+                    }
+
+                    byte[] innerOctets = encapsulatedOctets.GetOctets();
+                    if (innerOctets.Length > 0)
+                    {
+                        return TryInspectCmcOrInnerAsn1ForCertificates(
+                            innerOctets,
+                            target,
+                            currentDepth + 2,
+                            ref visitedNodes,
+                            maxAllowedCertificates);
+                    }
+                    return true;
+                }
             }
 
             foreach (Asn1Encodable item in seq)
             {
-                ExtractCertificatesFromAsn1Recursive(item.ToAsn1Object(), target);
+                if (!TryExtractCertificatesFromAsn1Bounded(
+                        item.ToAsn1Object(),
+                        target,
+                        currentDepth + 1,
+                        ref visitedNodes,
+                        maxAllowedCertificates))
+                {
+                    return false;
+                }
             }
+            return true;
         }
-        else if (obj is Asn1Set set)
+
+        if (obj is Asn1Set set)
         {
+            if (set.Count > MaxAsn1TraversalNodes)
+            {
+                return false;
+            }
+
             foreach (Asn1Encodable item in set)
             {
-                ExtractCertificatesFromAsn1Recursive(item.ToAsn1Object(), target);
+                if (!TryExtractCertificatesFromAsn1Bounded(
+                        item.ToAsn1Object(),
+                        target,
+                        currentDepth + 1,
+                        ref visitedNodes,
+                        maxAllowedCertificates))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if (obj is Asn1TaggedObject tagged)
+        {
+            Asn1Object baseObj;
+            try
+            {
+                baseObj = tagged.GetBaseObject().ToAsn1Object();
+            }
+            catch
+            {
+                return false;
+            }
+
+            return TryExtractCertificatesFromAsn1Bounded(
+                baseObj,
+                target,
+                currentDepth + 1,
+                ref visitedNodes,
+                maxAllowedCertificates);
+        }
+
+        if (currentDepth <= 1 && obj is Asn1OctetString topLevelOctets)
+        {
+            byte[] innerOctets = topLevelOctets.GetOctets();
+            if (innerOctets.Length > 0)
+            {
+                return TryInspectCmcOrInnerAsn1ForCertificates(
+                    innerOctets,
+                    target,
+                    currentDepth + 1,
+                    ref visitedNodes,
+                    maxAllowedCertificates);
             }
         }
-        else if (obj is Asn1TaggedObject tagged)
+
+        return true;
+    }
+
+    private static bool TryValidateDerAsn1Bounds(
+        byte[] derBytes,
+        int maxBytes,
+        int maxDepth,
+        ref int visitedNodes)
+    {
+        if (derBytes is not { Length: > 0 } || derBytes.Length > maxBytes)
         {
-            ExtractCertificatesFromAsn1Recursive(tagged.GetExplicitBaseObject().ToAsn1Object(), target);
+            return false;
+        }
+
+        try
+        {
+            using Asn1InputStream asn1In = new(derBytes);
+            int topLevelObjects = 0;
+            Asn1Object? obj;
+            while ((obj = asn1In.ReadObject()) != null)
+            {
+                topLevelObjects++;
+                if (topLevelObjects > MaxCertificatesPerBundle)
+                {
+                    return false;
+                }
+
+                if (!ValidateAsn1TreeBounds(obj, currentDepth: 0, maxDepth, ref visitedNodes))
+                {
+                    return false;
+                }
+            }
+
+            return topLevelObjects > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool ValidateAsn1TreeBounds(
+        Asn1Object obj,
+        int currentDepth,
+        int maxDepth,
+        ref int visitedNodes)
+    {
+        visitedNodes++;
+        if (currentDepth > maxDepth || visitedNodes > MaxAsn1TraversalNodes)
+        {
+            return false;
+        }
+
+        if (obj is Asn1Sequence seq)
+        {
+            if (seq.Count > MaxAsn1TraversalNodes)
+            {
+                return false;
+            }
+
+            foreach (Asn1Encodable item in seq)
+            {
+                if (!ValidateAsn1TreeBounds(item.ToAsn1Object(), currentDepth + 1, maxDepth, ref visitedNodes))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if (obj is Asn1Set set)
+        {
+            if (set.Count > MaxAsn1TraversalNodes)
+            {
+                return false;
+            }
+
+            foreach (Asn1Encodable item in set)
+            {
+                if (!ValidateAsn1TreeBounds(item.ToAsn1Object(), currentDepth + 1, maxDepth, ref visitedNodes))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if (obj is Asn1TaggedObject tagged)
+        {
+            Asn1Object baseObj;
+            try
+            {
+                baseObj = tagged.GetBaseObject().ToAsn1Object();
+            }
+            catch
+            {
+                return false;
+            }
+
+            return ValidateAsn1TreeBounds(baseObj, currentDepth + 1, maxDepth, ref visitedNodes);
+        }
+
+        return true;
+    }
+
+    private static X509Certificate2 LoadValidatedSingleCertificate(byte[] der)
+    {
+        if (der is not { Length: > 0 } || der.Length > MaxSingleCertificateDerBytes)
+        {
+            throw new CryptographicException($"Certificate DER length ({der?.Length ?? 0} bytes) is outside permitted bounds (1..{MaxSingleCertificateDerBytes} bytes).");
+        }
+
+        int visitedNodes = 0;
+        if (!TryValidateDerAsn1Bounds(der, MaxSingleCertificateDerBytes, MaxAsn1TraversalDepth, ref visitedNodes))
+        {
+            throw new CryptographicException("Certificate DER failed ASN.1 structure or nesting depth validation.");
+        }
+
+        Asn1Object asn1 = Asn1Object.FromByteArray(der);
+        _ = X509CertificateStructure.GetInstance(asn1);
+        return X509CertificateLoader.LoadCertificate(der);
+    }
+
+    private static string StripWhitespace(string value)
+    {
+        StringBuilder sb = new(value.Length);
+        foreach (char ch in value)
+        {
+            if (!char.IsWhiteSpace(ch))
+            {
+                sb.Append(ch);
+            }
+        }
+        return sb.ToString();
+    }
+
+    private static void DisposeAll(IEnumerable<X509Certificate2> certificates)
+    {
+        foreach (X509Certificate2 cert in certificates)
+        {
+            cert.Dispose();
         }
     }
 
@@ -428,8 +864,25 @@ public static class CaChainAndConstraintValidator
         byte[] expectedSpkiDer;
         try
         {
-            decodedCsr = (new PemReader(new StringReader(csrPem)).ReadObject() as Pkcs10CertificationRequest)
-                ?? throw new ArgumentException("Pending CSR could not be decoded.");
+            if (string.IsNullOrWhiteSpace(csrPem) || csrPem.Length > IssuancePolicyService.MaxCsrPemLength)
+            {
+                return new(false, $"Pending CSR exceeds the maximum permitted length ({IssuancePolicyService.MaxCsrPemLength} characters).", null, null, null);
+            }
+
+            using StringReader sr = new(csrPem);
+            PemReader pemReader = new(sr);
+            PemObject? pemObj = pemReader.ReadPemObject();
+            if (pemObj == null
+                || (!string.Equals(pemObj.Type, "CERTIFICATE REQUEST", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(pemObj.Type, "NEW CERTIFICATE REQUEST", StringComparison.OrdinalIgnoreCase))
+                || pemObj.Content is not { Length: > 0 }
+                || pemObj.Content.Length > IssuancePolicyService.MaxCsrDerBytes
+                || pemReader.ReadPemObject() != null)
+            {
+                throw new ArgumentException("Pending CSR could not be decoded.");
+            }
+
+            decodedCsr = new Pkcs10CertificationRequest(pemObj.Content);
             if (!decodedCsr.Verify())
             {
                 return new(false, "Pending CSR self-signature verification failed.", null, null, null);
@@ -945,9 +1398,21 @@ public static class CaChainAndConstraintValidator
                 }
 
                 List<string> caPermittedDns = [];
-                if (nc.PermittedSubtrees != null)
+                GeneralSubtrees? permittedSubtrees = nc.PermittedSubtreesValue;
+                if (permittedSubtrees != null)
                 {
-                    foreach (Asn1Encodable item in nc.PermittedSubtrees)
+                    Asn1Sequence permittedSeq = Asn1Sequence.GetInstance(permittedSubtrees.ToAsn1Object());
+                    if (permittedSeq.Count > MaxNameConstraintSubtreesPerCa)
+                    {
+                        return (
+                            false,
+                            $"Certificate '{cert.Subject}' contains {permittedSeq.Count} PermittedSubtrees in NameConstraints, exceeding the maximum supported count ({MaxNameConstraintSubtreesPerCa}).",
+                            null,
+                            [],
+                            []);
+                    }
+
+                    foreach (Asn1Encodable item in permittedSeq)
                     {
                         GeneralSubtree subtree = GeneralSubtree.GetInstance(item);
                         var (subtreeOk, subtreeErr, dnsPattern) = ValidateAndExtractDnsSubtree(cert.Subject, "permitted", subtree);
@@ -975,9 +1440,21 @@ public static class CaChainAndConstraintValidator
                     perCaPermittedDns.Add(caPermittedDns);
                 }
 
-                if (nc.ExcludedSubtrees != null)
+                GeneralSubtrees? excludedSubtrees = nc.ExcludedSubtreesValue;
+                if (excludedSubtrees != null)
                 {
-                    foreach (Asn1Encodable item in nc.ExcludedSubtrees)
+                    Asn1Sequence excludedSeq = Asn1Sequence.GetInstance(excludedSubtrees.ToAsn1Object());
+                    if (excludedSeq.Count > MaxNameConstraintSubtreesPerCa)
+                    {
+                        return (
+                            false,
+                            $"Certificate '{cert.Subject}' contains {excludedSeq.Count} ExcludedSubtrees in NameConstraints, exceeding the maximum supported count ({MaxNameConstraintSubtreesPerCa}).",
+                            null,
+                            [],
+                            []);
+                    }
+
+                    foreach (Asn1Encodable item in excludedSeq)
                     {
                         GeneralSubtree subtree = GeneralSubtree.GetInstance(item);
                         var (subtreeOk, subtreeErr, dnsPattern) = ValidateAndExtractDnsSubtree(cert.Subject, "excluded", subtree);
@@ -1192,19 +1669,19 @@ public static class CaChainAndConstraintValidator
         string subtreeKind,
         GeneralSubtree subtree)
     {
-        if (subtree.Minimum != null && subtree.Minimum.IntValueExact != 0)
+        if (subtree.MinimumObject != null && subtree.MinimumObject.IntValueExact != 0)
         {
             return (
                 false,
-                $"Certificate '{certSubject}' contains a NameConstraints {subtreeKind} subtree with non-zero minimum ({subtree.Minimum}), which is invalid under RFC 5280.",
+                $"Certificate '{certSubject}' contains a NameConstraints {subtreeKind} subtree with non-zero minimum ({subtree.MinimumObject}), which is invalid under RFC 5280.",
                 null);
         }
 
-        if (subtree.Maximum != null)
+        if (subtree.MaximumObject != null)
         {
             return (
                 false,
-                $"Certificate '{certSubject}' contains a NameConstraints {subtreeKind} subtree with a maximum distance ({subtree.Maximum}), which is invalid under RFC 5280.",
+                $"Certificate '{certSubject}' contains a NameConstraints {subtreeKind} subtree with a maximum distance ({subtree.MaximumObject}), which is invalid under RFC 5280.",
                 null);
         }
 
@@ -1362,34 +1839,41 @@ public static class CaChainAndConstraintValidator
 
         if (info.Attributes != null)
         {
-            foreach (Asn1Encodable attr in info.Attributes)
+            try
             {
-                AttributePkcs pkcsAttr = AttributePkcs.GetInstance(attr);
-                if (PkcsObjectIdentifiers.Pkcs9AtExtensionRequest.Equals(pkcsAttr.AttrType))
+                foreach (Asn1Encodable attr in info.Attributes)
                 {
-                    foreach (Asn1Encodable extSet in pkcsAttr.AttrValues)
+                    AttributePkcs pkcsAttr = AttributePkcs.GetInstance(attr);
+                    if (PkcsObjectIdentifiers.Pkcs9AtExtensionRequest.Equals(pkcsAttr.AttrType))
                     {
-                        X509Extensions exts = X509Extensions.GetInstance(extSet);
-                        Org.BouncyCastle.Asn1.X509.X509Extension bcExt = exts.GetExtension(X509Extensions.BasicConstraints);
-                        if (bcExt != null)
+                        foreach (Asn1Encodable extSet in pkcsAttr.AttrValues)
                         {
-                            requestedBcPresent = true;
-                            BasicConstraints reqBc = BasicConstraints.GetInstance(Asn1OctetString.GetInstance(bcExt.Value).GetOctets());
-                            requestedPathLen = reqBc.PathLenConstraint != null ? reqBc.PathLenConstraint.IntValueExact : null;
-                        }
+                            X509Extensions exts = X509Extensions.GetInstance(extSet);
+                            Org.BouncyCastle.Asn1.X509.X509Extension bcExt = exts.GetExtension(X509Extensions.BasicConstraints);
+                            if (bcExt != null)
+                            {
+                                requestedBcPresent = true;
+                                BasicConstraints reqBc = BasicConstraints.GetInstance(Asn1OctetString.GetInstance(bcExt.Value).GetOctets());
+                                requestedPathLen = reqBc.PathLenConstraint != null ? reqBc.PathLenConstraint.IntValueExact : null;
+                            }
 
-                        Org.BouncyCastle.Asn1.X509.X509Extension kuExt = exts.GetExtension(X509Extensions.KeyUsage);
-                        if (kuExt != null)
-                        {
-                            var rawKuExt = new System.Security.Cryptography.X509Certificates.X509Extension(
-                                X509Extensions.KeyUsage.Id,
-                                Asn1OctetString.GetInstance(kuExt.Value).GetOctets(),
-                                kuExt.IsCritical);
-                            X509KeyUsageExtension parsedReqKu = new(rawKuExt, kuExt.IsCritical);
-                            requestedKu = parsedReqKu.KeyUsages;
+                            Org.BouncyCastle.Asn1.X509.X509Extension kuExt = exts.GetExtension(X509Extensions.KeyUsage);
+                            if (kuExt != null)
+                            {
+                                var rawKuExt = new System.Security.Cryptography.X509Certificates.X509Extension(
+                                    X509Extensions.KeyUsage.Id,
+                                    Asn1OctetString.GetInstance(kuExt.Value).GetOctets(),
+                                    kuExt.IsCritical);
+                                X509KeyUsageExtension parsedReqKu = new(rawKuExt, kuExt.IsCritical);
+                                requestedKu = parsedReqKu.KeyUsages;
+                            }
                         }
                     }
                 }
+            }
+            catch
+            {
+                // Ignore malformed optional CSR attributes when computing summary differences
             }
         }
 
