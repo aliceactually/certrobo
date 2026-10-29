@@ -2103,7 +2103,7 @@
         manualSignedCertFileBytes = null;
         try
         {
-            await using Stream s = e.File.OpenReadStream(maxAllowedSize: 5 * 1024 * 1024);
+            await using Stream s = e.File.OpenReadStream(maxAllowedSize: CaChainAndConstraintValidator.MaxBundleRawBytes);
             using MemoryStream ms = new();
             await s.CopyToAsync(ms);
             manualSignedCertFileBytes = ms.ToArray();
@@ -2120,7 +2120,7 @@
         manualChainCertFileBytes = null;
         try
         {
-            await using Stream s = e.File.OpenReadStream(maxAllowedSize: 5 * 1024 * 1024);
+            await using Stream s = e.File.OpenReadStream(maxAllowedSize: CaChainAndConstraintValidator.MaxBundleRawBytes);
             using MemoryStream ms = new();
             await s.CopyToAsync(ms);
             manualChainCertFileBytes = ms.ToArray();

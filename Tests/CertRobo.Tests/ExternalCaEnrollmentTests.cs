@@ -435,14 +435,8 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
         Assert.NotNull(admin);
 
         NameConstraints nameConstraints = new(
-            permitted: (IList<GeneralSubtree>)new GeneralSubtree[]
-            {
-                new GeneralSubtree(new GeneralName(GeneralName.DnsName, ".contoso.com"))
-            },
-            excluded: (IList<GeneralSubtree>)new GeneralSubtree[]
-            {
-                new GeneralSubtree(new GeneralName(GeneralName.DnsName, ".blocked.contoso.com"))
-            });
+            new GeneralSubtrees(new GeneralSubtree(new GeneralName(GeneralName.DnsName, ".contoso.com"))),
+            new GeneralSubtrees(new GeneralSubtree(new GeneralName(GeneralName.DnsName, ".blocked.contoso.com"))));
         OidCollection serverOnlyEku = [];
         serverOnlyEku.Add(new Oid(CertificateProfiles.ServerAuthOid));
 

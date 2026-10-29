@@ -1,8 +1,10 @@
+using CertRobo.Services;
 using Org.BouncyCastle.Asn1;
 using Org.BouncyCastle.Asn1.Pkcs;
 using Org.BouncyCastle.Asn1.X509;
 using Org.BouncyCastle.OpenSsl;
 using Org.BouncyCastle.Pkcs;
+using PemObject = Org.BouncyCastle.Utilities.IO.Pem.PemObject;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -126,46 +128,92 @@ public static class DomainPolicyEvaluator
 
     public static List<string> GetDomainsFromCsr(string csrPem)
     {
-        List<string> domains = new();
-        Pkcs10CertificationRequest? decoded = new PemReader(new StringReader(csrPem)).ReadObject() as Pkcs10CertificationRequest
-            ?? throw new ArgumentException("Could not decode CSR PEM.");
-
-        CertificationRequestInfo info = decoded.GetCertificationRequestInfo();
-
-        var oids = info.Subject.GetOidList();
-        var values = info.Subject.GetValueList();
-        for (int i = 0; i < oids.Count; i++)
+        if (string.IsNullOrWhiteSpace(csrPem) || csrPem.Length > IssuancePolicyService.MaxCsrPemLength)
         {
-            if (X509Name.CN.Equals(oids[i]))
-            {
-                string cn = (string)values[i]!;
-                if (!string.IsNullOrWhiteSpace(cn))
-                {
-                    domains.Add(cn);
-                }
-            }
+            throw new ArgumentException("Could not decode CSR PEM.");
         }
 
-        Asn1Set attributes = info.Attributes;
-        if (attributes != null)
+        List<string> domains = [];
+        try
         {
-            foreach (Asn1Encodable attr in attributes)
+            using StringReader sr = new(csrPem);
+            PemReader pemReader = new(sr);
+            PemObject? pemObj = pemReader.ReadPemObject();
+            if (pemObj == null
+                || (!string.Equals(pemObj.Type, "CERTIFICATE REQUEST", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(pemObj.Type, "NEW CERTIFICATE REQUEST", StringComparison.OrdinalIgnoreCase))
+                || pemObj.Content is not { Length: > 0 }
+                || pemObj.Content.Length > IssuancePolicyService.MaxCsrDerBytes
+                || pemReader.ReadPemObject() != null)
             {
-                AttributePkcs pkcsAttr = AttributePkcs.GetInstance(attr);
-                if (PkcsObjectIdentifiers.Pkcs9AtExtensionRequest.Equals(pkcsAttr.AttrType))
+                throw new ArgumentException("Could not decode CSR PEM.");
+            }
+
+            Pkcs10CertificationRequest decoded = new(pemObj.Content);
+            CertificationRequestInfo info = decoded.GetCertificationRequestInfo();
+
+            var oids = info.Subject.GetOidList();
+            var values = info.Subject.GetValueList();
+            if (oids.Count > IssuancePolicyService.MaxCsrSubjectRdns || values.Count != oids.Count)
+            {
+                throw new ArgumentException("Could not decode CSR PEM.");
+            }
+
+            for (int i = 0; i < oids.Count; i++)
+            {
+                if (X509Name.CN.Equals(oids[i]))
                 {
-                    foreach (Asn1Encodable extSet in pkcsAttr.AttrValues)
+                    string cn = (string)values[i]!;
+                    if (!string.IsNullOrWhiteSpace(cn))
                     {
-                        X509Extensions extensions = X509Extensions.GetInstance(extSet);
-                        X509Extension sanExt = extensions.GetExtension(X509Extensions.SubjectAlternativeName);
-                        if (sanExt != null)
+                        domains.Add(cn);
+                    }
+                }
+            }
+
+            Asn1Set? attributes = info.Attributes;
+            if (attributes != null)
+            {
+                if (attributes.Count > IssuancePolicyService.MaxCsrAttributes)
+                {
+                    throw new ArgumentException("Could not decode CSR PEM.");
+                }
+
+                foreach (Asn1Encodable attr in attributes)
+                {
+                    AttributePkcs pkcsAttr = AttributePkcs.GetInstance(attr);
+                    if (PkcsObjectIdentifiers.Pkcs9AtExtensionRequest.Equals(pkcsAttr.AttrType))
+                    {
+                        if (pkcsAttr.AttrValues.Count > IssuancePolicyService.MaxCsrExtensions)
                         {
-                            GeneralNames sans = GeneralNames.GetInstance(Asn1OctetString.GetInstance(sanExt.Value).GetOctets());
-                            foreach (GeneralName gn in sans.GetNames())
+                            throw new ArgumentException("Could not decode CSR PEM.");
+                        }
+
+                        foreach (Asn1Encodable extSet in pkcsAttr.AttrValues)
+                        {
+                            X509Extensions extensions = X509Extensions.GetInstance(extSet);
+                            X509Extension sanExt = extensions.GetExtension(X509Extensions.SubjectAlternativeName);
+                            if (sanExt != null)
                             {
-                                if (gn.TagNo == GeneralName.DnsName)
+                                byte[] sanOctets = Asn1OctetString.GetInstance(sanExt.Value).GetOctets();
+                                if (sanOctets.Length == 0 || sanOctets.Length > IssuancePolicyService.MaxCsrDerBytes)
                                 {
-                                    domains.Add(gn.Name.ToString()!);
+                                    throw new ArgumentException("Could not decode CSR PEM.");
+                                }
+
+                                GeneralNames sans = GeneralNames.GetInstance(Asn1Object.FromByteArray(sanOctets));
+                                GeneralName[] sanEntries = sans.GetNames();
+                                if (sanEntries.Length > IssuancePolicyService.MaxCsrDnsSanEntries)
+                                {
+                                    throw new ArgumentException("Could not decode CSR PEM.");
+                                }
+
+                                foreach (GeneralName gn in sanEntries)
+                                {
+                                    if (gn.TagNo == GeneralName.DnsName)
+                                    {
+                                        domains.Add(DerIA5String.GetInstance(gn.Name).GetString());
+                                    }
                                 }
                             }
                         }
@@ -173,6 +221,15 @@ public static class DomainPolicyEvaluator
                 }
             }
         }
+        catch (ArgumentException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new ArgumentException("Could not decode CSR PEM.", ex);
+        }
+
         return domains.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     }
 }

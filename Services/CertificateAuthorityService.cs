@@ -1011,11 +1011,36 @@ public sealed class CertificateAuthorityService
             throw new ArgumentException("A non-empty storage passphrase is required to protect the imported CA key.", nameof(storagePassphrase));
         }
 
+        if (string.IsNullOrWhiteSpace(issuerCertPem) || issuerCertPem.Length > CaChainAndConstraintValidator.MaxBundleTextLength)
+        {
+            throw new ArgumentException("Imported CA certificate PEM is missing or exceeds maximum permitted size.", nameof(issuerCertPem));
+        }
+
+        if (chainCertsPem is { Length: > CaChainAndConstraintValidator.MaxBundleTextLength })
+        {
+            throw new ArgumentException("Imported CA chain PEM exceeds maximum permitted size.", nameof(chainCertsPem));
+        }
+
+        if (string.IsNullOrWhiteSpace(privateKeyPem) || privateKeyPem.Length > PkcsBuilder.MaxKeyPemLength)
+        {
+            throw new ArgumentException("Imported CA private key PEM is missing or exceeds maximum permitted size.", nameof(privateKeyPem));
+        }
+
         await SigningAndSerialLock.WaitAsync(cancellationToken);
         try
         {
             await ThrowIfUnfinishedPendingEnrollmentExistsAsync(cancellationToken);
-            using X509Certificate2 cert = X509Certificate2.CreateFromPem(issuerCertPem);
+            List<X509Certificate2> parsedIssuerCerts = CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
+                null,
+                issuerCertPem,
+                "imported CA certificate");
+            if (parsedIssuerCerts.Count != 1)
+            {
+                foreach (X509Certificate2 c in parsedIssuerCerts) c.Dispose();
+                throw new ArgumentException("Imported CA certificate PEM must contain exactly one X.509 certificate.", nameof(issuerCertPem));
+            }
+
+            using X509Certificate2 cert = parsedIssuerCerts[0];
             using AsymmetricAlgorithm key = ImportPrivateKeyFromPem(cert, privateKeyPem, inputKeyPassphrase);
 
             ValidateCaCertificateAndKeyMatch(cert, key, chainCertsPem, out bool isIntermediate, out string normalizedChainPem);
@@ -1060,6 +1085,20 @@ public sealed class CertificateAuthorityService
         if (string.IsNullOrWhiteSpace(storagePassphrase))
         {
             throw new ArgumentException("A non-empty storage passphrase is required.", nameof(storagePassphrase));
+        }
+
+        if (pkcs12Bytes is not { Length: > 0 } || pkcs12Bytes.Length > CaChainAndConstraintValidator.MaxBundleRawBytes)
+        {
+            throw new ArgumentException($"PKCS#12 archive is empty or exceeds the maximum permitted size of {CaChainAndConstraintValidator.MaxBundleRawBytes} bytes.", nameof(pkcs12Bytes));
+        }
+
+        try
+        {
+            _ = Asn1Object.FromByteArray(pkcs12Bytes);
+        }
+        catch (Exception ex)
+        {
+            throw new ArgumentException("PKCS#12 archive could not be decoded.", nameof(pkcs12Bytes), ex);
         }
 
         await SigningAndSerialLock.WaitAsync(cancellationToken);
@@ -2437,6 +2476,20 @@ public sealed class CertificateAuthorityService
         string privateKeyPem,
         string? passphrase)
     {
+        byte[] keyDer = PkcsBuilder.ExtractPemOrBase64BytesBounded(
+            privateKeyPem,
+            PkcsBuilder.MaxKeyPemLength,
+            PkcsBuilder.MaxKeyDerBytes,
+            "Imported CA private key");
+        try
+        {
+            _ = Asn1Object.FromByteArray(keyDer);
+        }
+        catch (Exception ex)
+        {
+            throw new ArgumentException("Imported CA private key could not be decoded.", nameof(privateKeyPem), ex);
+        }
+
         string oid = cert.PublicKey.Oid.Value ?? string.Empty;
         if (oid == "1.2.840.113549.1.1.1") // RSA
         {

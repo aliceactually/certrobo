@@ -143,8 +143,17 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
         Assert.Equal(3, transport.Requests.Count);
     }
 
-    [Fact]
-    public async Task IssuedCesResponse_UsesSharedValidator_AndBecomesReadyForActivation()
+    [Theory]
+    [InlineData("utf-8", false, true)]
+    [InlineData("utf-16", false, true)]
+    [InlineData("utf-16BE", false, true)]
+    [InlineData("utf-8", true, true)]
+    [InlineData("utf-16", true, true)]
+    [InlineData("utf-16BE", true, true)]
+    [InlineData("utf-8", true, false)]
+    [InlineData("utf-16", true, false)]
+    public async Task IssuedCesResponse_UsesSharedValidator_AndBecomesReadyForActivation(
+        string charset, bool includeBom, bool includeCharset)
     {
         PendingCaEnrollmentRecord pending = await CreatePendingAsync();
         using RSA rootKey = RSA.Create(2048);
@@ -154,7 +163,22 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
         string bundlePem = issuingCert.ExportCertificatePem() + "\n" + rootCert.ExportCertificatePem();
         string p7bBase64 = Convert.ToBase64String(PkcsBuilder.BuildPkcs7DerFromPemBundle(bundlePem));
 
-        ScriptedTransport transport = new(_ => SoapResponse(IssuedRstr("77", p7bBase64)));
+        System.Text.Encoding encoding = System.Text.Encoding.GetEncoding(charset);
+        byte[] payload = encoding.GetBytes(IssuedRstr("77", p7bBase64));
+        if (includeBom)
+        {
+            payload = [.. encoding.GetPreamble(), .. payload];
+        }
+        ScriptedTransport transport = new(_ =>
+        {
+            ByteArrayContent content = new(payload);
+            content.Headers.ContentType = new("application/soap+xml");
+            if (includeCharset)
+            {
+                content.Headers.ContentType.CharSet = charset;
+            }
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
+        });
         AdCsCesEnrollmentService ces = CreateCesService(transport);
         await ConfigureUsernamePasswordAsync(ces, rootCert.ExportCertificatePem());
 

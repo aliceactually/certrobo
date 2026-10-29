@@ -1,4 +1,5 @@
-﻿using ICSharpCode.SharpZipLib.Zip;
+﻿using CertRobo.Services;
+using ICSharpCode.SharpZipLib.Zip;
 using Org.BouncyCastle.Asn1;
 using Org.BouncyCastle.Asn1.Pkcs;
 using Org.BouncyCastle.Asn1.X509;
@@ -12,12 +13,16 @@ using Org.BouncyCastle.OpenSsl;
 using Org.BouncyCastle.Pkcs;
 using Org.BouncyCastle.Security;
 using Org.BouncyCastle.X509;
+using PemObject = Org.BouncyCastle.Utilities.IO.Pem.PemObject;
 using System.Text;
 
 namespace CertRobo;
 
 public class PkcsBuilder
 {
+    public const int MaxKeyPemLength = 32 * 1024;
+    public const int MaxKeyDerBytes = 16 * 1024;
+
     private static readonly char[] newline = ['\n', '\r'];
 
     private string? _cert;
@@ -66,12 +71,8 @@ public class PkcsBuilder
             {
                 try
                 {
-                    string t = string.Empty;
-                    foreach (string s in value.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
-                    {
-                        t += s;
-                    }
-                    PrivateKeyFactory.CreateKey(Convert.FromBase64String(t));
+                    byte[] der = ExtractPemOrBase64BytesBounded(value, MaxKeyPemLength, MaxKeyDerBytes, "Private key");
+                    PrivateKeyFactory.CreateKey(der);
                 }
                 catch
                 {
@@ -102,12 +103,8 @@ public class PkcsBuilder
             return false;
         }
 
-        string k = string.Empty;
-        foreach (string s in privateKey.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
-        {
-            k += s;
-        }
-        AsymmetricKeyParameter privateParam = PrivateKeyFactory.CreateKey(Convert.FromBase64String(k));
+        byte[] keyDer = ExtractPemOrBase64BytesBounded(privateKey, MaxKeyPemLength, MaxKeyDerBytes, "Private key");
+        AsymmetricKeyParameter privateParam = PrivateKeyFactory.CreateKey(keyDer);
         X509Certificate cert = ParseFirstCertificate(certificate);
         AsymmetricKeyParameter publicParam = cert.GetPublicKey();
 
@@ -274,12 +271,8 @@ public class PkcsBuilder
 
             if (!string.IsNullOrWhiteSpace(privateKey))
             {
-                string k = "";
-                foreach (string s in privateKey.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
-                {
-                    k += s;
-                }
-                AsymmetricKeyParameter p = PrivateKeyFactory.CreateKey(Convert.FromBase64String(k));
+                byte[] keyDer = ExtractPemOrBase64BytesBounded(privateKey, MaxKeyPemLength, MaxKeyDerBytes, "Private key");
+                AsymmetricKeyParameter p = PrivateKeyFactory.CreateKey(keyDer);
                 if (p is RsaPrivateCrtKeyParameters or ECPrivateKeyParameters or Ed25519PrivateKeyParameters)
                 {
                     if (CertKeyCheck(certificate, privateKey))
@@ -383,18 +376,72 @@ public class PkcsBuilder
 
     private static IList<X509Certificate> ParseCertificateBundle(string pem)
     {
+        if (string.IsNullOrWhiteSpace(pem) || pem.Length > CaChainAndConstraintValidator.MaxBundleTextLength)
+        {
+            throw new ArgumentException("Certificate bundle could not be parsed");
+        }
+
         List<X509Certificate> list = [];
+        X509CertificateParser certParser = new();
         using StringReader sr = new(pem);
         PemReader reader = new(sr);
-        object? obj;
-        while ((obj = reader.ReadObject()) != null)
+        PemObject? pemObj;
+        while ((pemObj = reader.ReadPemObject()) != null)
         {
-            if (obj is X509Certificate c)
+            if (string.Equals(pemObj.Type, "CERTIFICATE", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(pemObj.Type, "X509 CERTIFICATE", StringComparison.OrdinalIgnoreCase))
             {
-                list.Add(c);
+                if (list.Count >= CaChainAndConstraintValidator.MaxCertificatesPerBundle
+                    || pemObj.Content is not { Length: > 0 }
+                    || pemObj.Content.Length > CaChainAndConstraintValidator.MaxSingleCertificateDerBytes)
+                {
+                    throw new ArgumentException("Certificate bundle exceeds permitted size or count limits");
+                }
+
+                X509Certificate? parsed = certParser.ReadCertificate(pemObj.Content);
+                if (parsed == null)
+                {
+                    throw new ArgumentException("Certificate could not be parsed");
+                }
+                list.Add(parsed);
             }
         }
         return list;
+    }
+
+    internal static byte[] ExtractPemOrBase64BytesBounded(
+        string pemOrBase64,
+        int maxPemLength,
+        int maxDerBytes,
+        string label)
+    {
+        if (string.IsNullOrWhiteSpace(pemOrBase64))
+        {
+            throw new ArgumentException($"{label} cannot be empty.");
+        }
+
+        if (pemOrBase64.Length > maxPemLength)
+        {
+            throw new ArgumentException($"{label} exceeds the maximum permitted length ({maxPemLength} characters).");
+        }
+
+        StringBuilder sb = new(pemOrBase64.Length);
+        foreach (string line in pemOrBase64.Split(newline, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string trimmed = line.Trim();
+            if (!trimmed.StartsWith("-----", StringComparison.Ordinal))
+            {
+                sb.Append(trimmed);
+            }
+        }
+
+        byte[] der = Convert.FromBase64String(sb.ToString());
+        if (der.Length == 0 || der.Length > maxDerBytes)
+        {
+            throw new ArgumentException($"{label} decoded size exceeds permitted bounds.");
+        }
+
+        return der;
     }
 
     private static string ExtractCommonName(X509Certificate cert)
@@ -456,12 +503,12 @@ public class KeyPair(string publicKey, string privateKey)
         AsymmetricKeyParameter privateKey;
         try
         {
-            string t = "";
-            foreach (string s in Public.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
-            {
-                t += s;
-            }
-            publicKey = PublicKeyFactory.CreateKey(Convert.FromBase64String(t));
+            byte[] pubDer = PkcsBuilder.ExtractPemOrBase64BytesBounded(
+                Public,
+                PkcsBuilder.MaxKeyPemLength,
+                PkcsBuilder.MaxKeyDerBytes,
+                "Public key");
+            publicKey = PublicKeyFactory.CreateKey(pubDer);
         }
         catch (Exception)
         {
@@ -469,12 +516,12 @@ public class KeyPair(string publicKey, string privateKey)
         }
         try
         {
-            string t = "";
-            foreach (string s in Private.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
-            {
-                t += s;
-            }
-            privateKey = PrivateKeyFactory.CreateKey(Convert.FromBase64String(t));
+            byte[] privDer = PkcsBuilder.ExtractPemOrBase64BytesBounded(
+                Private,
+                PkcsBuilder.MaxKeyPemLength,
+                PkcsBuilder.MaxKeyDerBytes,
+                "Private key");
+            privateKey = PrivateKeyFactory.CreateKey(privDer);
         }
         catch (Exception)
         {
@@ -631,15 +678,14 @@ public class CryptoFactory
         {
             return string.Empty;
         }
-        string k = "";
-        foreach (string s in privateKey.Split(newline, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("-----")))
-        {
-            k += s;
-        }
         AsymmetricKeyParameter privateParam;
         try
         {
-            byte[] privateBytes = Convert.FromBase64String(k);
+            byte[] privateBytes = PkcsBuilder.ExtractPemOrBase64BytesBounded(
+                privateKey,
+                PkcsBuilder.MaxKeyPemLength,
+                PkcsBuilder.MaxKeyDerBytes,
+                "Private key");
             privateParam = PrivateKeyFactory.CreateKey(privateBytes);
         }
         catch (Exception)

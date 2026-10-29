@@ -371,6 +371,25 @@ using (IServiceScope scope = app.Services.CreateScope())
             return;
         }
 
+        System.IO.FileInfo signedInfo = new(signedPath);
+        if (!signedInfo.Exists || signedInfo.Length > CaChainAndConstraintValidator.MaxBundleRawBytes)
+        {
+            Console.Error.WriteLine($"External CA validation failed: '{signedPath}' does not exist or exceeds the maximum permitted size ({CaChainAndConstraintValidator.MaxBundleRawBytes} bytes).");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        if (!string.IsNullOrEmpty(chainPath))
+        {
+            System.IO.FileInfo chainInfo = new(chainPath);
+            if (!chainInfo.Exists || chainInfo.Length > CaChainAndConstraintValidator.MaxBundleRawBytes)
+            {
+                Console.Error.WriteLine($"External CA validation failed: '{chainPath}' does not exist or exceeds the maximum permitted size ({CaChainAndConstraintValidator.MaxBundleRawBytes} bytes).");
+                Environment.ExitCode = 1;
+                return;
+            }
+        }
+
         byte[] signedBytes = await File.ReadAllBytesAsync(signedPath);
         byte[]? chainBytes = !string.IsNullOrEmpty(chainPath) ? await File.ReadAllBytesAsync(chainPath) : null;
 
@@ -414,6 +433,14 @@ using (IServiceScope scope = app.Services.CreateScope())
         if (user == null)
         {
             Console.Error.WriteLine($"User '{reqUser}' not found.");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        System.IO.FileInfo csrInfo = new(csrPath);
+        if (!csrInfo.Exists || csrInfo.Length > IssuancePolicyService.MaxCsrPemLength)
+        {
+            Console.Error.WriteLine($"Issuance failed: CSR file '{csrPath}' does not exist or exceeds the maximum permitted size ({IssuancePolicyService.MaxCsrPemLength} bytes).");
             Environment.ExitCode = 1;
             return;
         }
