@@ -1176,7 +1176,7 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
             duplicateId = duplicate.Id;
         }
 
-        // 1. Revoke first record while CRL publication fails -> both ledger records must remain intact
+        // 1. Revoke first record while CRL publication fails -> both ledger records must remain intact and both transition to Revoked
         service.CrlPublicationFaultInjector = _ => throw new IOException("Simulated CRL failure on revoke.");
         RevocationOutcome failedRevoke = await service.RevokeCertificateAsync(leaf.Record!.Id, CrlReason.KeyCompromise, "admin");
         service.CrlPublicationFaultInjector = null;
@@ -1185,6 +1185,10 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
         Assert.False(failedRevoke.CrlPublished);
         Assert.True(failedRevoke.IsPendingPublication);
 
+        IReadOnlySet<int> pendingAfterFailedRevoke = await service.GetCertificateIdsWithUnpublishedRevocationsAsync();
+        Assert.Contains(leaf.Record.Id, pendingAfterFailedRevoke);
+        Assert.Contains(duplicateId, pendingAfterFailedRevoke);
+
         using (IServiceScope checkScope1 = sp.CreateScope())
         {
             CertRoboDbContext checkDb = checkScope1.ServiceProvider.GetRequiredService<CertRoboDbContext>();
@@ -1192,6 +1196,8 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
             IssuedCertificateRecord? preservedDuplicate = await checkDb.IssuedCertificates.FindAsync(duplicateId);
             Assert.NotNull(preservedPrimary);
             Assert.NotNull(preservedDuplicate);
+            Assert.Equal(IssuanceStatus.Revoked, preservedPrimary.Status);
+            Assert.Equal(IssuanceStatus.Revoked, preservedDuplicate.Status);
             Assert.Equal("host.contoso.com", preservedPrimary.CommonName);
             Assert.Equal("other-certificate.contoso.com", preservedDuplicate.CommonName);
             Assert.Equal("other-operator", preservedDuplicate.RequestedByUserName);
@@ -1203,24 +1209,27 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
         RevocationOutcome outcome = await service.RevokeCertificateAsync(leaf.Record.Id, CrlReason.KeyCompromise, "admin");
         Assert.True(outcome.RevocationAccepted);
         Assert.True(outcome.CrlPublished);
+        Assert.Empty(await service.GetCertificateIdsWithUnpublishedRevocationsAsync());
 
         using (IServiceScope checkScope2 = sp.CreateScope())
         {
             CertRoboDbContext checkDb = checkScope2.ServiceProvider.GetRequiredService<CertRoboDbContext>();
             IssuedCertificateRecord? preservedDuplicate = await checkDb.IssuedCertificates.FindAsync(duplicateId);
             Assert.NotNull(preservedDuplicate);
+            Assert.Equal(IssuanceStatus.Revoked, preservedDuplicate.Status);
             Assert.Equal("other-certificate.contoso.com", preservedDuplicate.CommonName);
             Assert.Equal("other-operator", preservedDuplicate.RequestedByUserName);
             Assert.Equal(otherRealLeaf.CertificatePem, preservedDuplicate.CertificatePem);
         }
 
         // 3. Seed equivalent serial with publication failure, then with publication success -> both ledger records remain preserved
+        //    and retain their initial revocation attribution while the CRL updates to Superseded
         service.CrlPublicationFaultInjector = _ => throw new IOException("Simulated CRL failure on seed.");
         RevocationOutcome failedSeed = await service.SeedRevokedSerialAsync(
             "00" + leaf.Record.SerialNumberHex,
             "host.contoso.com",
             CrlReason.Superseded,
-            "admin");
+            "seed-operator");
         service.CrlPublicationFaultInjector = null;
         Assert.True(failedSeed.RevocationAccepted);
         Assert.False(failedSeed.CrlPublished);
@@ -1229,9 +1238,10 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
             "00" + leaf.Record.SerialNumberHex,
             "host.contoso.com",
             CrlReason.Superseded,
-            "admin");
+            "seed-operator");
         Assert.True(succeededSeed.RevocationAccepted);
         Assert.True(succeededSeed.CrlPublished);
+        Assert.True(CrlContainsSerial(succeededSeed.PublishedCrl!.CrlDer, leaf.Record.SerialNumberHex, CrlReason.Superseded));
         Assert.Empty(await service.GetCertificateIdsWithUnpublishedRevocationsAsync());
 
         using (IServiceScope checkScope3 = sp.CreateScope())
@@ -1247,8 +1257,173 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
             Assert.Equal(otherRealLeaf.CertificatePem, preservedDuplicate.CertificatePem);
             Assert.Equal(IssuanceStatus.Revoked, preservedPrimary.Status);
             Assert.Equal(IssuanceStatus.Revoked, preservedDuplicate.Status);
-            Assert.Equal(CrlReason.Superseded, preservedPrimary.RevocationReasonCode);
-            Assert.Equal(CrlReason.Superseded, preservedDuplicate.RevocationReasonCode);
+            // Initial revocation attribution on both rows ("admin", KeyCompromise) is preserved without overwriting
+            Assert.Equal("admin", preservedPrimary.RevokedByUserName);
+            Assert.Equal("admin", preservedDuplicate.RevokedByUserName);
+            Assert.Equal(CrlReason.KeyCompromise, preservedPrimary.RevocationReasonCode);
+            Assert.Equal(CrlReason.KeyCompromise, preservedDuplicate.RevocationReasonCode);
+
+            List<SerialRevocationEventRecord> auditEvents = await checkDb.SerialRevocationEvents
+                .Where(e => e.CaAuthorityId == ca.Id)
+                .OrderBy(e => e.Id)
+                .ToListAsync();
+            Assert.True(auditEvents.Count >= 3);
+            Assert.Equal("Revoke", auditEvents[0].OperationType);
+            Assert.Equal("admin", auditEvents[0].RevokedByUserName);
+            Assert.Equal("Seed", auditEvents[^1].OperationType);
+            Assert.Equal("seed-operator", auditEvents[^1].RevokedByUserName);
+            Assert.Equal(CrlReason.Superseded, auditEvents[^1].RevocationReasonCode);
+        }
+    }
+
+    [Fact]
+    public async Task ReviewProbe_RevokeReportsEquivalentIssuedRowAsRevoked()
+    {
+        const string secret = "Disposable-Test-Secret-Only!2026";
+        using ServiceProvider sp = BuildServiceProvider(
+            Path.Combine(_tempRoot, "review-status.db"),
+            Path.Combine(_tempRoot, "review-status-ca"),
+            configuredPassphrase: secret);
+        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
+        ApplicationUser admin = await BootstrapAdminAsync(sp);
+        CaAuthorityRecord ca = await service.CreateSelfSignedOrIntermediateCaAsync(
+            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
+            CertificateKeyFamily.Ecdsa, 256, 365, secret);
+        IssuanceOutcome leaf = await IssueLeafAsync(service, admin.Id, "host.contoso.com");
+        int duplicateId;
+        using (IServiceScope scope = sp.CreateScope())
+        {
+            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord duplicate = new()
+            {
+                CaAuthorityId = ca.Id,
+                SerialNumberHex = "00" + leaf.Record!.SerialNumberHex,
+                SerialNumberValue = leaf.Record.SerialNumberValue,
+                ProfileId = leaf.Record.ProfileId,
+                CommonName = leaf.Record.CommonName,
+                SubjectAlternativeNamesCsv = leaf.Record.SubjectAlternativeNamesCsv,
+                SubjectDistinguishedName = leaf.Record.SubjectDistinguishedName,
+                IssuerDistinguishedName = leaf.Record.IssuerDistinguishedName,
+                KeyAlgorithm = leaf.Record.KeyAlgorithm,
+                KeySizeBits = leaf.Record.KeySizeBits,
+                ThumbprintSha256 = leaf.Record.ThumbprintSha256,
+                CertificatePem = leaf.CertificatePem!,
+                ChainPem = leaf.Record.ChainPem,
+                NotBeforeUtc = leaf.Record.NotBeforeUtc,
+                NotAfterUtc = leaf.Record.NotAfterUtc,
+                RequestedByUserId = admin.Id,
+                RequestedByUserName = "another-operator",
+                Status = IssuanceStatus.Issued
+            };
+            db.IssuedCertificates.Add(duplicate);
+            await db.SaveChangesAsync();
+            duplicateId = duplicate.Id;
+        }
+        RevocationOutcome outcome = await service.RevokeCertificateAsync(leaf.Record!.Id, CrlReason.KeyCompromise, "admin");
+        Assert.True(outcome.CrlPublished);
+        Assert.True(CrlContainsSerial(outcome.PublishedCrl!.CrlDer, leaf.Record.SerialNumberHex, CrlReason.KeyCompromise));
+        using IServiceScope checkScope = sp.CreateScope();
+        CertRoboDbContext checkDb = checkScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+        IssuedCertificateRecord duplicateAfter = (await checkDb.IssuedCertificates.FindAsync(duplicateId))!;
+        Assert.Equal(IssuanceStatus.Revoked, duplicateAfter.Status);
+        Assert.Equal("another-operator", duplicateAfter.RequestedByUserName);
+    }
+
+    [Fact]
+    public async Task ReviewProbe_ReconcilePreservesSiblingRevocationActor()
+    {
+        const string secret = "Disposable-Test-Secret-Only!2026";
+        using ServiceProvider sp = BuildServiceProvider(
+            Path.Combine(_tempRoot, "review-actor.db"),
+            Path.Combine(_tempRoot, "review-actor-ca"),
+            configuredPassphrase: secret);
+        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
+        ApplicationUser admin = await BootstrapAdminAsync(sp);
+        CaAuthorityRecord ca = await service.CreateSelfSignedOrIntermediateCaAsync(
+            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
+            CertificateKeyFamily.Ecdsa, 256, 365, secret);
+        IssuanceOutcome leaf = await IssueLeafAsync(service, admin.Id, "host.contoso.com");
+        DateTimeOffset originalRevokedAt = DateTimeOffset.UtcNow.AddDays(-2);
+        int duplicateId;
+        using (IServiceScope scope = sp.CreateScope())
+        {
+            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord duplicate = new()
+            {
+                CaAuthorityId = ca.Id,
+                SerialNumberHex = "00" + leaf.Record!.SerialNumberHex,
+                SerialNumberValue = leaf.Record.SerialNumberValue,
+                ProfileId = leaf.Record.ProfileId,
+                CommonName = leaf.Record.CommonName,
+                SubjectAlternativeNamesCsv = leaf.Record.SubjectAlternativeNamesCsv,
+                SubjectDistinguishedName = leaf.Record.SubjectDistinguishedName,
+                IssuerDistinguishedName = leaf.Record.IssuerDistinguishedName,
+                KeyAlgorithm = leaf.Record.KeyAlgorithm,
+                KeySizeBits = leaf.Record.KeySizeBits,
+                ThumbprintSha256 = leaf.Record.ThumbprintSha256,
+                CertificatePem = leaf.CertificatePem!,
+                ChainPem = leaf.Record.ChainPem,
+                NotBeforeUtc = leaf.Record.NotBeforeUtc,
+                NotAfterUtc = leaf.Record.NotAfterUtc,
+                RequestedByUserId = admin.Id,
+                RequestedByUserName = "another-operator",
+                Status = IssuanceStatus.Revoked,
+                RevokedAtUtc = originalRevokedAt,
+                RevocationReasonCode = CrlReason.Superseded,
+                RevokedByUserName = "original-operator"
+            };
+            db.IssuedCertificates.Add(duplicate);
+            await db.SaveChangesAsync();
+            duplicateId = duplicate.Id;
+        }
+        RevocationOutcome outcome = await service.RevokeCertificateAsync(leaf.Record!.Id, CrlReason.KeyCompromise, "admin");
+        Assert.True(outcome.CrlPublished);
+        Assert.True(CrlContainsSerial(outcome.PublishedCrl!.CrlDer, leaf.Record.SerialNumberHex, CrlReason.KeyCompromise));
+        Assert.Empty(await service.GetCertificateIdsWithUnpublishedRevocationsAsync());
+
+        using (IServiceScope checkScope = sp.CreateScope())
+        {
+            CertRoboDbContext checkDb = checkScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord duplicateAfter = (await checkDb.IssuedCertificates.FindAsync(duplicateId))!;
+            IssuedCertificateRecord primaryAfter = (await checkDb.IssuedCertificates.FindAsync(leaf.Record.Id))!;
+            Assert.Equal("original-operator", duplicateAfter.RevokedByUserName);
+            Assert.Equal(CrlReason.Superseded, duplicateAfter.RevocationReasonCode);
+            Assert.Equal(originalRevokedAt, duplicateAfter.RevokedAtUtc);
+            Assert.Equal("admin", primaryAfter.RevokedByUserName);
+            Assert.Equal(CrlReason.KeyCompromise, primaryAfter.RevocationReasonCode);
+        }
+
+        // Also verify SeedRevokedSerialAsync with a third actor and reason preserves both rows' prior attribution
+        // across a pending failure and subsequent retry
+        service.CrlPublicationFaultInjector = _ => throw new IOException("Simulated seed CRL failure.");
+        RevocationOutcome pendingSeed = await service.SeedRevokedSerialAsync(
+            leaf.Record.SerialNumberHex,
+            "host.contoso.com",
+            CrlReason.CessationOfOperation,
+            "migration-operator");
+        service.CrlPublicationFaultInjector = null;
+        Assert.True(pendingSeed.IsPendingPublication);
+
+        IReadOnlySet<int> pendingIds = await service.GetCertificateIdsWithUnpublishedRevocationsAsync();
+        Assert.Contains(leaf.Record.Id, pendingIds);
+        Assert.Contains(duplicateId, pendingIds);
+
+        IReadOnlyList<CrlRefreshOutcome> retryOutcomes = await service.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+        Assert.Single(retryOutcomes);
+        Assert.True(retryOutcomes[0].Succeeded, retryOutcomes[0].ErrorMessage);
+        Assert.True(CrlContainsSerial(retryOutcomes[0].PublishedCrl!.CrlDer, leaf.Record.SerialNumberHex, CrlReason.CessationOfOperation));
+        Assert.Empty(await service.GetCertificateIdsWithUnpublishedRevocationsAsync());
+
+        using (IServiceScope checkScope2 = sp.CreateScope())
+        {
+            CertRoboDbContext checkDb = checkScope2.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord duplicateFinal = (await checkDb.IssuedCertificates.FindAsync(duplicateId))!;
+            IssuedCertificateRecord primaryFinal = (await checkDb.IssuedCertificates.FindAsync(leaf.Record.Id))!;
+            Assert.Equal("original-operator", duplicateFinal.RevokedByUserName);
+            Assert.Equal(CrlReason.Superseded, duplicateFinal.RevocationReasonCode);
+            Assert.Equal(originalRevokedAt, duplicateFinal.RevokedAtUtc);
+            Assert.Equal("admin", primaryFinal.RevokedByUserName);
+            Assert.Equal(CrlReason.KeyCompromise, primaryFinal.RevocationReasonCode);
         }
     }
 
@@ -1438,13 +1613,13 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
         Stopwatch sw = Stopwatch.StartNew();
         while (sw.Elapsed < timeout)
         {
+            long currentScans = bgService.CompletedScanCount;
             PublishedCrlRecord? latest = await caService.GetLatestCrlAsync(caAuthorityId: caAuthorityId);
             if (latest != null && latest.CrlNumber >= expectedCrlNumber)
             {
                 return latest;
             }
 
-            long currentScans = bgService.CompletedScanCount;
             TimeSpan remaining = timeout - sw.Elapsed;
             if (remaining <= TimeSpan.Zero)
             {

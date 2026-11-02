@@ -2263,6 +2263,7 @@ public sealed class CertificateAuthorityService
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
+            await db.EnsureSchemaUpgradedAsync(cancellationToken);
             IssuedCertificateRecord? certRecord = await db.IssuedCertificates
                 .FirstOrDefaultAsync(c => c.Id == certificateId, cancellationToken);
 
@@ -2286,11 +2287,21 @@ public sealed class CertificateAuthorityService
                     $"Certificate in status '{certRecord.Status}' cannot be revoked.");
             }
 
+            bool targetWasAlreadyRevoked = certRecord.Status == IssuanceStatus.Revoked;
             DateTimeOffset effectiveRevokedAt = certRecord.RevokedAtUtc ?? DateTimeOffset.UtcNow;
             certRecord.Status = IssuanceStatus.Revoked;
-            certRecord.RevokedAtUtc = effectiveRevokedAt;
-            certRecord.RevocationReasonCode = revocationReasonCode;
-            certRecord.RevokedByUserName = revokedByUserName;
+            if (!targetWasAlreadyRevoked)
+            {
+                certRecord.RevokedAtUtc = effectiveRevokedAt;
+                certRecord.RevocationReasonCode = revocationReasonCode;
+                certRecord.RevokedByUserName = revokedByUserName;
+            }
+            else
+            {
+                certRecord.RevokedAtUtc ??= effectiveRevokedAt;
+                certRecord.RevocationReasonCode ??= revocationReasonCode;
+                certRecord.RevokedByUserName ??= revokedByUserName;
+            }
 
             if (certRecord.CaAuthorityId.HasValue
                 && TryNormalizePositiveSerialHex(certRecord.SerialNumberHex, out BigInteger certSerialBi, out string canonicalCertHex, out _))
@@ -2304,13 +2315,17 @@ public sealed class CertificateAuthorityService
                              && otherBi.Equals(certSerialBi))
                     .ToList();
 
-                // Reconcile any other already-revoked records for the same numeric serial so CRL generation
-                // sees a single agreed reason and timestamp, without deleting or discarding any ledger record.
-                foreach (IssuedCertificateRecord siblingRevoked in siblingSerialRecords.Where(r => r.Status == IssuanceStatus.Revoked))
+                // Revocation is per (issuer, serial): mark any Issued sibling records for the same serial as Revoked
+                // while preserving all issuance metadata and never overwriting prior revocation attribution on already-revoked siblings.
+                foreach (IssuedCertificateRecord sibling in siblingSerialRecords)
                 {
-                    siblingRevoked.RevokedAtUtc = effectiveRevokedAt;
-                    siblingRevoked.RevocationReasonCode = revocationReasonCode;
-                    siblingRevoked.RevokedByUserName = revokedByUserName;
+                    if (sibling.Status == IssuanceStatus.Issued || sibling.Status == IssuanceStatus.Revoked)
+                    {
+                        sibling.Status = IssuanceStatus.Revoked;
+                        sibling.RevokedAtUtc ??= effectiveRevokedAt;
+                        sibling.RevocationReasonCode ??= revocationReasonCode;
+                        sibling.RevokedByUserName ??= revokedByUserName;
+                    }
                 }
 
                 bool canonicalHexTakenBySibling = sameIssuerRecords.Any(c =>
@@ -2319,6 +2334,24 @@ public sealed class CertificateAuthorityService
                 {
                     certRecord.SerialNumberHex = canonicalCertHex;
                 }
+
+                int maxMatchingRecordId = siblingSerialRecords
+                    .Select(s => s.Id)
+                    .Append(certRecord.Id)
+                    .Max();
+
+                db.SerialRevocationEvents.Add(new SerialRevocationEventRecord
+                {
+                    CaAuthorityId = certRecord.CaAuthorityId.Value,
+                    CanonicalSerialHex = canonicalCertHex,
+                    TargetCertificateRecordId = certRecord.Id,
+                    OperationType = "Revoke",
+                    RevocationReasonCode = revocationReasonCode,
+                    RevokedAtUtc = effectiveRevokedAt,
+                    RevokedByUserName = revokedByUserName,
+                    ReconciledMaxCertificateRecordId = maxMatchingRecordId,
+                    CreatedAtUtc = DateTimeOffset.UtcNow
+                });
             }
 
             await db.SaveChangesAsync(cancellationToken);
@@ -2361,6 +2394,7 @@ public sealed class CertificateAuthorityService
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
+            await db.EnsureSchemaUpgradedAsync(cancellationToken);
             CaAuthorityRecord? ca = await db.CaAuthorities
                 .OrderByDescending(c => c.Id)
                 .FirstOrDefaultAsync(c => c.IsActive, cancellationToken);
@@ -2399,14 +2433,17 @@ public sealed class CertificateAuthorityService
                     ?? matchingRecords.Select(r => r.RevokedAtUtc).FirstOrDefault(t => t.HasValue)
                     ?? effectiveRevokedAt;
 
-                // Preserve every existing ledger record and its distinct certificate/audit metadata
-                // while reconciling revocation state across equivalent encodings of the same serial.
+                // Preserve every existing ledger record and its prior revocation attribution (who revoked it and when)
+                // while transitioning any Issued sibling rows to Revoked and recording the authoritative Seed event.
                 foreach (IssuedCertificateRecord record in matchingRecords)
                 {
-                    record.Status = IssuanceStatus.Revoked;
-                    record.RevokedAtUtc = unifiedRevokedAt;
-                    record.RevocationReasonCode = revocationReasonCode;
-                    record.RevokedByUserName = revokedByUserName;
+                    if (record.Status == IssuanceStatus.Issued || record.Status == IssuanceStatus.Revoked)
+                    {
+                        record.Status = IssuanceStatus.Revoked;
+                        record.RevokedAtUtc ??= unifiedRevokedAt;
+                        record.RevocationReasonCode ??= revocationReasonCode;
+                        record.RevokedByUserName ??= revokedByUserName;
+                    }
                 }
 
                 bool canonicalHexTakenByOther = caCertificates.Any(c =>
@@ -2417,7 +2454,22 @@ public sealed class CertificateAuthorityService
                     primary.SerialNumberHex = canonicalHex;
                 }
 
+                int maxMatchingRecordId = matchingRecords.Max(r => r.Id);
+                db.SerialRevocationEvents.Add(new SerialRevocationEventRecord
+                {
+                    CaAuthorityId = ca.Id,
+                    CanonicalSerialHex = canonicalHex,
+                    TargetCertificateRecordId = primary.Id,
+                    OperationType = "Seed",
+                    RevocationReasonCode = revocationReasonCode,
+                    RevokedAtUtc = unifiedRevokedAt,
+                    RevokedByUserName = revokedByUserName,
+                    ReconciledMaxCertificateRecordId = maxMatchingRecordId,
+                    CreatedAtUtc = DateTimeOffset.UtcNow
+                });
+
                 targetRecord = primary;
+                await db.SaveChangesAsync(cancellationToken);
             }
             else
             {
@@ -2445,10 +2497,23 @@ public sealed class CertificateAuthorityService
                     RevokedByUserName = revokedByUserName
                 };
                 db.IssuedCertificates.Add(seeded);
+                await db.SaveChangesAsync(cancellationToken);
+
+                db.SerialRevocationEvents.Add(new SerialRevocationEventRecord
+                {
+                    CaAuthorityId = ca.Id,
+                    CanonicalSerialHex = canonicalHex,
+                    TargetCertificateRecordId = seeded.Id,
+                    OperationType = "Seed",
+                    RevocationReasonCode = revocationReasonCode,
+                    RevokedAtUtc = effectiveRevokedAt,
+                    RevokedByUserName = revokedByUserName,
+                    ReconciledMaxCertificateRecordId = seeded.Id,
+                    CreatedAtUtc = DateTimeOffset.UtcNow
+                });
+                await db.SaveChangesAsync(cancellationToken);
                 targetRecord = seeded;
             }
-
-            await db.SaveChangesAsync(cancellationToken);
 
             return await TryPublishRevocationCrlCoreAsync(targetRecord, cancellationToken);
         }
@@ -2599,8 +2664,10 @@ public sealed class CertificateAuthorityService
         {
             List<CaAuthorityRecord> authorities;
             List<IssuedCertificateRecord> maintainedCertificates;
+            List<SerialRevocationEventRecord> revocationEvents;
             await using (CertRoboDbContext readDb = await _dbFactory.CreateDbContextAsync(cancellationToken))
             {
+                await readDb.EnsureSchemaUpgradedAsync(cancellationToken);
                 authorities = await readDb.CaAuthorities
                     .AsNoTracking()
                     .OrderBy(c => c.Id)
@@ -2608,6 +2675,10 @@ public sealed class CertificateAuthorityService
                 maintainedCertificates = await readDb.IssuedCertificates
                     .AsNoTracking()
                     .Where(c => c.Status == IssuanceStatus.Issued || c.Status == IssuanceStatus.Revoked)
+                    .ToListAsync(cancellationToken);
+                revocationEvents = await readDb.SerialRevocationEvents
+                    .AsNoTracking()
+                    .OrderBy(e => e.Id)
                     .ToListAsync(cancellationToken);
             }
 
@@ -2633,6 +2704,9 @@ public sealed class CertificateAuthorityService
             Dictionary<int, List<IssuedCertificateRecord>> revokedByAuthority = maintainedCertificates
                 .Where(c => c.CaAuthorityId.HasValue && c.Status == IssuanceStatus.Revoked)
                 .GroupBy(c => c.CaAuthorityId!.Value)
+                .ToDictionary(g => g.Key, g => g.ToList());
+            Dictionary<int, List<SerialRevocationEventRecord>> eventsByAuthority = revocationEvents
+                .GroupBy(e => e.CaAuthorityId)
                 .ToDictionary(g => g.Key, g => g.ToList());
             HashSet<int> knownAuthorityIds = authorities.Select(a => a.Id).ToHashSet();
             List<CrlRefreshOutcome> outcomes = [];
@@ -2673,7 +2747,8 @@ public sealed class CertificateAuthorityService
 
                     bool hasUnpublishedRevocations = HasUnpublishedRevocations(
                         latest,
-                        revokedByAuthority.GetValueOrDefault(authority.Id));
+                        revokedByAuthority.GetValueOrDefault(authority.Id),
+                        eventsByAuthority.GetValueOrDefault(authority.Id));
 
                     if (authority.NotAfterUtc <= now)
                     {
@@ -2787,6 +2862,7 @@ public sealed class CertificateAuthorityService
         CancellationToken cancellationToken = default)
     {
         await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
+        await db.EnsureSchemaUpgradedAsync(cancellationToken);
         List<IssuedCertificateRecord> revokedCerts = await db.IssuedCertificates
             .AsNoTracking()
             .Where(c => c.Status == IssuanceStatus.Revoked)
@@ -2796,6 +2872,14 @@ public sealed class CertificateAuthorityService
         {
             return new HashSet<int>();
         }
+
+        List<SerialRevocationEventRecord> allEvents = await db.SerialRevocationEvents
+            .AsNoTracking()
+            .OrderBy(e => e.Id)
+            .ToListAsync(cancellationToken);
+        Dictionary<int, List<SerialRevocationEventRecord>> eventsByAuthority = allEvents
+            .GroupBy(e => e.CaAuthorityId)
+            .ToDictionary(g => g.Key, g => g.ToList());
 
         HashSet<int> knownAuthorityIds = (await db.CaAuthorities
             .AsNoTracking()
@@ -2815,7 +2899,8 @@ public sealed class CertificateAuthorityService
             .GroupBy(c => c.CaAuthorityId!.Value))
         {
             List<IssuedCertificateRecord> groupRecords = group.ToList();
-            var (_, conflictingIds, _) = AnalyzeRevokedSerialGroups(groupRecords, now);
+            List<SerialRevocationEventRecord>? authorityEvents = eventsByAuthority.GetValueOrDefault(group.Key);
+            var (canonicalEntries, conflictingIds, _) = AnalyzeRevokedSerialGroups(groupRecords, now, authorityEvents);
             foreach (int conflictId in conflictingIds)
             {
                 unpublishedIds.Add(conflictId);
@@ -2854,11 +2939,14 @@ public sealed class CertificateAuthorityService
                 continue;
             }
 
-            foreach (IssuedCertificateRecord r in groupRecords)
+            foreach (CanonicalCrlRevocationEntry entry in canonicalEntries)
             {
-                if (IsCertificateRevocationUnpublished(parsedCrl, r))
+                if (IsCanonicalRevocationEntryUnpublished(parsedCrl, entry))
                 {
-                    unpublishedIds.Add(r.Id);
+                    foreach (int recordId in entry.RecordIds)
+                    {
+                        unpublishedIds.Add(recordId);
+                    }
                 }
             }
         }
@@ -2868,7 +2956,8 @@ public sealed class CertificateAuthorityService
 
     public static bool HasUnpublishedRevocations(
         PublishedCrlRecord? latestCrl,
-        IReadOnlyList<IssuedCertificateRecord>? revokedCertificates)
+        IReadOnlyList<IssuedCertificateRecord>? revokedCertificates,
+        IReadOnlyList<SerialRevocationEventRecord>? serialEvents = null)
     {
         if (latestCrl == null)
         {
@@ -2880,7 +2969,10 @@ public sealed class CertificateAuthorityService
             return false;
         }
 
-        var (_, conflictingIds, _) = AnalyzeRevokedSerialGroups(revokedCertificates, DateTimeOffset.UtcNow);
+        var (canonicalEntries, conflictingIds, _) = AnalyzeRevokedSerialGroups(
+            revokedCertificates,
+            DateTimeOffset.UtcNow,
+            serialEvents);
         if (conflictingIds.Count > 0)
         {
             return true;
@@ -2901,9 +2993,9 @@ public sealed class CertificateAuthorityService
             return true;
         }
 
-        foreach (IssuedCertificateRecord revoked in revokedCertificates)
+        foreach (CanonicalCrlRevocationEntry entry in canonicalEntries)
         {
-            if (IsCertificateRevocationUnpublished(parsedCrl, revoked))
+            if (IsCanonicalRevocationEntryUnpublished(parsedCrl, entry))
             {
                 return true;
             }
@@ -2912,36 +3004,26 @@ public sealed class CertificateAuthorityService
         return false;
     }
 
-    private static bool IsCertificateRevocationUnpublished(
+    private static bool IsCanonicalRevocationEntryUnpublished(
         X509Crl parsedCrl,
-        IssuedCertificateRecord revoked)
+        CanonicalCrlRevocationEntry expectedEntry)
     {
-        if (!TryNormalizePositiveSerialHex(revoked.SerialNumberHex, out BigInteger serialBigInt, out _, out _))
-        {
-            return true;
-        }
-
-        X509CrlEntry? entry = parsedCrl.GetRevokedCertificate(serialBigInt);
+        X509CrlEntry? entry = parsedCrl.GetRevokedCertificate(expectedEntry.SerialBigInt);
         if (entry == null)
         {
             return true;
         }
 
-        int expectedReason = revoked.RevocationReasonCode ?? CrlReason.Unspecified;
         int actualReason = ExtractCrlEntryReasonCode(entry);
-        if (actualReason != expectedReason)
+        if (actualReason != expectedEntry.ReasonCode)
         {
             return true;
         }
 
-        if (revoked.RevokedAtUtc.HasValue)
+        DateTime actualRevDateUtc = TruncateToSeconds(entry.RevocationDate.ToUniversalTime());
+        if (actualRevDateUtc != expectedEntry.RevocationDateUtc)
         {
-            DateTime expectedRevDateUtc = TruncateToSeconds(revoked.RevokedAtUtc.Value.UtcDateTime);
-            DateTime actualRevDateUtc = TruncateToSeconds(entry.RevocationDate.ToUniversalTime());
-            if (expectedRevDateUtc != actualRevDateUtc)
-            {
-                return true;
-            }
+            return true;
         }
 
         return false;
@@ -3010,7 +3092,8 @@ public sealed class CertificateAuthorityService
         BigInteger SerialBigInt,
         string CanonicalHex,
         DateTime RevocationDateUtc,
-        int ReasonCode);
+        int ReasonCode,
+        IReadOnlyList<int> RecordIds);
 
     private static (
         IReadOnlyList<CanonicalCrlRevocationEntry> Entries,
@@ -3018,11 +3101,24 @@ public sealed class CertificateAuthorityService
         IReadOnlyList<string> ConflictMessages)
         AnalyzeRevokedSerialGroups(
             IReadOnlyList<IssuedCertificateRecord> revokedCerts,
-            DateTimeOffset fallbackNow)
+            DateTimeOffset fallbackNow,
+            IReadOnlyList<SerialRevocationEventRecord>? serialEvents = null)
     {
         List<CanonicalCrlRevocationEntry> canonicalEntries = [];
         HashSet<int> conflictingIds = [];
         List<string> conflictMessages = [];
+
+        Dictionary<string, SerialRevocationEventRecord> latestEventBySerial = new(StringComparer.Ordinal);
+        if (serialEvents != null)
+        {
+            foreach (SerialRevocationEventRecord evt in serialEvents.OrderBy(e => e.Id))
+            {
+                if (TryNormalizePositiveSerialHex(evt.CanonicalSerialHex, out _, out string normEvtHex, out _))
+                {
+                    latestEventBySerial[normEvtHex] = evt;
+                }
+            }
+        }
 
         Dictionary<string, (BigInteger SerialBigInt, List<IssuedCertificateRecord> Records)> byCanonicalHex =
             new(StringComparer.Ordinal);
@@ -3051,6 +3147,31 @@ public sealed class CertificateAuthorityService
 
         foreach ((string canonicalHex, (BigInteger serialBigInt, List<IssuedCertificateRecord> groupRecords)) in byCanonicalHex)
         {
+            List<int> groupRecordIds = groupRecords.Select(r => r.Id).ToList();
+
+            if (latestEventBySerial.TryGetValue(canonicalHex, out SerialRevocationEventRecord? latestEvent))
+            {
+                DateTime eventRevDateUtc = TruncateToSeconds(latestEvent.RevokedAtUtc.UtcDateTime);
+                int eventReason = latestEvent.RevocationReasonCode;
+
+                bool allPostEventRecordsAgree = groupRecords
+                    .Where(r => r.Id > latestEvent.ReconciledMaxCertificateRecordId)
+                    .All(r =>
+                        (r.RevocationReasonCode ?? CrlReason.Unspecified) == eventReason
+                        && (!r.RevokedAtUtc.HasValue || TruncateToSeconds(r.RevokedAtUtc.Value.UtcDateTime) == eventRevDateUtc));
+
+                if (allPostEventRecordsAgree)
+                {
+                    canonicalEntries.Add(new CanonicalCrlRevocationEntry(
+                        serialBigInt,
+                        canonicalHex,
+                        eventRevDateUtc,
+                        eventReason,
+                        groupRecordIds));
+                    continue;
+                }
+            }
+
             HashSet<int> distinctReasons = groupRecords
                 .Select(r => r.RevocationReasonCode ?? CrlReason.Unspecified)
                 .ToHashSet();
@@ -3085,7 +3206,8 @@ public sealed class CertificateAuthorityService
                 serialBigInt,
                 canonicalHex,
                 agreedRevDateUtc,
-                agreedReason));
+                agreedReason,
+                groupRecordIds));
         }
 
         canonicalEntries.Sort((a, b) => a.SerialBigInt.CompareTo(b.SerialBigInt));
@@ -3338,16 +3460,44 @@ public sealed class CertificateAuthorityService
         crlGen.SetThisUpdate(thisUpdate.UtcDateTime);
         crlGen.SetNextUpdate(nextUpdate.UtcDateTime);
 
+        await db.EnsureSchemaUpgradedAsync(cancellationToken);
+
         List<IssuedCertificateRecord> revokedCerts = await db.IssuedCertificates
             .Where(c => c.CaAuthorityId == ca.Id && c.Status == IssuanceStatus.Revoked)
             .OrderBy(c => c.SerialNumberValue)
             .ThenBy(c => c.Id)
             .ToListAsync(cancellationToken);
 
-        var (canonicalRevocationEntries, _, conflictMessages) = AnalyzeRevokedSerialGroups(revokedCerts, now);
+        List<SerialRevocationEventRecord> serialEvents = await db.SerialRevocationEvents
+            .Where(e => e.CaAuthorityId == ca.Id)
+            .OrderBy(e => e.Id)
+            .ToListAsync(cancellationToken);
+
+        var (canonicalRevocationEntries, _, conflictMessages) = AnalyzeRevokedSerialGroups(revokedCerts, now, serialEvents);
         if (conflictMessages.Count > 0)
         {
             throw new InvalidOperationException(string.Join(" ", conflictMessages));
+        }
+
+        if (canonicalRevocationEntries.Count > 0)
+        {
+            Dictionary<string, CanonicalCrlRevocationEntry> entryByCanonicalHex = canonicalRevocationEntries
+                .ToDictionary(e => e.CanonicalHex, StringComparer.Ordinal);
+            List<IssuedCertificateRecord> issuedForAuthority = await db.IssuedCertificates
+                .Where(c => c.CaAuthorityId == ca.Id && c.Status == IssuanceStatus.Issued)
+                .ToListAsync(cancellationToken);
+
+            foreach (IssuedCertificateRecord issuedRow in issuedForAuthority)
+            {
+                if (TryNormalizePositiveSerialHex(issuedRow.SerialNumberHex, out _, out string issuedCanonicalHex, out _)
+                    && entryByCanonicalHex.TryGetValue(issuedCanonicalHex, out CanonicalCrlRevocationEntry? revEntry))
+                {
+                    issuedRow.Status = IssuanceStatus.Revoked;
+                    issuedRow.RevokedAtUtc ??= new DateTimeOffset(revEntry.RevocationDateUtc, TimeSpan.Zero);
+                    issuedRow.RevocationReasonCode ??= revEntry.ReasonCode;
+                    issuedRow.RevokedByUserName ??= "crl-reconcile";
+                }
+            }
         }
 
         foreach (IssuedCertificateRecord revoked in revokedCerts)
