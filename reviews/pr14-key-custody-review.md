@@ -17,3 +17,13 @@ These are code/documentation findings; I have not reproduced the multi-process r
 - No full deployment, AD CS/CES interoperability test, or separate fault-injection test was performed.
 
 The existing tests provide useful coverage for mismatched custody, restart, historical issuers, and migration. A passing suite does not exercise the documented failure/coordination scenarios above. The separate CA/CRL lifecycle work remains outside this review.
+
+## Follow-up review — `086bc42a614b3999f4ea6bac9779b4676958b27c`
+
+The original two findings have been addressed: the instructions retain the old passphrase and stop the service, and lifecycle operations now have cross-process locking. There is one remaining issue in the revised recovery procedure:
+
+**A failed stop or backup does not prevent migration.** The stop, backup, initial custody check, and migration commands in `README.md:329-340` are separate shell commands. Only the final migration/verification/start sequence is conditional. When the block is pasted into a normal shell and stopping the service or taking the backup fails, execution continues into migration; the final command can succeed and make the overall block appear successful. A mocked execution of the exact README block reproduced this with a failed backup followed by migration and service start. No real service, key, or backup was touched.
+
+Make successful service stop and backup prerequisites for the migration and start, with an explicit failure message and no migration on either failure. The initial custody verification can legitimately return nonzero in this mixed-passphrase recovery scenario, so handle that result intentionally rather than applying an indiscriminate `set -e` to the entire sequence. Add a test executing the documented shell flow with stubbed commands to verify failed stop/backup prevents migration, while an expected initial custody failure does not.
+
+Linux validation of this follow-up: `dotnet test -c Release --nologo --no-restore -m:1` passed **78/78** tests. The mocked README execution reported backup failure, then migration and service start, with an overall success exit status.
