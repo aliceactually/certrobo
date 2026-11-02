@@ -759,6 +759,400 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
         Assert.True(importedSingleKey.IsIntermediate);
     }
 
+    [Fact]
+    public async Task ReviewFix_EquivalentSerialEncodings_SignPadding_LeadingZeros_AndPreExistingDuplicates_ConvergeAndExposeConflicts()
+    {
+        const string secret = "Disposable-Test-Secret-Only!2026";
+        string dbPath = Path.Combine(_tempRoot, "leading-zero.db");
+        string caDir = Path.Combine(_tempRoot, "leading-zero-ca");
+
+        using ServiceProvider sp = BuildServiceProvider(dbPath, caDir, configuredPassphrase: secret);
+        CertificateAuthorityService caService = sp.GetRequiredService<CertificateAuthorityService>();
+        ApplicationUser admin = await BootstrapAdminAsync(sp);
+
+        CaAuthorityRecord ca = await caService.CreateSelfSignedOrIntermediateCaAsync(
+            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
+            CertificateKeyFamily.Ecdsa, 256, 365, secret);
+
+        // 1. Exact review probe: issue & revoke a certificate, then seed its serial prefixed with "00" and a different reason
+        IssuanceOutcome leaf = await IssueLeafAsync(caService, admin.Id, "host.contoso.com");
+        RevocationOutcome first = await caService.RevokeCertificateAsync(leaf.Record!.Id, CrlReason.KeyCompromise, "admin");
+        Assert.True(first.CrlPublished);
+
+        RevocationOutcome seeded = await caService.SeedRevokedSerialAsync(
+            "00" + leaf.Record.SerialNumberHex,
+            "host.contoso.com",
+            CrlReason.Superseded,
+            "admin");
+        Assert.True(seeded.CrlPublished);
+        Assert.Empty(await caService.GetCertificateIdsWithUnpublishedRevocationsAsync());
+
+        long crlAfterSeed = seeded.PublishedCrl!.CrlNumber;
+        Assert.True(CrlContainsSerial(seeded.PublishedCrl.CrlDer, leaf.Record.SerialNumberHex, CrlReason.Superseded));
+
+        // Subsequent refreshes must be no-ops (converged, no permanent pending loop)
+        for (int i = 0; i < 2; i++)
+        {
+            IReadOnlyList<CrlRefreshOutcome> retry = await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+            Assert.Empty(retry);
+            Assert.Empty(await caService.GetCertificateIdsWithUnpublishedRevocationsAsync());
+            Assert.Equal(crlAfterSeed, (await caService.GetLatestCrlAsync())!.CrlNumber);
+        }
+
+        // 2. ASN.1 DER sign-padding ("00:80:AB:CD" vs "80:AB:CD") and odd-nibble/leading-zero ("0003E9" vs "3E9")
+        RevocationOutcome signPadded1 = await caService.SeedRevokedSerialAsync(
+            "00:80:AB:CD",
+            "signpadded.contoso.com",
+            CrlReason.KeyCompromise,
+            "admin");
+        Assert.True(signPadded1.CrlPublished);
+        Assert.Equal("80ABCD", signPadded1.CertificateRecord!.SerialNumberHex);
+
+        RevocationOutcome signPadded2 = await caService.SeedRevokedSerialAsync(
+            "80ABCD",
+            "signpadded.contoso.com",
+            CrlReason.CessationOfOperation,
+            "admin");
+        Assert.True(signPadded2.CrlPublished);
+        Assert.Equal(signPadded1.CertificateRecord.Id, signPadded2.CertificateRecord!.Id);
+        Assert.Empty(await caService.GetCertificateIdsWithUnpublishedRevocationsAsync());
+
+        // 3. Pre-existing agreeing duplicate rows in database ("03E9" and "0003E9" with same reason & timestamp)
+        DateTimeOffset agreedRevokedAt = new(2026, 11, 2, 12, 0, 0, TimeSpan.Zero);
+        using (IServiceScope scope = sp.CreateScope())
+        {
+            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            db.IssuedCertificates.AddRange(
+                new IssuedCertificateRecord
+                {
+                    CaAuthorityId = ca.Id,
+                    SerialNumberHex = "03E9",
+                    SerialNumberValue = 1001,
+                    ProfileId = "legacy-imported",
+                    CommonName = "dup1.contoso.com",
+                    SubjectAlternativeNamesCsv = "dup1.contoso.com",
+                    SubjectDistinguishedName = "CN=dup1.contoso.com",
+                    IssuerDistinguishedName = "CN=ca.contoso.com",
+                    KeyAlgorithm = "LEGACY",
+                    KeySizeBits = 0,
+                    ThumbprintSha256 = "LEGACY-03E9",
+                    NotBeforeUtc = ca.NotBeforeUtc,
+                    NotAfterUtc = ca.NotAfterUtc,
+                    RequestedByUserId = "legacy",
+                    RequestedByUserName = "admin",
+                    Status = IssuanceStatus.Revoked,
+                    CreatedAtUtc = agreedRevokedAt,
+                    RevokedAtUtc = agreedRevokedAt,
+                    RevocationReasonCode = CrlReason.KeyCompromise,
+                    RevokedByUserName = "admin"
+                },
+                new IssuedCertificateRecord
+                {
+                    CaAuthorityId = ca.Id,
+                    SerialNumberHex = "0003E9",
+                    SerialNumberValue = 1001,
+                    ProfileId = "legacy-imported",
+                    CommonName = "dup1.contoso.com",
+                    SubjectAlternativeNamesCsv = "dup1.contoso.com",
+                    SubjectDistinguishedName = "CN=dup1.contoso.com",
+                    IssuerDistinguishedName = "CN=ca.contoso.com",
+                    KeyAlgorithm = "LEGACY",
+                    KeySizeBits = 0,
+                    ThumbprintSha256 = "LEGACY-0003E9",
+                    NotBeforeUtc = ca.NotBeforeUtc,
+                    NotAfterUtc = ca.NotAfterUtc,
+                    RequestedByUserId = "legacy",
+                    RequestedByUserName = "admin",
+                    Status = IssuanceStatus.Revoked,
+                    CreatedAtUtc = agreedRevokedAt,
+                    RevokedAtUtc = agreedRevokedAt,
+                    RevocationReasonCode = CrlReason.KeyCompromise,
+                    RevokedByUserName = "admin"
+                });
+            await db.SaveChangesAsync();
+        }
+
+        IReadOnlyList<CrlRefreshOutcome> agreedRefresh = await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+        Assert.Single(agreedRefresh);
+        Assert.True(agreedRefresh[0].Succeeded, agreedRefresh[0].ErrorMessage);
+
+        // Verify the generated CRL has no duplicate serial entries and subsequent refresh converges
+        X509Crl parsedAgreedCrl = new X509CrlParser().ReadCrl(agreedRefresh[0].PublishedCrl!.CrlDer);
+        var crlEntries = parsedAgreedCrl.GetRevokedCertificates();
+        int countFor03E9 = crlEntries.Cast<X509CrlEntry>().Count(e => e.SerialNumber.Equals(new BigInteger(1, [0x03, 0xE9])));
+        Assert.Equal(1, countFor03E9);
+        Assert.Empty(await caService.GetCertificateIdsWithUnpublishedRevocationsAsync());
+        Assert.Empty(await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24)));
+
+        // 4. Pre-existing CONFLICTING duplicate rows in database ("04B0" with KeyCompromise vs "0004B0" with Superseded)
+        int conflictId1;
+        int conflictId2;
+        using (IServiceScope scope = sp.CreateScope())
+        {
+            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord c1 = new()
+            {
+                CaAuthorityId = ca.Id,
+                SerialNumberHex = "04B0",
+                SerialNumberValue = 1200,
+                ProfileId = "legacy-imported",
+                CommonName = "conflict.contoso.com",
+                SubjectAlternativeNamesCsv = "conflict.contoso.com",
+                SubjectDistinguishedName = "CN=conflict.contoso.com",
+                IssuerDistinguishedName = "CN=ca.contoso.com",
+                KeyAlgorithm = "LEGACY",
+                KeySizeBits = 0,
+                ThumbprintSha256 = "LEGACY-04B0",
+                NotBeforeUtc = ca.NotBeforeUtc,
+                NotAfterUtc = ca.NotAfterUtc,
+                RequestedByUserId = "legacy",
+                RequestedByUserName = "admin",
+                Status = IssuanceStatus.Revoked,
+                CreatedAtUtc = agreedRevokedAt,
+                RevokedAtUtc = agreedRevokedAt,
+                RevocationReasonCode = CrlReason.KeyCompromise,
+                RevokedByUserName = "admin"
+            };
+            IssuedCertificateRecord c2 = new()
+            {
+                CaAuthorityId = ca.Id,
+                SerialNumberHex = "0004B0",
+                SerialNumberValue = 1200,
+                ProfileId = "legacy-imported",
+                CommonName = "conflict.contoso.com",
+                SubjectAlternativeNamesCsv = "conflict.contoso.com",
+                SubjectDistinguishedName = "CN=conflict.contoso.com",
+                IssuerDistinguishedName = "CN=ca.contoso.com",
+                KeyAlgorithm = "LEGACY",
+                KeySizeBits = 0,
+                ThumbprintSha256 = "LEGACY-0004B0",
+                NotBeforeUtc = ca.NotBeforeUtc,
+                NotAfterUtc = ca.NotAfterUtc,
+                RequestedByUserId = "legacy",
+                RequestedByUserName = "admin",
+                Status = IssuanceStatus.Revoked,
+                CreatedAtUtc = agreedRevokedAt,
+                RevokedAtUtc = agreedRevokedAt,
+                RevocationReasonCode = CrlReason.Superseded,
+                RevokedByUserName = "admin"
+            };
+            db.IssuedCertificates.AddRange(c1, c2);
+            await db.SaveChangesAsync();
+            conflictId1 = c1.Id;
+            conflictId2 = c2.Id;
+        }
+
+        long crlBeforeConflict = (await caService.GetLatestCrlAsync())!.CrlNumber;
+        IReadOnlySet<int> unpublishedWithConflict = await caService.GetCertificateIdsWithUnpublishedRevocationsAsync();
+        Assert.Contains(conflictId1, unpublishedWithConflict);
+        Assert.Contains(conflictId2, unpublishedWithConflict);
+
+        // Retries must expose the conflict without advancing CRL numbers
+        for (int i = 0; i < 2; i++)
+        {
+            IReadOnlyList<CrlRefreshOutcome> conflictRefresh = await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+            Assert.Single(conflictRefresh);
+            Assert.False(conflictRefresh[0].Succeeded);
+            Assert.Contains("Conflicting revocation records", conflictRefresh[0].ErrorMessage);
+            Assert.Contains("04B0", conflictRefresh[0].ErrorMessage);
+            Assert.Equal(crlBeforeConflict, (await caService.GetLatestCrlAsync())!.CrlNumber);
+        }
+
+        // Reconciling the conflicting serial via SeedRevokedSerialAsync deduplicates the rows and converges
+        RevocationOutcome reconciled = await caService.SeedRevokedSerialAsync(
+            "00:04:B0",
+            "conflict.contoso.com",
+            CrlReason.KeyCompromise,
+            "admin");
+        Assert.True(reconciled.CrlPublished);
+        Assert.Equal(crlBeforeConflict + 1, reconciled.PublishedCrl!.CrlNumber);
+        Assert.Empty(await caService.GetCertificateIdsWithUnpublishedRevocationsAsync());
+        Assert.Empty(await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24)));
+    }
+
+    [Fact]
+    public async Task ReviewFix_RealDatabasePersistenceFailure_OnOneIssuer_DoesNotContaminateOtherIssuerRefresh()
+    {
+        const string secret = "Disposable-Test-Secret-Only!2026";
+        string dbPath = Path.Combine(_tempRoot, "failure-isolation.db");
+        string caDir = Path.Combine(_tempRoot, "failure-isolation-ca");
+
+        using ServiceProvider sp = BuildServiceProvider(dbPath, caDir, configuredPassphrase: secret);
+        CertificateAuthorityService caService = sp.GetRequiredService<CertificateAuthorityService>();
+        ApplicationUser admin = await BootstrapAdminAsync(sp);
+
+        CaAuthorityRecord a = await caService.CreateSelfSignedOrIntermediateCaAsync(
+            "CA A", "a.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
+            CertificateKeyFamily.Ecdsa, 256, 365, secret);
+        IssuanceOutcome leafA = await IssueLeafAsync(caService, admin.Id, "a1.contoso.com");
+
+        CaAuthorityRecord b = await caService.CreateSelfSignedOrIntermediateCaAsync(
+            "CA B", "b.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
+            CertificateKeyFamily.Ecdsa, 256, 365, secret);
+        IssuanceOutcome leafB = await IssueLeafAsync(caService, admin.Id, "b1.contoso.com");
+
+        caService.LockRuntimePassphrase();
+        Assert.True((await caService.RevokeCertificateAsync(leafA.Record!.Id, CrlReason.KeyCompromise, "admin")).IsPendingPublication);
+        Assert.True((await caService.RevokeCertificateAsync(leafB.Record!.Id, CrlReason.KeyCompromise, "admin")).IsPendingPublication);
+        caService.UnlockRuntimePassphrase(secret);
+
+        using (IServiceScope scope = sp.CreateScope())
+        {
+            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+#pragma warning disable EF1002
+            await db.Database.ExecuteSqlRawAsync(
+                $"CREATE TRIGGER fail_first_issuer BEFORE INSERT ON PublishedCrls WHEN NEW.CaAuthorityId = {a.Id} BEGIN SELECT RAISE(ABORT, 'synthetic issuer-specific failure'); END;");
+#pragma warning restore EF1002
+        }
+
+        // Issuer A fails persistence, but Issuer B must succeed in its isolated context and advance to CRL #2
+        IReadOnlyList<CrlRefreshOutcome> results = await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+        Assert.False(results.Single(x => x.CaAuthorityId == a.Id).Succeeded);
+        Assert.True(results.Single(x => x.CaAuthorityId == b.Id).Succeeded, results.Single(x => x.CaAuthorityId == b.Id).ErrorMessage);
+        Assert.Equal(1, (await caService.GetLatestCrlAsync(caAuthorityId: a.Id))!.CrlNumber);
+        Assert.Equal(2, (await caService.GetLatestCrlAsync(caAuthorityId: b.Id))!.CrlNumber);
+
+        IReadOnlySet<int> stillPending = await caService.GetCertificateIdsWithUnpublishedRevocationsAsync();
+        Assert.Contains(leafA.Record.Id, stillPending);
+        Assert.DoesNotContain(leafB.Record.Id, stillPending);
+
+        using (IServiceScope scope = sp.CreateScope())
+        {
+            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            await db.Database.ExecuteSqlRawAsync("DROP TRIGGER fail_first_issuer;");
+        }
+
+        IReadOnlyList<CrlRefreshOutcome> retry = await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+        Assert.Single(retry);
+        Assert.Equal(a.Id, retry[0].CaAuthorityId);
+        Assert.True(retry[0].Succeeded, retry[0].ErrorMessage);
+        Assert.Equal(2, (await caService.GetLatestCrlAsync(caAuthorityId: a.Id))!.CrlNumber);
+        Assert.Equal(2, (await caService.GetLatestCrlAsync(caAuthorityId: b.Id))!.CrlNumber);
+        Assert.Empty(await caService.GetCertificateIdsWithUnpublishedRevocationsAsync());
+    }
+
+    [Fact]
+    public async Task ReviewFix_BackgroundService_WakesPromptlyOnPendingRevocationAndUnlock_AfterCleanScan()
+    {
+        const string secret = "BackgroundServiceWakeSecret!2026";
+        string dbPath = Path.Combine(_tempRoot, "bg-wake.db");
+        string caDir = Path.Combine(_tempRoot, "bg-wake-ca");
+
+        using ServiceProvider sp = BuildServiceProvider(dbPath, caDir);
+        CertificateAuthorityService caService = sp.GetRequiredService<CertificateAuthorityService>();
+        ApplicationUser admin = await BootstrapAdminAsync(sp);
+
+        CaAuthorityRecord ca = await caService.CreateSelfSignedOrIntermediateCaAsync(
+            "Background Wake CA", "wake.contoso.com", "US", "WA", "Redmond", "Contoso", "PKI",
+            CertificateKeyFamily.Ecdsa, 256, 365, secret);
+        IssuanceOutcome leaf1 = await IssueLeafAsync(caService, admin.Id, "wake1.contoso.com");
+        IssuanceOutcome leaf2 = await IssueLeafAsync(caService, admin.Id, "wake2.contoso.com");
+
+        var logger = sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<CrlRefreshBackgroundService>>();
+        using CrlRefreshBackgroundService bgService = new(
+            caService,
+            logger,
+            checkIntervalOverride: TimeSpan.FromMinutes(30),
+            pendingRetryIntervalOverride: TimeSpan.FromMilliseconds(100));
+
+        await bgService.StartAsync(CancellationToken.None);
+        try
+        {
+            // 1. Wait for the initial clean scan to complete; the background service is now parked in its 30-minute wait
+            await bgService.WaitForCompletedScanCountAsync(1, TimeSpan.FromSeconds(5));
+            Assert.Equal(1, (await caService.GetLatestCrlAsync(caAuthorityId: ca.Id))!.CrlNumber);
+
+            // 2. Lock the signer and revoke leaf1 AFTER the clean scan has already entered its 30-minute wait
+            caService.LockRuntimePassphrase();
+            RevocationOutcome lockedRevoke = await caService.RevokeCertificateAsync(
+                leaf1.Record!.Id,
+                CrlReason.KeyCompromise,
+                "admin");
+            Assert.True(lockedRevoke.IsPendingPublication);
+
+            // The pending revocation wakes the background service from its 30-minute sleep immediately
+            long afterPendingScan = await bgService.WaitForCompletedScanCountAsync(2, TimeSpan.FromSeconds(5));
+            Assert.True(afterPendingScan >= 2);
+            Assert.Equal(1, (await caService.GetLatestCrlAsync(caAuthorityId: ca.Id))!.CrlNumber);
+
+            // 3. Unlocking the signer signals the background service to publish CRL #2 immediately
+            caService.UnlockRuntimePassphrase(secret);
+            PublishedCrlRecord crl2 = await WaitForCrlNumberAsync(caService, ca.Id, expectedCrlNumber: 2, bgService, TimeSpan.FromSeconds(5));
+            Assert.Equal(2, crl2.CrlNumber);
+            Assert.True(CrlContainsSerial(crl2.CrlDer, leaf1.Record.SerialNumberHex, CrlReason.KeyCompromise));
+            Assert.Empty(await caService.GetCertificateIdsWithUnpublishedRevocationsAsync());
+
+            // Wait for the background service to settle into its clean 30-minute sleep
+            long settledScanCount = bgService.CompletedScanCount;
+            await Task.Delay(150);
+            if (bgService.CompletedScanCount > settledScanCount)
+            {
+                await Task.Delay(150);
+            }
+
+            // 4. Also verify a transient publication failure arriving after a clean scan wakes the 30-minute sleep
+            //    and retries automatically on the short pendingRetryInterval once the transient fault clears
+            int faultCount = 0;
+            caService.CrlPublicationFaultInjector = _ =>
+            {
+                if (Interlocked.Increment(ref faultCount) <= 2)
+                {
+                    throw new IOException("Transient CRL fault.");
+                }
+            };
+
+            RevocationOutcome transientOutcome = await caService.RevokeCertificateAsync(
+                leaf2.Record!.Id,
+                CrlReason.Superseded,
+                "admin");
+            Assert.True(transientOutcome.IsPendingPublication);
+
+            PublishedCrlRecord crl3 = await WaitForCrlNumberAsync(caService, ca.Id, expectedCrlNumber: 3, bgService, TimeSpan.FromSeconds(5));
+            caService.CrlPublicationFaultInjector = null;
+
+            Assert.Equal(3, crl3.CrlNumber);
+            Assert.True(CrlContainsSerial(crl3.CrlDer, leaf2.Record.SerialNumberHex, CrlReason.Superseded));
+            Assert.Empty(await caService.GetCertificateIdsWithUnpublishedRevocationsAsync());
+        }
+        finally
+        {
+            caService.CrlPublicationFaultInjector = null;
+            await bgService.StopAsync(CancellationToken.None);
+        }
+    }
+
+    private static async Task<PublishedCrlRecord> WaitForCrlNumberAsync(
+        CertificateAuthorityService caService,
+        int caAuthorityId,
+        long expectedCrlNumber,
+        CrlRefreshBackgroundService bgService,
+        TimeSpan timeout)
+    {
+        Stopwatch sw = Stopwatch.StartNew();
+        while (sw.Elapsed < timeout)
+        {
+            PublishedCrlRecord? latest = await caService.GetLatestCrlAsync(caAuthorityId: caAuthorityId);
+            if (latest != null && latest.CrlNumber >= expectedCrlNumber)
+            {
+                return latest;
+            }
+
+            long currentScans = bgService.CompletedScanCount;
+            TimeSpan remaining = timeout - sw.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+            {
+                break;
+            }
+
+            await bgService.WaitForCompletedScanCountAsync(currentScans + 1, remaining);
+        }
+
+        PublishedCrlRecord? finalCrl = await caService.GetLatestCrlAsync(caAuthorityId: caAuthorityId);
+        Assert.NotNull(finalCrl);
+        Assert.Equal(expectedCrlNumber, finalCrl.CrlNumber);
+        return finalCrl;
+    }
+
     private async Task<IssuanceOutcome> IssueLeafAsync(
         CertificateAuthorityService caService,
         string userId,
