@@ -69,6 +69,11 @@ CertRobo__PublicBaseUrl=http://pki.contoso.com
 CertRobo__CrlValidityHours=168
 ```
 
+> **Custody Model:** CertRobo enforces a single shared at-rest CA storage passphrase across the active issuer, any maintained historical issuers (whose CRLs must continue to be refreshed until expiry), and any pending external-CA request.
+> * When persistent custody is configured (`CertRobo__CaPassphraseFile`, `CERTROBO_CA_PASSPHRASE`, or `CertRobo__CaPassphrase`), initial CA creation, import, replacement, and runtime unlock must match the configured secret.
+> * When no persistent passphrase is configured (manual-unlock mode), the CA starts **Locked** after every service restart until an administrator unlocks it in `/admin`.
+> * When importing an existing CA from an encrypted PEM key or PKCS#12 (`.pfx`/`.p12`) bundle, the bundle's import decryption password may differ from CertRobo's at-rest CA storage passphrase.
+
 ### 4. Configure SELinux (`Enforcing`) and `systemd` Service
 
 When SELinux is `Enforcing`, label `/opt/certrobo/CertRobo` as `bin_t` so `systemd` can execute it, and enable `httpd_can_network_connect` so Nginx can proxy to Kestrel on `127.0.0.1:5000`:
@@ -317,6 +322,23 @@ sudo systemctl enable --now nginx.service
      sudo systemctl start certrobo.service
      ```
    * Note that rolling back to an earlier backup after certificates have been delivered to clients cannot undo trust in already-issued certificates; if importing an existing CA identity from AD CS, fence the old signer first, set the initial serial and CRL number floors above the highest previously issued values, and seed any unexpired revoked serials in `/admin`.
+   * **CA Key Custody Verification & Mixed-Passphrase Recovery:**
+     If a deployment previously encrypted a historical or replacement CA key with a different passphrase (or rotated `/etc/certrobo/ca.pass`), verify custody health and converge all stored keys to the configured shared custody secret without overwriting original `.p8.enc` key files:
+     ```bash
+     # 1. Take a consistent backup before modifying key custody
+     sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --backup /var/lib/certrobo/backups/pre-reprotect-backup.zip'
+
+     # 2. Inspect custody status across active, historical, and pending CA keys
+     sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --verify-ca-custody'
+
+     # 3. Re-protect any incompatible keys using a mode-0600 file containing the previous passphrase(s) (one per line)
+     sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --reprotect-ca-keys /etc/certrobo/legacy-ca.pass'
+     sudo shred -u /etc/certrobo/legacy-ca.pass
+
+     # 4. Re-verify custody and restart the service
+     sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --verify-ca-custody'
+     sudo systemctl restart certrobo.service
+     ```
 
 5. **Issuer-Specific Publication and Export Behavior**
    * Set `CertRobo__PublicBaseUrl` to the externally reachable plain-HTTP PKI origin. New authorities using default publication paths then receive stable issuer URLs such as `http://pki.contoso.com/authorities/3/issuer.crt` (DER AIA certificate) and `http://pki.contoso.com/authorities/3/ca.crl`. `/ca.crt`, `/ca.p7b`, `/issuer.crt`, `/ca.crl`, and `/ca.crl.pem` remain compatibility aliases for the active issuer; `/rootca.crt` returns only the trust anchor.

@@ -46,6 +46,48 @@ public sealed record CrlRefreshOutcome(
     PublishedCrlRecord? PublishedCrl,
     string? ErrorMessage);
 
+public sealed record CaAuthorityKeyCustodyStatus(
+    int CaAuthorityId,
+    string CaName,
+    bool IsActive,
+    bool IsIntermediate,
+    bool IsExpired,
+    int UnexpiredCertificateCount,
+    bool RequiresCrlMaintenance,
+    string EncryptedPrivateKeyPath,
+    bool KeyFileExists,
+    bool CanDecryptWithEffectivePassphrase,
+    bool CanDecryptWithConfiguredPassphrase,
+    string? FailureReason);
+
+public sealed record PendingCaKeyCustodyStatus(
+    int PendingEnrollmentId,
+    string CaName,
+    string EncryptedPrivateKeyPath,
+    bool KeyFileExists,
+    bool CanDecryptWithEffectivePassphrase,
+    bool CanDecryptWithConfiguredPassphrase,
+    string? FailureReason);
+
+public sealed record CaKeyCustodyReport(
+    bool HasConfiguredPersistentPassphrase,
+    string ConfiguredPersistentSource,
+    bool HasRuntimeUnlockedPassphrase,
+    bool IsExplicitlyLocked,
+    bool HasEffectivePassphrase,
+    bool RuntimeMatchesConfiguredPassphrase,
+    bool IsCustodyHealthy,
+    bool ActiveAuthorityDecryptable,
+    IReadOnlyList<CaAuthorityKeyCustodyStatus> Authorities,
+    PendingCaKeyCustodyStatus? PendingEnrollment);
+
+public sealed record CaKeyReprotectionResult(
+    bool Succeeded,
+    int ReprotectedAuthorityCount,
+    bool ReprotectedPendingEnrollment,
+    IReadOnlyList<int> ReprotectedAuthorityIds,
+    string SummaryMessage);
+
 /// <summary>
 /// Manages CA lifecycle (creation, import, encrypted key custody, unlock state),
 /// serial allocation, leaf certificate signing, post-issuance verification,
@@ -60,6 +102,7 @@ public sealed class CertificateAuthorityService
     private readonly CaKeyCustodyOptions _options;
 
     private string? _runtimeUnlockedPassphrase;
+    private bool _isExplicitlyLocked;
 
     public CertificateAuthorityService(
         IDbContextFactory<CertRoboDbContext> dbFactory,
@@ -71,18 +114,44 @@ public sealed class CertificateAuthorityService
         _options = options;
     }
 
-    public void UnlockRuntimePassphrase(string passphrase)
+    public void UnlockRuntimePassphrase(string passphrase) =>
+        UnlockRuntimePassphraseAsync(passphrase).GetAwaiter().GetResult();
+
+    public async Task UnlockRuntimePassphraseAsync(
+        string passphrase,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(passphrase))
         {
             throw new ArgumentException("Passphrase cannot be empty.", nameof(passphrase));
         }
-        _runtimeUnlockedPassphrase = passphrase;
+
+        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        try
+        {
+            await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
+            await db.EnsureSchemaUpgradedAsync(cancellationToken);
+
+            await ValidateCustodyCandidateCoreAsync(
+                db,
+                passphrase,
+                secondaryParentPassphrase: null,
+                requireExistingKeyForUnlock: true,
+                cancellationToken);
+
+            _runtimeUnlockedPassphrase = passphrase;
+            _isExplicitlyLocked = false;
+        }
+        finally
+        {
+            SigningAndSerialLock.Release();
+        }
     }
 
     public void LockRuntimePassphrase()
     {
         _runtimeUnlockedPassphrase = null;
+        _isExplicitlyLocked = true;
     }
 
     internal static Task AcquireLifecycleLockAsync(CancellationToken cancellationToken) =>
@@ -91,19 +160,17 @@ public sealed class CertificateAuthorityService
     internal static void ReleaseLifecycleLock() =>
         SigningAndSerialLock.Release();
 
-    public string? ResolveEffectivePassphrase()
-    {
-        if (!string.IsNullOrEmpty(_runtimeUnlockedPassphrase))
-        {
-            return _runtimeUnlockedPassphrase;
-        }
+    public string? ResolveConfiguredPassphrase() =>
+        ResolveConfiguredPassphraseWithSource().Passphrase;
 
+    public (string? Passphrase, string Source) ResolveConfiguredPassphraseWithSource()
+    {
         if (!string.IsNullOrEmpty(_options.PassphraseEnvironmentVariable))
         {
             string? envVal = Environment.GetEnvironmentVariable(_options.PassphraseEnvironmentVariable);
             if (!string.IsNullOrWhiteSpace(envVal))
             {
-                return envVal.Trim();
+                return (envVal.Trim(), $"environment variable '{_options.PassphraseEnvironmentVariable}'");
             }
         }
 
@@ -112,16 +179,451 @@ public sealed class CertificateAuthorityService
             string fileVal = File.ReadAllText(_options.PassphraseFilePath).Trim();
             if (!string.IsNullOrEmpty(fileVal))
             {
-                return fileVal;
+                return (fileVal, $"passphrase file '{_options.PassphraseFilePath}'");
             }
         }
 
         if (!string.IsNullOrWhiteSpace(_options.ConfiguredPassphrase))
         {
-            return _options.ConfiguredPassphrase;
+            return (_options.ConfiguredPassphrase, "configuration 'CertRobo:CaPassphrase'");
         }
 
-        return null;
+        return (null, "None");
+    }
+
+    public string? ResolveEffectivePassphrase()
+    {
+        if (_isExplicitlyLocked)
+        {
+            return null;
+        }
+
+        if (!string.IsNullOrEmpty(_runtimeUnlockedPassphrase))
+        {
+            return _runtimeUnlockedPassphrase;
+        }
+
+        return ResolveConfiguredPassphrase();
+    }
+
+    public async Task<CaKeyCustodyReport> InspectKeyCustodyAsync(
+        string? candidatePassphrase = null,
+        CancellationToken cancellationToken = default)
+    {
+        await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
+        await db.EnsureSchemaUpgradedAsync(cancellationToken);
+
+        (string? configuredPassphrase, string configuredSource) = ResolveConfiguredPassphraseWithSource();
+        string? effectivePassphrase = !string.IsNullOrEmpty(candidatePassphrase)
+            ? candidatePassphrase
+            : ResolveEffectivePassphrase();
+
+        bool hasConfigured = !string.IsNullOrEmpty(configuredPassphrase);
+        bool hasRuntime = !_isExplicitlyLocked && !string.IsNullOrEmpty(_runtimeUnlockedPassphrase);
+        bool hasEffective = !string.IsNullOrEmpty(effectivePassphrase);
+        bool runtimeMatchesConfigured = !hasConfigured
+            || string.IsNullOrEmpty(effectivePassphrase)
+            || PassphrasesEqual(effectivePassphrase, configuredPassphrase!);
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        List<CaAuthorityRecord> authorities = await db.CaAuthorities
+            .OrderBy(c => c.Id)
+            .ToListAsync(cancellationToken);
+
+        HashSet<int> authoritiesWithUnexpiredCerts = (await db.IssuedCertificates
+            .Where(c => c.CaAuthorityId.HasValue
+                     && (c.Status == IssuanceStatus.Issued || c.Status == IssuanceStatus.Revoked))
+            .ToListAsync(cancellationToken))
+            .Where(c => c.NotAfterUtc > now)
+            .Select(c => c.CaAuthorityId!.Value)
+            .ToHashSet();
+
+        Dictionary<int, int> unexpiredCountsByAuthority = (await db.IssuedCertificates
+            .Where(c => c.CaAuthorityId.HasValue
+                     && (c.Status == IssuanceStatus.Issued || c.Status == IssuanceStatus.Revoked))
+            .ToListAsync(cancellationToken))
+            .Where(c => c.NotAfterUtc > now)
+            .GroupBy(c => c.CaAuthorityId!.Value)
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        List<CaAuthorityKeyCustodyStatus> authorityStatuses = [];
+        bool allAuthoritiesHealthy = true;
+        bool activeDecryptable = false;
+
+        foreach (CaAuthorityRecord authority in authorities)
+        {
+            bool isExpired = authority.NotAfterUtc <= now;
+            int unexpiredCount = unexpiredCountsByAuthority.GetValueOrDefault(authority.Id, 0);
+            bool requiresMaintenance = authority.IsActive || (!isExpired && authoritiesWithUnexpiredCerts.Contains(authority.Id));
+            bool fileExists = File.Exists(authority.EncryptedPrivateKeyPath);
+
+            string? effectiveErr = null;
+            bool canDecryptEffective = hasEffective
+                && TryVerifyAuthorityKey(authority, effectivePassphrase, out effectiveErr);
+            string? failureReason = hasEffective
+                ? (canDecryptEffective ? null : effectiveErr)
+                : (fileExists ? "CA signing key is locked (no effective passphrase is active)." : $"Encrypted private key file '{Path.GetFileName(authority.EncryptedPrivateKeyPath)}' was not found.");
+
+            string? configuredErr = null;
+            bool canDecryptConfigured = hasConfigured
+                && TryVerifyAuthorityKey(authority, configuredPassphrase, out configuredErr);
+            if (hasConfigured && !canDecryptConfigured && failureReason == null)
+            {
+                failureReason = configuredErr;
+            }
+
+            if (authority.IsActive && canDecryptEffective && runtimeMatchesConfigured)
+            {
+                activeDecryptable = true;
+            }
+
+            bool authorityHealthy = fileExists
+                && (!hasEffective || canDecryptEffective)
+                && (!hasConfigured || canDecryptConfigured)
+                && runtimeMatchesConfigured;
+            if (!authorityHealthy)
+            {
+                allAuthoritiesHealthy = false;
+            }
+
+            authorityStatuses.Add(new(
+                authority.Id,
+                authority.Name,
+                authority.IsActive,
+                authority.IsIntermediate,
+                isExpired,
+                unexpiredCount,
+                requiresMaintenance,
+                authority.EncryptedPrivateKeyPath,
+                fileExists,
+                canDecryptEffective,
+                canDecryptConfigured,
+                failureReason));
+        }
+
+        PendingCaEnrollmentRecord? pending = await db.PendingCaEnrollments
+            .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
+                     && p.Status != PendingCaEnrollmentStatus.Cancelled)
+            .OrderByDescending(p => p.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        PendingCaKeyCustodyStatus? pendingStatus = null;
+        bool pendingHealthy = true;
+        if (pending != null)
+        {
+            bool pendingFileExists = File.Exists(pending.EncryptedPrivateKeyPath);
+            string? effPendingErr = null;
+            bool canDecryptEffective = hasEffective
+                && TryVerifyPendingKey(pending, effectivePassphrase, out effPendingErr);
+            string? pendingFailure = hasEffective
+                ? (canDecryptEffective ? null : effPendingErr)
+                : (pendingFileExists ? "Pending CA signing key is locked." : $"Encrypted pending private key file '{Path.GetFileName(pending.EncryptedPrivateKeyPath)}' was not found.");
+
+            string? cfgPendingErr = null;
+            bool canDecryptConfigured = hasConfigured
+                && TryVerifyPendingKey(pending, configuredPassphrase, out cfgPendingErr);
+            if (hasConfigured && !canDecryptConfigured && pendingFailure == null)
+            {
+                pendingFailure = cfgPendingErr;
+            }
+
+            pendingHealthy = pendingFileExists
+                && (!hasEffective || canDecryptEffective)
+                && (!hasConfigured || canDecryptConfigured)
+                && runtimeMatchesConfigured;
+
+            pendingStatus = new(
+                pending.Id,
+                pending.CaName,
+                pending.EncryptedPrivateKeyPath,
+                pendingFileExists,
+                canDecryptEffective,
+                canDecryptConfigured,
+                pendingFailure);
+        }
+
+        bool isHealthy = runtimeMatchesConfigured && allAuthoritiesHealthy && pendingHealthy;
+
+        return new(
+            hasConfigured,
+            configuredSource,
+            hasRuntime,
+            _isExplicitlyLocked,
+            hasEffective,
+            runtimeMatchesConfigured,
+            isHealthy,
+            activeDecryptable,
+            authorityStatuses,
+            pendingStatus);
+    }
+
+    /// <summary>
+    /// Explicit recovery/migration procedure to re-encrypt incompatible historical, active, or pending CA private keys
+    /// onto the shared target storage passphrase without overwriting existing encrypted key files or discarding issuers.
+    /// </summary>
+    public Task<CaKeyReprotectionResult> ReprotectCaKeysAsync(
+        string currentPassphrase,
+        string targetStoragePassphrase,
+        int? targetAuthorityId = null,
+        CancellationToken cancellationToken = default) =>
+        ReprotectCaKeysAsync([currentPassphrase], targetStoragePassphrase, targetAuthorityId, cancellationToken);
+
+    public async Task<CaKeyReprotectionResult> ReprotectCaKeysAsync(
+        IReadOnlyCollection<string> currentPassphrases,
+        string targetStoragePassphrase,
+        int? targetAuthorityId = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(targetStoragePassphrase))
+        {
+            throw new ArgumentException("A non-empty target storage passphrase is required.", nameof(targetStoragePassphrase));
+        }
+
+        List<string> sourceCandidates = (currentPassphrases ?? [])
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .ToList();
+        if (sourceCandidates.Count == 0)
+        {
+            throw new ArgumentException("At least one non-empty current key passphrase is required.", nameof(currentPassphrases));
+        }
+
+        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        try
+        {
+            await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
+            await db.EnsureSchemaUpgradedAsync(cancellationToken);
+
+            (string? configuredPassphrase, string configuredSource) = ResolveConfiguredPassphraseWithSource();
+            if (!string.IsNullOrEmpty(configuredPassphrase)
+                && !PassphrasesEqual(targetStoragePassphrase, configuredPassphrase))
+            {
+                throw new InvalidOperationException(
+                    $"Target storage passphrase must match the configured persistent CA custody secret ({configuredSource}). Update the configured custody secret first or re-protect keys to match it.");
+            }
+
+            List<CaAuthorityRecord> authorities = await db.CaAuthorities
+                .OrderBy(c => c.Id)
+                .ToListAsync(cancellationToken);
+
+            if (targetAuthorityId.HasValue && !authorities.Any(a => a.Id == targetAuthorityId.Value))
+            {
+                throw new InvalidOperationException($"CA authority #{targetAuthorityId.Value} was not found.");
+            }
+
+            List<PendingCaEnrollmentRecord> pendingEnrollments = targetAuthorityId.HasValue
+                ? []
+                : await db.PendingCaEnrollments
+                    .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
+                             && p.Status != PendingCaEnrollmentStatus.Cancelled)
+                    .OrderBy(p => p.Id)
+                    .ToListAsync(cancellationToken);
+
+            if (authorities.Count == 0 && pendingEnrollments.Count == 0)
+            {
+                throw new InvalidOperationException("No stored CA keys were found to re-protect.");
+            }
+
+            List<(CaAuthorityRecord Authority, string SourcePassphrase)> authoritiesToReprotect = [];
+            foreach (CaAuthorityRecord authority in authorities)
+            {
+                if (targetAuthorityId.HasValue && authority.Id != targetAuthorityId.Value)
+                {
+                    continue;
+                }
+
+                if (!File.Exists(authority.EncryptedPrivateKeyPath))
+                {
+                    throw new FileNotFoundException(
+                        $"Encrypted private key file for CA '{authority.Name}' (ID #{authority.Id}) was not found.",
+                        authority.EncryptedPrivateKeyPath);
+                }
+
+                if (TryVerifyAuthorityKey(authority, targetStoragePassphrase, out _))
+                {
+                    continue;
+                }
+
+                string? matchedSource = sourceCandidates.FirstOrDefault(
+                    candidate => TryVerifyAuthorityKey(authority, candidate, out _));
+                if (string.IsNullOrEmpty(matchedSource))
+                {
+                    throw new InvalidOperationException(
+                        $"Cannot re-protect CA '{authority.Name}' (ID #{authority.Id}): none of the supplied current passphrases unlocked its encrypted private key.");
+                }
+
+                authoritiesToReprotect.Add((authority, matchedSource));
+            }
+
+            List<(PendingCaEnrollmentRecord Pending, string SourcePassphrase)> pendingToReprotect = [];
+            foreach (PendingCaEnrollmentRecord pending in pendingEnrollments)
+            {
+                if (!File.Exists(pending.EncryptedPrivateKeyPath))
+                {
+                    throw new FileNotFoundException(
+                        $"Encrypted private key file for pending CA request '{pending.CaName}' (ID #{pending.Id}) was not found.",
+                        pending.EncryptedPrivateKeyPath);
+                }
+
+                if (TryVerifyPendingKey(pending, targetStoragePassphrase, out _))
+                {
+                    continue;
+                }
+
+                string? matchedSource = sourceCandidates.FirstOrDefault(
+                    candidate => TryVerifyPendingKey(pending, candidate, out _));
+                if (string.IsNullOrEmpty(matchedSource))
+                {
+                    throw new InvalidOperationException(
+                        $"Cannot re-protect pending CA request '{pending.CaName}' (ID #{pending.Id}): none of the supplied current passphrases unlocked its encrypted private key.");
+                }
+
+                pendingToReprotect.Add((pending, matchedSource));
+            }
+
+            Directory.CreateDirectory(_options.StorageDirectory);
+            string backupDir = Path.Combine(_options.StorageDirectory, "recovery-backups");
+            Directory.CreateDirectory(backupDir);
+            if (!OperatingSystem.IsWindows())
+            {
+                try
+                {
+                    File.SetUnixFileMode(backupDir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                }
+                catch
+                {
+                }
+            }
+
+            List<string> createdKeyPaths = [];
+            List<(CaAuthorityRecord Authority, string NewKeyPath)> stagedAuthorityUpdates = [];
+            List<(PendingCaEnrollmentRecord Pending, string NewKeyPath)> stagedPendingUpdates = [];
+
+            try
+            {
+                foreach ((CaAuthorityRecord authority, string srcPass) in authoritiesToReprotect)
+                {
+                    // Preserve a non-overwritten backup copy in recovery-backups while also leaving the original .p8.enc file untouched
+                    string backupFileName = $"{Path.GetFileName(authority.EncryptedPrivateKeyPath)}.bak-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}"[..Math.Min(96, Path.GetFileName(authority.EncryptedPrivateKeyPath).Length + 28)];
+                    string backupFilePath = Path.Combine(backupDir, backupFileName);
+                    File.Copy(authority.EncryptedPrivateKeyPath, backupFilePath, overwrite: false);
+                    RestrictFilePermissionsIfUnix(backupFilePath);
+
+                    using AsymmetricAlgorithm key = LoadEncryptedKey(authority.EncryptedPrivateKeyPath, srcPass);
+                    byte[] reencryptedPkcs8 = key.ExportEncryptedPkcs8PrivateKey(
+                        targetStoragePassphrase,
+                        new PbeParameters(
+                            PbeEncryptionAlgorithm.Aes256Cbc,
+                            HashAlgorithmName.SHA256,
+                            iterationCount: 100_000));
+
+                    string newKeyFilePath = Path.Combine(_options.StorageDirectory, $"ca-key-{Guid.NewGuid():N}.p8.enc");
+                    if (File.Exists(newKeyFilePath))
+                    {
+                        throw new IOException("Refusing to overwrite an existing encrypted CA key file.");
+                    }
+
+                    await File.WriteAllBytesAsync(newKeyFilePath, reencryptedPkcs8, cancellationToken);
+                    RestrictFilePermissionsIfUnix(newKeyFilePath);
+                    createdKeyPaths.Add(newKeyFilePath);
+
+                    // Verify newly written key file on disk before updating database record
+                    using AsymmetricAlgorithm verifiedKey = LoadEncryptedKey(newKeyFilePath, targetStoragePassphrase);
+                    using X509Certificate2 cert = X509Certificate2.CreateFromPem(authority.IssuerCertificatePem);
+                    if (!cert.PublicKey.ExportSubjectPublicKeyInfo().SequenceEqual(ExportPublicKeySpki(verifiedKey)))
+                    {
+                        throw new CryptographicException(
+                            $"Re-protected key verification failed for CA '{authority.Name}' (ID #{authority.Id}).");
+                    }
+
+                    stagedAuthorityUpdates.Add((authority, newKeyFilePath));
+                }
+
+                foreach ((PendingCaEnrollmentRecord pending, string srcPass) in pendingToReprotect)
+                {
+                    string backupFileName = $"{Path.GetFileName(pending.EncryptedPrivateKeyPath)}.bak-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}"[..Math.Min(96, Path.GetFileName(pending.EncryptedPrivateKeyPath).Length + 28)];
+                    string backupFilePath = Path.Combine(backupDir, backupFileName);
+                    File.Copy(pending.EncryptedPrivateKeyPath, backupFilePath, overwrite: false);
+                    RestrictFilePermissionsIfUnix(backupFilePath);
+
+                    using AsymmetricAlgorithm key = LoadEncryptedKey(pending.EncryptedPrivateKeyPath, srcPass);
+                    byte[] reencryptedPkcs8 = key.ExportEncryptedPkcs8PrivateKey(
+                        targetStoragePassphrase,
+                        new PbeParameters(
+                            PbeEncryptionAlgorithm.Aes256Cbc,
+                            HashAlgorithmName.SHA256,
+                            iterationCount: 100_000));
+
+                    string newKeyFilePath = Path.Combine(_options.StorageDirectory, $"ca-pending-key-{Guid.NewGuid():N}.p8.enc");
+                    if (File.Exists(newKeyFilePath))
+                    {
+                        throw new IOException("Refusing to overwrite an existing encrypted pending CA key file.");
+                    }
+
+                    await File.WriteAllBytesAsync(newKeyFilePath, reencryptedPkcs8, cancellationToken);
+                    RestrictFilePermissionsIfUnix(newKeyFilePath);
+                    createdKeyPaths.Add(newKeyFilePath);
+
+                    using AsymmetricAlgorithm verifiedKey = LoadEncryptedKey(newKeyFilePath, targetStoragePassphrase);
+                    string spkiHex = Convert.ToHexString(SHA256.HashData(ExportPublicKeySpki(verifiedKey)));
+                    if (!spkiHex.Equals(pending.PublicKeySpkiSha256Hex, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new CryptographicException(
+                            $"Re-protected key verification failed for pending CA request '{pending.CaName}' (ID #{pending.Id}).");
+                    }
+
+                    stagedPendingUpdates.Add((pending, newKeyFilePath));
+                }
+
+                await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+                foreach ((CaAuthorityRecord authority, string newKeyPath) in stagedAuthorityUpdates)
+                {
+                    authority.EncryptedPrivateKeyPath = newKeyPath;
+                }
+                foreach ((PendingCaEnrollmentRecord pending, string newKeyPath) in stagedPendingUpdates)
+                {
+                    pending.EncryptedPrivateKeyPath = newKeyPath;
+                }
+                await db.SaveChangesAsync(cancellationToken);
+                await tx.CommitAsync(cancellationToken);
+            }
+            catch
+            {
+                foreach (string createdPath in createdKeyPaths)
+                {
+                    try
+                    {
+                        if (File.Exists(createdPath))
+                        {
+                            File.Delete(createdPath);
+                        }
+                    }
+                    catch
+                    {
+                        // Preserve original exception
+                    }
+                }
+                throw;
+            }
+
+            bool allNowUnified = authorities.All(a => TryVerifyAuthorityKey(a, targetStoragePassphrase, out _))
+                && pendingEnrollments.All(p => TryVerifyPendingKey(p, targetStoragePassphrase, out _));
+            if (allNowUnified && !_isExplicitlyLocked)
+            {
+                _runtimeUnlockedPassphrase = targetStoragePassphrase;
+            }
+
+            IReadOnlyList<int> reprotectedIds = stagedAuthorityUpdates.Select(u => u.Authority.Id).ToList();
+            return new(
+                true,
+                reprotectedIds.Count,
+                stagedPendingUpdates.Count > 0,
+                reprotectedIds,
+                $"Re-protected {reprotectedIds.Count} CA authority key(s){(stagedPendingUpdates.Count > 0 ? " and 1 pending CA key" : "")} to the shared storage passphrase. Original encrypted key files were preserved untouched.");
+        }
+        finally
+        {
+            SigningAndSerialLock.Release();
+        }
     }
 
     public async Task<CaAuthorityRecord?> GetActiveAuthorityAsync(CancellationToken cancellationToken = default)
@@ -233,39 +735,6 @@ public sealed class CertificateAuthorityService
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
             await db.EnsureSchemaUpgradedAsync(cancellationToken);
 
-            CaAuthorityRecord? activeAuthority = await db.CaAuthorities
-                .OrderByDescending(c => c.Id)
-                .FirstOrDefaultAsync(c => c.IsActive, cancellationToken);
-            if (activeAuthority != null)
-            {
-                string? effectiveActivePassphrase = ResolveEffectivePassphrase();
-                if (!string.IsNullOrEmpty(effectiveActivePassphrase))
-                {
-                    if (!CryptographicOperations.FixedTimeEquals(
-                            Encoding.UTF8.GetBytes(passphrase),
-                            Encoding.UTF8.GetBytes(effectiveActivePassphrase)))
-                    {
-                        throw new InvalidOperationException(
-                            "A replacement pending CA key must use the same configured CA storage passphrase as the active issuer so the current CA remains operational during enrolment.");
-                    }
-                    passphrase = effectiveActivePassphrase;
-                }
-                else
-                {
-                    try
-                    {
-                        using AsymmetricAlgorithm _ = LoadEncryptedKey(
-                            activeAuthority.EncryptedPrivateKeyPath,
-                            passphrase);
-                    }
-                    catch
-                    {
-                        throw new InvalidOperationException(
-                            "The supplied storage passphrase does not unlock the active CA. Unlock the active CA or use its storage passphrase before creating a replacement request.");
-                    }
-                }
-            }
-
             PendingCaEnrollmentRecord? existingPending = await db.PendingCaEnrollments
                 .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
                          && p.Status != PendingCaEnrollmentStatus.Cancelled)
@@ -277,6 +746,13 @@ public sealed class CertificateAuthorityService
                 throw new InvalidOperationException(
                     $"A pending external CA enrolment request ('{existingPending.CaName}') already exists. Review, complete, or cancel the existing request before generating a new CSR.");
             }
+
+            await ValidateCustodyCandidateCoreAsync(
+                db,
+                passphrase,
+                secondaryParentPassphrase: null,
+                requireExistingKeyForUnlock: false,
+                cancellationToken);
 
             using AsymmetricAlgorithm subjectKey = CreateDotNetAsymmetricKey(keyFamily, keyBits);
             X500DistinguishedName subjectDn = BuildX500DistinguishedName(
@@ -360,10 +836,8 @@ public sealed class CertificateAuthorityService
             db.PendingCaEnrollments.Add(record);
             await db.SaveChangesAsync(cancellationToken);
 
-            if (string.IsNullOrEmpty(_runtimeUnlockedPassphrase))
-            {
-                _runtimeUnlockedPassphrase = passphrase;
-            }
+            _runtimeUnlockedPassphrase = passphrase;
+            _isExplicitlyLocked = false;
 
             return record;
         }
@@ -446,7 +920,17 @@ public sealed class CertificateAuthorityService
             AsymmetricAlgorithm pendingKey;
             try
             {
+                await ValidateCustodyCandidateCoreAsync(
+                    db,
+                    passphrase,
+                    secondaryParentPassphrase: null,
+                    requireExistingKeyForUnlock: true,
+                    cancellationToken);
                 pendingKey = LoadEncryptedKey(pending.EncryptedPrivateKeyPath, passphrase);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return new(false, ex.Message, null, null, null);
             }
             catch (Exception)
             {
@@ -548,10 +1032,8 @@ public sealed class CertificateAuthorityService
                     pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
                     await db.SaveChangesAsync(cancellationToken);
 
-                    if (string.IsNullOrEmpty(_runtimeUnlockedPassphrase))
-                    {
-                        _runtimeUnlockedPassphrase = passphrase;
-                    }
+                    _runtimeUnlockedPassphrase = passphrase;
+                    _isExplicitlyLocked = false;
 
                     return validation;
                 }
@@ -614,6 +1096,13 @@ public sealed class CertificateAuthorityService
             {
                 throw new InvalidOperationException("CA passphrase is required to unlock the pending private key and sign initial CRL #1.");
             }
+
+            await ValidateCustodyCandidateCoreAsync(
+                db,
+                passphrase,
+                secondaryParentPassphrase: null,
+                requireExistingKeyForUnlock: true,
+                cancellationToken);
 
             using AsymmetricAlgorithm pendingKey = LoadEncryptedKey(pending.EncryptedPrivateKeyPath, passphrase);
 
@@ -691,6 +1180,7 @@ public sealed class CertificateAuthorityService
                 await tx.CommitAsync(cancellationToken);
 
                 _runtimeUnlockedPassphrase = passphrase;
+                _isExplicitlyLocked = false;
                 await WritePublicTrustFilesAsync(newAuthority, cancellationToken);
 
                 return newAuthority;
@@ -884,6 +1374,24 @@ public sealed class CertificateAuthorityService
         try
         {
             await ThrowIfUnfinishedPendingEnrollmentExistsAsync(cancellationToken);
+            await using (CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken))
+            {
+                await db.EnsureSchemaUpgradedAsync(cancellationToken);
+                await ValidateCustodyCandidateCoreAsync(
+                    db,
+                    passphrase,
+                    secondaryParentPassphrase: parentPassphrase,
+                    requireExistingKeyForUnlock: false,
+                    cancellationToken);
+
+                if (parentAuthority != null
+                    && !TryVerifyAuthorityKey(parentAuthority, passphrase, out string? parentErr))
+                {
+                    throw new InvalidOperationException(
+                        $"Parent CA '{parentAuthority.Name}' (ID #{parentAuthority.Id}) could not be unlocked with the supplied storage passphrase: {parentErr}");
+                }
+            }
+
             using AsymmetricAlgorithm subjectKey = CreateDotNetAsymmetricKey(keyFamily, keyBits);
             X500DistinguishedName subjectDn = BuildX500DistinguishedName(
                 subjectCommonName, country, stateOrProvince, locality, organization, organizationalUnit);
@@ -1045,6 +1553,17 @@ public sealed class CertificateAuthorityService
 
             ValidateCaCertificateAndKeyMatch(cert, key, chainCertsPem, out bool isIntermediate, out string normalizedChainPem);
 
+            await using (CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken))
+            {
+                await db.EnsureSchemaUpgradedAsync(cancellationToken);
+                await ValidateCustodyCandidateCoreAsync(
+                    db,
+                    storagePassphrase,
+                    secondaryParentPassphrase: null,
+                    requireExistingKeyForUnlock: false,
+                    cancellationToken);
+            }
+
             byte[] encryptedPkcs8 = key.ExportEncryptedPkcs8PrivateKey(
                 storagePassphrase,
                 new PbeParameters(
@@ -1105,10 +1624,21 @@ public sealed class CertificateAuthorityService
         try
         {
             await ThrowIfUnfinishedPendingEnrollmentExistsAsync(cancellationToken);
-            X509Certificate2Collection collection = X509CertificateLoader.LoadPkcs12Collection(
-                pkcs12Bytes,
-                pkcs12Password,
-                X509KeyStorageFlags.Exportable);
+            X509Certificate2Collection collection;
+            try
+            {
+                collection = X509CertificateLoader.LoadPkcs12Collection(
+                    pkcs12Bytes,
+                    pkcs12Password,
+                    X509KeyStorageFlags.Exportable);
+            }
+            catch (CryptographicException ex)
+            {
+                throw new ArgumentException(
+                    "Failed to decrypt or load the PKCS#12 archive using the supplied import bundle password.",
+                    nameof(pkcs12Password),
+                    ex);
+            }
 
             X509Certificate2? caCertWithKey = collection.FirstOrDefault(c => c.HasPrivateKey)
                 ?? throw new ArgumentException("PKCS#12 archive does not contain a certificate with a private key.");
@@ -1130,6 +1660,17 @@ public sealed class CertificateAuthorityService
                 extraChainBuilder.ToString(),
                 out bool isIntermediate,
                 out string normalizedChainPem);
+
+            await using (CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken))
+            {
+                await db.EnsureSchemaUpgradedAsync(cancellationToken);
+                await ValidateCustodyCandidateCoreAsync(
+                    db,
+                    storagePassphrase,
+                    secondaryParentPassphrase: null,
+                    requireExistingKeyForUnlock: false,
+                    cancellationToken);
+            }
 
             byte[] encryptedPkcs8 = key.ExportEncryptedPkcs8PrivateKey(
                 storagePassphrase,
@@ -1214,6 +1755,11 @@ public sealed class CertificateAuthorityService
             if (string.IsNullOrEmpty(passphrase))
             {
                 return new(false, "CA signing key is locked. An administrator must unlock the CA or configure the passphrase.", null, null, null);
+            }
+
+            if (!TryVerifyAuthorityKey(ca, passphrase, out string? keyUnlockError))
+            {
+                return new(false, $"Certificate signing failed: {keyUnlockError}", null, null, null);
             }
 
             // Ensure an initial CRL has been published before issuing certificates referencing it
@@ -1600,6 +2146,11 @@ public sealed class CertificateAuthorityService
                 throw new InvalidOperationException("Cannot refresh CRL while CA signing key is locked.");
             }
 
+            if (!TryVerifyAuthorityKey(ca, passphrase, out string? keyUnlockError))
+            {
+                throw new InvalidOperationException($"Cannot refresh CRL for CA '{ca.Name}': {keyUnlockError}");
+            }
+
             return await GenerateAndPersistCrlInternalAsync(db, ca, passphrase, cancellationToken);
         }
         finally
@@ -1644,6 +2195,18 @@ public sealed class CertificateAuthorityService
                     || authoritiesWithUnexpiredCertificates.Contains(authority.Id);
                 if (!shouldMaintain)
                 {
+                    continue;
+                }
+
+                if (!string.IsNullOrEmpty(passphrase)
+                    && !TryVerifyAuthorityKey(authority, passphrase, out string? custodyErr))
+                {
+                    outcomes.Add(new(
+                        authority.Id,
+                        authority.Name,
+                        false,
+                        null,
+                        $"Could not refresh CRL for stored issuer '{authority.Name}': {custodyErr}"));
                     continue;
                 }
 
@@ -1818,6 +2381,7 @@ public sealed class CertificateAuthorityService
             await tx.CommitAsync(cancellationToken);
 
             _runtimeUnlockedPassphrase = passphrase;
+            _isExplicitlyLocked = false;
 
             // Also update static/rootca.crt if writable so static/legacy links see the current trust chain.
             await WritePublicTrustFilesAsync(record, cancellationToken);
@@ -2449,6 +3013,182 @@ public sealed class CertificateAuthorityService
         };
     }
 
+    private async Task ValidateCustodyCandidateCoreAsync(
+        CertRoboDbContext db,
+        string candidatePassphrase,
+        string? secondaryParentPassphrase,
+        bool requireExistingKeyForUnlock,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(candidatePassphrase))
+        {
+            throw new ArgumentException("A non-empty CA storage passphrase is required.", nameof(candidatePassphrase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(secondaryParentPassphrase)
+            && !PassphrasesEqual(candidatePassphrase, secondaryParentPassphrase))
+        {
+            throw new InvalidOperationException(
+                "The subordinate CA storage passphrase must match the parent CA storage passphrase under the shared custody policy.");
+        }
+
+        (string? configuredPassphrase, string configuredSource) = ResolveConfiguredPassphraseWithSource();
+        if (!string.IsNullOrEmpty(configuredPassphrase)
+            && !PassphrasesEqual(candidatePassphrase, configuredPassphrase))
+        {
+            throw new InvalidOperationException(
+                $"The supplied CA storage passphrase does not match the configured persistent CA custody secret ({configuredSource}). All CA keys must use the same custody passphrase so the active issuer and historical CRLs remain operational across restarts.");
+        }
+
+        if (!requireExistingKeyForUnlock
+            && !_isExplicitlyLocked
+            && !string.IsNullOrEmpty(_runtimeUnlockedPassphrase)
+            && !PassphrasesEqual(candidatePassphrase, _runtimeUnlockedPassphrase))
+        {
+            throw new InvalidOperationException(
+                "The supplied CA storage passphrase does not match the currently unlocked runtime CA passphrase. All active and historical CA keys must share one storage passphrase.");
+        }
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        List<CaAuthorityRecord> authorities = await db.CaAuthorities
+            .OrderBy(c => c.Id)
+            .ToListAsync(cancellationToken);
+
+        List<PendingCaEnrollmentRecord> pendingEnrollments = await db.PendingCaEnrollments
+            .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
+                     && p.Status != PendingCaEnrollmentStatus.Cancelled)
+            .OrderBy(p => p.Id)
+            .ToListAsync(cancellationToken);
+
+        if (requireExistingKeyForUnlock && authorities.Count == 0 && pendingEnrollments.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "No CA signing key is configured to unlock. Provision, import, or request a CA first.");
+        }
+
+        HashSet<int> authoritiesWithUnexpiredCerts = (await db.IssuedCertificates
+            .Where(c => c.CaAuthorityId.HasValue
+                     && (c.Status == IssuanceStatus.Issued || c.Status == IssuanceStatus.Revoked))
+            .ToListAsync(cancellationToken))
+            .Where(c => c.NotAfterUtc > now)
+            .Select(c => c.CaAuthorityId!.Value)
+            .ToHashSet();
+
+        foreach (CaAuthorityRecord authority in authorities)
+        {
+            bool requiresMaintenance = authority.IsActive
+                || (authority.NotAfterUtc > now && authoritiesWithUnexpiredCerts.Contains(authority.Id));
+            bool shouldVerify = requiresMaintenance
+                || authority.NotAfterUtc > now
+                || File.Exists(authority.EncryptedPrivateKeyPath);
+
+            if (!shouldVerify)
+            {
+                continue;
+            }
+
+            if (!TryVerifyAuthorityKey(authority, candidatePassphrase, out string? keyErr))
+            {
+                string roleDesc = authority.IsActive ? "active" : (requiresMaintenance ? "maintained historical" : "stored historical");
+                throw new InvalidOperationException(
+                    $"CA key custody validation failed for {roleDesc} CA '{authority.Name}' (ID #{authority.Id}): {keyErr} All active and maintained historical CA keys must share one storage passphrase. If existing keys use mixed passphrases, run the CA key custody recovery/re-protection procedure.");
+            }
+        }
+
+        foreach (PendingCaEnrollmentRecord pending in pendingEnrollments)
+        {
+            if (!TryVerifyPendingKey(pending, candidatePassphrase, out string? pendingErr))
+            {
+                throw new InvalidOperationException(
+                    $"CA key custody validation failed for pending CA request '{pending.CaName}' (ID #{pending.Id}): {pendingErr}");
+            }
+        }
+    }
+
+    private static bool TryVerifyAuthorityKey(
+        CaAuthorityRecord authority,
+        string? passphrase,
+        out string? error)
+    {
+        error = null;
+        if (!File.Exists(authority.EncryptedPrivateKeyPath))
+        {
+            error = $"Encrypted private key file '{Path.GetFileName(authority.EncryptedPrivateKeyPath)}' for CA '{authority.Name}' (ID #{authority.Id}) was not found.";
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(passphrase))
+        {
+            error = $"No CA storage passphrase is available to unlock CA '{authority.Name}' (ID #{authority.Id}).";
+            return false;
+        }
+
+        try
+        {
+            using AsymmetricAlgorithm key = LoadEncryptedKey(authority.EncryptedPrivateKeyPath, passphrase);
+            using X509Certificate2 cert = X509Certificate2.CreateFromPem(authority.IssuerCertificatePem);
+            byte[] certSpki = cert.PublicKey.ExportSubjectPublicKeyInfo();
+            byte[] keySpki = ExportPublicKeySpki(key);
+            if (!certSpki.SequenceEqual(keySpki))
+            {
+                error = $"Decrypted private key for CA '{authority.Name}' (ID #{authority.Id}) does not match its certificate public key.";
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception)
+        {
+            error = $"CA '{authority.Name}' (ID #{authority.Id}) private key could not be unlocked with the supplied passphrase.";
+            return false;
+        }
+    }
+
+    private static bool TryVerifyPendingKey(
+        PendingCaEnrollmentRecord pending,
+        string? passphrase,
+        out string? error)
+    {
+        error = null;
+        if (!File.Exists(pending.EncryptedPrivateKeyPath))
+        {
+            error = $"Encrypted private key file '{Path.GetFileName(pending.EncryptedPrivateKeyPath)}' for pending CA request '{pending.CaName}' (ID #{pending.Id}) was not found.";
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(passphrase))
+        {
+            error = $"No CA storage passphrase is available to unlock pending CA request '{pending.CaName}' (ID #{pending.Id}).";
+            return false;
+        }
+
+        try
+        {
+            using AsymmetricAlgorithm key = LoadEncryptedKey(pending.EncryptedPrivateKeyPath, passphrase);
+            byte[] spkiDer = ExportPublicKeySpki(key);
+            string spkiSha256Hex = Convert.ToHexString(SHA256.HashData(spkiDer));
+            if (!spkiSha256Hex.Equals(pending.PublicKeySpkiSha256Hex, StringComparison.OrdinalIgnoreCase))
+            {
+                error = $"Decrypted private key for pending CA request '{pending.CaName}' (ID #{pending.Id}) does not match its CSR public key.";
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception)
+        {
+            error = $"Pending CA request '{pending.CaName}' (ID #{pending.Id}) private key could not be unlocked with the supplied passphrase.";
+            return false;
+        }
+    }
+
+    private static bool PassphrasesEqual(string a, string b)
+    {
+        byte[] aBytes = Encoding.UTF8.GetBytes(a);
+        byte[] bBytes = Encoding.UTF8.GetBytes(b);
+        return CryptographicOperations.FixedTimeEquals(aBytes, bBytes);
+    }
+
     private static AsymmetricAlgorithm LoadEncryptedKey(string encryptedKeyPath, string passphrase)
     {
         if (!File.Exists(encryptedKeyPath))
@@ -2490,32 +3230,50 @@ public sealed class CertificateAuthorityService
             throw new ArgumentException("Imported CA private key could not be decoded.", nameof(privateKeyPem), ex);
         }
 
-        string oid = cert.PublicKey.Oid.Value ?? string.Empty;
-        if (oid == "1.2.840.113549.1.1.1") // RSA
+        bool isEncryptedPem = privateKeyPem.Contains("ENCRYPTED", StringComparison.OrdinalIgnoreCase);
+        if (isEncryptedPem && string.IsNullOrEmpty(passphrase))
         {
-            RSA rsa = RSA.Create();
-            if (!string.IsNullOrEmpty(passphrase) && privateKeyPem.Contains("ENCRYPTED", StringComparison.OrdinalIgnoreCase))
-            {
-                rsa.ImportFromEncryptedPem(privateKeyPem, passphrase);
-            }
-            else
-            {
-                rsa.ImportFromPem(privateKeyPem);
-            }
-            return rsa;
+            throw new ArgumentException(
+                "Imported CA private key PEM is encrypted; an input key decryption passphrase is required.",
+                nameof(passphrase));
         }
-        else
+
+        string oid = cert.PublicKey.Oid.Value ?? string.Empty;
+        try
         {
-            ECDsa ecdsa = ECDsa.Create();
-            if (!string.IsNullOrEmpty(passphrase) && privateKeyPem.Contains("ENCRYPTED", StringComparison.OrdinalIgnoreCase))
+            if (oid == "1.2.840.113549.1.1.1") // RSA
             {
-                ecdsa.ImportFromEncryptedPem(privateKeyPem, passphrase);
+                RSA rsa = RSA.Create();
+                if (isEncryptedPem)
+                {
+                    rsa.ImportFromEncryptedPem(privateKeyPem, passphrase);
+                }
+                else
+                {
+                    rsa.ImportFromPem(privateKeyPem);
+                }
+                return rsa;
             }
             else
             {
-                ecdsa.ImportFromPem(privateKeyPem);
+                ECDsa ecdsa = ECDsa.Create();
+                if (isEncryptedPem)
+                {
+                    ecdsa.ImportFromEncryptedPem(privateKeyPem, passphrase);
+                }
+                else
+                {
+                    ecdsa.ImportFromPem(privateKeyPem);
+                }
+                return ecdsa;
             }
-            return ecdsa;
+        }
+        catch (CryptographicException ex) when (isEncryptedPem)
+        {
+            throw new ArgumentException(
+                "Failed to decrypt the imported CA private key PEM using the supplied input key passphrase.",
+                nameof(passphrase),
+                ex);
         }
     }
 
