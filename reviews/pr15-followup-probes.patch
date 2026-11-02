@@ -1,0 +1,90 @@
+diff --git a/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs b/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
+index 2a863b1..6f2a258 100644
+--- a/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
++++ b/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
+@@ -1155,0 +1156,85 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
++    [Fact]
++    public async Task ReviewProbe_RevokeMustPreserveEquivalentSerialLedgerRecords()
++    {
++        const string secret = "Disposable-Test-Secret-Only!2026";
++        string dbPath = Path.Combine(_tempRoot, "preserve-ledger.db");
++        string caDir = Path.Combine(_tempRoot, "preserve-ledger-ca");
++        using ServiceProvider sp = BuildServiceProvider(dbPath, caDir, configuredPassphrase: secret);
++        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
++        ApplicationUser admin = await BootstrapAdminAsync(sp);
++        CaAuthorityRecord ca = await service.CreateSelfSignedOrIntermediateCaAsync(
++            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
++            CertificateKeyFamily.Ecdsa, 256, 365, secret);
++        IssuanceOutcome leaf = await IssueLeafAsync(service, admin.Id, "host.contoso.com");
++        int duplicateId;
++        using (IServiceScope scope = sp.CreateScope())
++        {
++            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++            IssuedCertificateRecord duplicate = new()
++            {
++                CaAuthorityId = ca.Id,
++                SerialNumberHex = "00" + leaf.Record!.SerialNumberHex,
++                SerialNumberValue = leaf.Record.SerialNumberValue,
++                ProfileId = leaf.Record.ProfileId,
++                CommonName = "other-certificate.contoso.com",
++                SubjectAlternativeNamesCsv = "other-certificate.contoso.com",
++                SubjectDistinguishedName = "CN=other-certificate.contoso.com",
++                IssuerDistinguishedName = leaf.Record.IssuerDistinguishedName,
++                KeyAlgorithm = leaf.Record.KeyAlgorithm,
++                KeySizeBits = leaf.Record.KeySizeBits,
++                ThumbprintSha256 = "DIFFERENT-HISTORICAL-RECORD",
++                CertificatePem = leaf.Record.CertificatePem,
++                ChainPem = leaf.Record.ChainPem,
++                NotBeforeUtc = leaf.Record.NotBeforeUtc,
++                NotAfterUtc = leaf.Record.NotAfterUtc,
++                RequestedByUserId = admin.Id,
++                RequestedByUserName = "other-operator",
++                Status = IssuanceStatus.Issued
++            };
++            db.IssuedCertificates.Add(duplicate);
++            await db.SaveChangesAsync();
++            duplicateId = duplicate.Id;
++        }
++        RevocationOutcome outcome = await service.RevokeCertificateAsync(leaf.Record!.Id, CrlReason.KeyCompromise, "admin");
++        Assert.True(outcome.RevocationAccepted);
++        using IServiceScope checkScope = sp.CreateScope();
++        CertRoboDbContext checkDb = checkScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++        Assert.NotNull(await checkDb.IssuedCertificates.FindAsync(duplicateId));
++    }
++
++    [Fact]
++    public async Task ReviewProbe_UnreadablePassphraseThrowsAfterPersistingRevocation()
++    {
++        if (OperatingSystem.IsWindows()) return;
++        const string secret = "Disposable-Test-Secret-Only!2026";
++        string dbPath = Path.Combine(_tempRoot, "unreadable-passphrase.db");
++        string caDir = Path.Combine(_tempRoot, "unreadable-passphrase-ca");
++        string passFile = Path.Combine(_tempRoot, "unreadable.pass");
++        await File.WriteAllTextAsync(passFile, secret);
++        using ServiceProvider sp = BuildServiceProvider(dbPath, caDir, passFilePath: passFile);
++        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
++        ApplicationUser admin = await BootstrapAdminAsync(sp);
++        await service.CreateSelfSignedOrIntermediateCaAsync(
++            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
++            CertificateKeyFamily.Ecdsa, 256, 365, secret);
++        IssuanceOutcome leaf = await IssueLeafAsync(service, admin.Id, "host.contoso.com");
++        await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(100));
++        File.SetUnixFileMode(passFile, UnixFileMode.None);
++        try
++        {
++            await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
++                service.RevokeCertificateAsync(leaf.Record!.Id, CrlReason.KeyCompromise, "admin"));
++            Assert.False(await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(100)));
++        }
++        finally
++        {
++            File.SetUnixFileMode(passFile, UnixFileMode.UserRead | UnixFileMode.UserWrite);
++        }
++        using IServiceScope checkScope = sp.CreateScope();
++        CertRoboDbContext checkDb = checkScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++        IssuedCertificateRecord saved = (await checkDb.IssuedCertificates.FindAsync(leaf.Record!.Id))!;
++        Assert.Equal(IssuanceStatus.Revoked, saved.Status);
++        PublishedCrlRecord current = (await service.GetLatestCrlAsync())!;
++        Assert.False(CrlContainsSerial(current.CrlDer, leaf.Record.SerialNumberHex));
++    }
++
