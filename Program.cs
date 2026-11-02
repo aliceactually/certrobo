@@ -73,7 +73,10 @@ CaKeyCustodyOptions caOptions = new()
     PassphraseFilePath = builder.Configuration["CertRobo:CaPassphraseFile"],
     ConfiguredPassphrase = builder.Configuration["CertRobo:CaPassphrase"],
     PublicBaseUrl = builder.Configuration["CertRobo:PublicBaseUrl"],
-    CrlValidityHours = int.TryParse(builder.Configuration["CertRobo:CrlValidityHours"], out int crlHrs) ? crlHrs : 168
+    CrlValidityHours = int.TryParse(builder.Configuration["CertRobo:CrlValidityHours"], out int crlHrs) ? crlHrs : 168,
+    CrossProcessLockTimeoutMs = int.TryParse(builder.Configuration["CertRobo:CrossProcessLockTimeoutMs"], out int lockTimeoutMs) && lockTimeoutMs > 0
+        ? lockTimeoutMs
+        : 30_000
 };
 builder.Services.AddSingleton(caOptions);
 
@@ -168,16 +171,25 @@ using (IServiceScope scope = app.Services.CreateScope())
             return;
         }
         string outputZipPath = args[backupFlagIdx + 1];
-        BackupRestoreService backupService = scope.ServiceProvider.GetRequiredService<BackupRestoreService>();
-        byte[] archiveBytes = await backupService.CreateConsistentBackupArchiveAsync(sqliteDbPath, dpKeysDir);
-        string? parentDir = Path.GetDirectoryName(Path.GetFullPath(outputZipPath));
-        if (!string.IsNullOrEmpty(parentDir))
+        try
         {
-            Directory.CreateDirectory(parentDir);
+            BackupRestoreService backupService = scope.ServiceProvider.GetRequiredService<BackupRestoreService>();
+            byte[] archiveBytes = await backupService.CreateConsistentBackupArchiveAsync(sqliteDbPath, dpKeysDir);
+            string? parentDir = Path.GetDirectoryName(Path.GetFullPath(outputZipPath));
+            if (!string.IsNullOrEmpty(parentDir))
+            {
+                Directory.CreateDirectory(parentDir);
+            }
+            await File.WriteAllBytesAsync(outputZipPath, archiveBytes);
+            Console.WriteLine($"Consistent backup written to '{outputZipPath}' ({archiveBytes.Length} bytes).");
+            return;
         }
-        await File.WriteAllBytesAsync(outputZipPath, archiveBytes);
-        Console.WriteLine($"Consistent backup written to '{outputZipPath}' ({archiveBytes.Length} bytes).");
-        return;
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Backup failed: {ex.Message}");
+            Environment.ExitCode = 1;
+            return;
+        }
     }
 
     // Handle CLI legacy settings.xml inspection / defaults import:
@@ -519,6 +531,13 @@ using (IServiceScope scope = app.Services.CreateScope())
             CaKeyReprotectionResult reprotectResult = await caService.ReprotectCaKeysAsync(
                 sourceLines,
                 targetPassphrase);
+            CaKeyCustodyReport postReport = await caService.InspectKeyCustodyAsync();
+            if (!postReport.IsCustodyHealthy || !postReport.HasEffectivePassphrase)
+            {
+                Console.Error.WriteLine("CA key re-protection failed post-migration custody verification.");
+                Environment.ExitCode = 1;
+                return;
+            }
             Console.WriteLine(reprotectResult.SummaryMessage);
             return;
         }

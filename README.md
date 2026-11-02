@@ -323,22 +323,23 @@ sudo systemctl enable --now nginx.service
      ```
    * Note that rolling back to an earlier backup after certificates have been delivered to clients cannot undo trust in already-issued certificates; if importing an existing CA identity from AD CS, fence the old signer first, set the initial serial and CRL number floors above the highest previously issued values, and seed any unexpired revoked serials in `/admin`.
    * **CA Key Custody Verification & Mixed-Passphrase Recovery:**
-     If a deployment previously encrypted a historical or replacement CA key with a different passphrase (or rotated `/etc/certrobo/ca.pass`), verify custody health and converge all stored keys to the configured shared custody secret without overwriting original `.p8.enc` key files:
+     If a deployment previously encrypted a historical or replacement CA key with a different passphrase (or rotated `/etc/certrobo/ca.pass`), stop the running service, take an offline backup, and converge all stored keys to the configured shared custody secret without overwriting original `.p8.enc` key files. Keep a separate, secure offline copy of all legacy and current passphrases before starting; never use the sole copy of a passphrase as a staging file on the host:
      ```bash
-     # 1. Take a consistent backup before modifying key custody
+     # 1. Stop the running service so it cannot race key migration or retain a stale in-memory passphrase
+     sudo systemctl stop certrobo.service
+
+     # 2. Take a consistent backup while the service is stopped
      sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --backup /var/lib/certrobo/backups/pre-reprotect-backup.zip'
 
-     # 2. Inspect custody status across active, historical, and pending CA keys
+     # 3. Inspect current custody status across active, historical, and pending CA keys
      sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --verify-ca-custody'
 
-     # 3. Re-protect any incompatible keys using a mode-0600 file containing the previous passphrase(s) (one per line)
-     sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --reprotect-ca-keys /etc/certrobo/legacy-ca.pass'
-     sudo shred -u /etc/certrobo/legacy-ca.pass
-
-     # 4. Re-verify custody and restart the service
-     sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --verify-ca-custody'
-     sudo systemctl restart certrobo.service
+     # 4. Re-protect incompatible keys using a mode-0600 staging file containing the previous passphrase(s) (one per line),
+     #    verify custody health, and start the service only if both migration and verification succeed
+     sudo -u certrobo sh -c 'set -e; set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --reprotect-ca-keys /etc/certrobo/legacy-ca.pass && ./CertRobo --verify-ca-custody' \
+       && sudo systemctl start certrobo.service
      ```
+     Do **not** delete `/etc/certrobo/legacy-ca.pass` or retire your independent offline copy of the legacy passphrase(s) until `--reprotect-ca-keys` and `--verify-ca-custody` have both exited `0`, `certrobo.service` has started cleanly, and active issuance and CRL refresh have been verified. Note that file deletion utilities (such as `rm` or `shred`) do not guarantee physical erasure on SSDs, copy-on-write filesystems, or journaled/networked storage.
 
 5. **Issuer-Specific Publication and Export Behavior**
    * Set `CertRobo__PublicBaseUrl` to the externally reachable plain-HTTP PKI origin. New authorities using default publication paths then receive stable issuer URLs such as `http://pki.contoso.com/authorities/3/issuer.crt` (DER AIA certificate) and `http://pki.contoso.com/authorities/3/ca.crl`. `/ca.crt`, `/ca.p7b`, `/issuer.crt`, `/ca.crl`, and `/ca.crl.pem` remain compatibility aliases for the active issuer; `/rootca.crt` returns only the trust anchor.

@@ -660,11 +660,306 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task ReprotectFailure_And_MidMigrationInterruption_PreserveSourcePassphraseFile_OriginalKeys_AndDatabaseState()
+    {
+        const string targetSecret = "TargetCustodySecret-Alpha!2026";
+        const string legacySecret = "LegacyCustodySecret-Bravo!2026";
+        const string wrongSecret = "WrongLegacySecret-Charlie!2026";
+
+        string dbPath = Path.Combine(_tempRoot, "reprotect-failure.db");
+        string caDir = Path.Combine(_tempRoot, "reprotect-failure-ca");
+        string targetPassFile = Path.Combine(_tempRoot, "reprotect-target.pass");
+        string legacyPassFile = Path.Combine(_tempRoot, "reprotect-legacy.pass");
+        string wrongPassFile = Path.Combine(_tempRoot, "reprotect-wrong.pass");
+
+        int issuerId;
+        int pendingId;
+        string originalIssuerKeyPath;
+        string originalPendingKeyPath;
+
+        using (ServiceProvider seedSp = BuildServiceProvider(dbPath, caDir))
+        {
+            CertificateAuthorityService caService = seedSp.GetRequiredService<CertificateAuthorityService>();
+            CaAuthorityRecord issuer = await caService.CreateSelfSignedOrIntermediateCaAsync(
+                "Legacy Protected Issuer",
+                "legacy-issuer.contoso.com",
+                "US", "WA", "Redmond", "Contoso", "PKI",
+                CertificateKeyFamily.Ecdsa,
+                256,
+                365,
+                legacySecret);
+            issuerId = issuer.Id;
+            originalIssuerKeyPath = issuer.EncryptedPrivateKeyPath;
+
+            PendingCaEnrollmentRecord pending = await caService.CreatePendingCaEnrollmentAsync(
+                "Legacy Pending CA",
+                "legacy-pending.contoso.com",
+                "US", "WA", "Redmond", "Contoso", "PKI",
+                CertificateKeyFamily.Ecdsa,
+                256,
+                legacySecret);
+            pendingId = pending.Id;
+            originalPendingKeyPath = pending.EncryptedPrivateKeyPath;
+        }
+
+        await File.WriteAllTextAsync(targetPassFile, targetSecret + "\n");
+        await File.WriteAllTextAsync(legacyPassFile, legacySecret + "\n");
+        await File.WriteAllTextAsync(wrongPassFile, wrongSecret + "\n");
+
+        int initialKeyFileCount = Directory.GetFiles(caDir, "*.p8.enc").Length;
+        Assert.Equal(2, initialKeyFileCount);
+
+        // 1. Failure path A: Wrong source passphrase in CLI --reprotect-ca-keys must exit non-zero,
+        //    must NOT delete or modify the source passphrase file, and must leave original keys untouched.
+        var (wrongExit, wrongOut) = await RunCertRoboCliAsync(
+            dbPath,
+            caDir,
+            targetPassFile,
+            ["--reprotect-ca-keys", wrongPassFile]);
+        Assert.NotEqual(0, wrongExit);
+        Assert.Contains("CA key re-protection failed", wrongOut);
+        Assert.True(File.Exists(wrongPassFile));
+        Assert.Equal(wrongSecret, (await File.ReadAllTextAsync(wrongPassFile)).Trim());
+        Assert.Equal(initialKeyFileCount, Directory.GetFiles(caDir, "*.p8.enc").Length);
+
+        // 2. Failure path B: Missing encrypted key file on disk must exit non-zero and preserve the source passphrase file.
+        string tempMovedPendingKey = originalPendingKeyPath + ".temporarily-missing";
+        File.Move(originalPendingKeyPath, tempMovedPendingKey);
+        try
+        {
+            var (missingExit, missingOut) = await RunCertRoboCliAsync(
+                dbPath,
+                caDir,
+                targetPassFile,
+                ["--reprotect-ca-keys", legacyPassFile]);
+            Assert.NotEqual(0, missingExit);
+            Assert.Contains("not found", missingOut, StringComparison.OrdinalIgnoreCase);
+            Assert.True(File.Exists(legacyPassFile));
+            Assert.Equal(legacySecret, (await File.ReadAllTextAsync(legacyPassFile)).Trim());
+        }
+        finally
+        {
+            File.Move(tempMovedPendingKey, originalPendingKeyPath);
+        }
+
+        // 3. Failure path C: Mid-migration I/O interruption after new key files and backup copies are written
+        //    must roll back all newly created files, leave DB paths unchanged, and preserve legacyPassFile.
+        var (interruptedExit, interruptedOut) = await RunCertRoboCliAsync(
+            dbPath,
+            caDir,
+            targetPassFile,
+            ["--reprotect-ca-keys", legacyPassFile],
+            extraEnv: new Dictionary<string, string?>
+            {
+                ["CERTROBO_TEST_FAIL_REPROTECT_AFTER_WRITE"] = "1"
+            });
+        Assert.NotEqual(0, interruptedExit);
+        Assert.Contains("Simulated mid-migration I/O failure", interruptedOut);
+        Assert.True(File.Exists(legacyPassFile));
+        Assert.Equal(legacySecret, (await File.ReadAllTextAsync(legacyPassFile)).Trim());
+
+        // Verify no orphan .p8.enc or .bak-* files remain after rollback
+        Assert.Equal(initialKeyFileCount, Directory.GetFiles(caDir, "*.p8.enc").Length);
+        string backupDir = Path.Combine(caDir, "recovery-backups");
+        Assert.True(!Directory.Exists(backupDir) || Directory.GetFiles(backupDir).Length == 0);
+
+        // Also test in-process onKeysStagedBeforeCommit hook directly
+        using (ServiceProvider faultSp = BuildServiceProvider(dbPath, caDir, passFilePath: targetPassFile))
+        {
+            CertificateAuthorityService faultCa = faultSp.GetRequiredService<CertificateAuthorityService>();
+
+            await Assert.ThrowsAsync<IOException>(() =>
+                faultCa.ReprotectCaKeysAsync(
+                    legacySecret,
+                    targetSecret,
+                    onKeysStagedBeforeCommit: () => throw new IOException("Injected in-process mid-migration fault.")));
+
+            Assert.Equal(initialKeyFileCount, Directory.GetFiles(caDir, "*.p8.enc").Length);
+            Assert.True(!Directory.Exists(backupDir) || Directory.GetFiles(backupDir).Length == 0);
+
+            CaAuthorityRecord unchangedIssuer = (await faultCa.GetAuthorityByIdAsync(issuerId))!;
+            PendingCaEnrollmentRecord unchangedPending = (await faultCa.GetPendingEnrollmentByIdAsync(pendingId))!;
+            Assert.Equal(originalIssuerKeyPath, unchangedIssuer.EncryptedPrivateKeyPath);
+            Assert.Equal(originalPendingKeyPath, unchangedPending.EncryptedPrivateKeyPath);
+        }
+
+        // 4. Subsequent re-protection with the preserved legacyPassFile succeeds and passes --verify-ca-custody
+        var (okExit, okOut) = await RunCertRoboCliAsync(
+            dbPath,
+            caDir,
+            targetPassFile,
+            ["--reprotect-ca-keys", legacyPassFile]);
+        Assert.True(okExit == 0, $"Expected re-protection to succeed, got ({okExit}): {okOut}");
+        Assert.Contains("Re-protected 1 CA authority key(s) and 1 pending CA key", okOut);
+        Assert.True(File.Exists(legacyPassFile));
+
+        var (verifyExit, verifyOut) = await RunCertRoboCliAsync(
+            dbPath,
+            caDir,
+            targetPassFile,
+            ["--verify-ca-custody"]);
+        Assert.Equal(0, verifyExit);
+        Assert.Contains("CA key custody check passed.", verifyOut);
+    }
+
+    [Fact]
+    public async Task CrossProcessLifecycleLock_SerializesConcurrentCliAndServiceOperations_And_EvictsStaleInMemoryPassphrase()
+    {
+        const string secretA = "CrossProcessSecret-Alpha!2026";
+        const string secretB = "CrossProcessSecret-Bravo!2026";
+
+        string dbPath = Path.Combine(_tempRoot, "cross-proc.db");
+        string caDir = Path.Combine(_tempRoot, "cross-proc-ca");
+        string dpDir = Path.Combine(_tempRoot, "cross-proc-dp");
+        string passFile = Path.Combine(_tempRoot, "cross-proc.pass");
+        string legacyPassFile = Path.Combine(_tempRoot, "cross-proc-legacy.pass");
+        string backupZipPath = Path.Combine(_tempRoot, "cross-proc-backup.zip");
+
+        await File.WriteAllTextAsync(passFile, secretA + "\n");
+        await File.WriteAllTextAsync(legacyPassFile, secretA + "\n");
+
+        using ServiceProvider serviceSp = BuildServiceProvider(dbPath, caDir, passFilePath: passFile, dpKeysDir: dpDir);
+        CertificateAuthorityService runningServiceCa = serviceSp.GetRequiredService<CertificateAuthorityService>();
+        ApplicationUser admin = await BootstrapAdminAsync(serviceSp);
+
+        CaAuthorityRecord activeCa = await runningServiceCa.CreateSelfSignedOrIntermediateCaAsync(
+            "Cross-Process Issuing CA",
+            "cross-proc-ca.contoso.com",
+            "US", "WA", "Redmond", "Contoso", "PKI",
+            CertificateKeyFamily.Ecdsa,
+            256,
+            365,
+            secretA);
+
+        PendingCaEnrollmentRecord pending = await runningServiceCa.CreatePendingCaEnrollmentAsync(
+            "Cross-Process Pending CA",
+            "cross-proc-pending.contoso.com",
+            "US", "WA", "Redmond", "Contoso", "PKI",
+            CertificateKeyFamily.Ecdsa,
+            256,
+            secretA);
+
+        // 1. While Process 1 holds the cross-process lock, a separate child process with a short timeout
+        //    cannot enter --backup or --reprotect-ca-keys and exits cleanly on lock timeout.
+        await using (IAsyncDisposable heldLock = await CertificateAuthorityService.AcquireLifecycleLockAsync(caDir))
+        {
+            var (contendedBackupExit, contendedBackupOut) = await RunCertRoboCliAsync(
+                dbPath,
+                caDir,
+                passFile,
+                ["--backup", backupZipPath],
+                extraEnv: new Dictionary<string, string?>
+                {
+                    ["CertRobo__CrossProcessLockTimeoutMs"] = "300"
+                });
+            Assert.NotEqual(0, contendedBackupExit);
+            Assert.Contains("cross-process CA lifecycle lock", contendedBackupOut, StringComparison.OrdinalIgnoreCase);
+            Assert.False(File.Exists(backupZipPath));
+        }
+
+        // 2. When Process 1 holds the cross-process lock briefly (350ms) and then releases it,
+        //    a concurrent child process running --backup and a concurrent CancelPendingCaEnrollmentAsync
+        //    are serialized so the backup archive never captures a pending DB record whose key file was deleted.
+        Task<(int ExitCode, string CombinedOutput)> delayedBackupTask;
+        await using (IAsyncDisposable briefLock = await CertificateAuthorityService.AcquireLifecycleLockAsync(caDir))
+        {
+            delayedBackupTask = RunCertRoboCliAsync(
+                dbPath,
+                caDir,
+                passFile,
+                ["--backup", backupZipPath]);
+            await Task.Delay(350);
+        }
+
+        Task<(bool Succeeded, string? ErrorMessage)> concurrentCancelTask =
+            runningServiceCa.CancelPendingCaEnrollmentAsync(pending.Id);
+
+        var (backupExit, backupOut) = await delayedBackupTask;
+        var (cancelOk, cancelErr) = await concurrentCancelTask;
+        Assert.True(backupExit == 0, $"Delayed backup failed ({backupExit}): {backupOut}");
+        Assert.True(cancelOk, cancelErr);
+        Assert.True(File.Exists(backupZipPath));
+
+        // Restore the backup archive taken during concurrent cancellation and verify DB/key-file consistency
+        string restoredRoot = Path.Combine(_tempRoot, "cross-proc-restored");
+        string restoredDb = Path.Combine(restoredRoot, "certrobo.db");
+        string restoredCa = Path.Combine(restoredRoot, "ca");
+        string restoredDp = Path.Combine(restoredRoot, "dp");
+        BackupRestoreService.RestoreBackupArchive(
+            await File.ReadAllBytesAsync(backupZipPath),
+            restoredDb,
+            restoredCa,
+            restoredDp);
+        using (ServiceProvider restoredSp = BuildServiceProvider(restoredDb, restoredCa, passFilePath: passFile, dpKeysDir: restoredDp))
+        {
+            CertificateAuthorityService restoredCaService = restoredSp.GetRequiredService<CertificateAuthorityService>();
+            CaKeyCustodyReport restoredReport = await restoredCaService.InspectKeyCustodyAsync();
+            Assert.True(restoredReport.IsCustodyHealthy);
+            if (restoredReport.PendingEnrollment != null)
+            {
+                Assert.True(restoredReport.PendingEnrollment.KeyFileExists);
+                Assert.True(restoredReport.PendingEnrollment.CanDecryptWithConfiguredPassphrase);
+            }
+        }
+
+        // 3. Verify that if the configured passphrase file is rotated to secretB and keys are re-protected by the CLI process,
+        //    the already-running service instance evicts its cached secretA in-memory passphrase, adopts secretB, and signs/refreshes cleanly.
+        Assert.Equal(secretA, runningServiceCa.ResolveEffectivePassphrase());
+        await File.WriteAllTextAsync(passFile, secretB + "\n");
+
+        var (reprotectExit, reprotectOut) = await RunCertRoboCliAsync(
+            dbPath,
+            caDir,
+            passFile,
+            ["--reprotect-ca-keys", legacyPassFile]);
+        Assert.True(reprotectExit == 0, $"CLI reprotect failed ({reprotectExit}): {reprotectOut}");
+
+        Assert.Equal(secretB, runningServiceCa.ResolveEffectivePassphrase());
+        CaKeyCustodyReport postRotateReport = await runningServiceCa.InspectKeyCustodyAsync();
+        Assert.True(postRotateReport.IsCustodyHealthy);
+        Assert.True(postRotateReport.ActiveAuthorityDecryptable);
+
+        KeyPair leafKey = _crypto.KeyGen(256);
+        string csr = _crypto.CSRGen(leafKey, "post-rotate.contoso.com", ["post-rotate.contoso.com"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        IssuanceOutcome issued = await runningServiceCa.IssueCertificateFromCsrAsync(admin.Id, csr);
+        Assert.True(issued.Succeeded, issued.ErrorMessage);
+
+        PublishedCrlRecord? refreshed = await runningServiceCa.RefreshActiveCrlAsync();
+        Assert.NotNull(refreshed);
+
+        // 4. Also verify manual-unlock mode (no persistent passFile configured on a running service instance):
+        //    if the service unlocked secretB in memory, and an external CLI process re-protects the keys back to secretA,
+        //    the manual-mode service evicts its stale secretB runtime unlock instead of retaining a broken in-memory secret.
+        using ServiceProvider manualServiceSp = BuildServiceProvider(dbPath, caDir);
+        CertificateAuthorityService manualServiceCa = manualServiceSp.GetRequiredService<CertificateAuthorityService>();
+        manualServiceCa.UnlockRuntimePassphrase(secretB);
+        Assert.Equal(secretB, manualServiceCa.ResolveEffectivePassphrase());
+
+        await File.WriteAllTextAsync(passFile, secretA + "\n");
+        await File.WriteAllTextAsync(legacyPassFile, secretB + "\n");
+        var (reprotectBackExit, reprotectBackOut) = await RunCertRoboCliAsync(
+            dbPath,
+            caDir,
+            passFile,
+            ["--reprotect-ca-keys", legacyPassFile]);
+        Assert.True(reprotectBackExit == 0, $"CLI reprotect back failed ({reprotectBackExit}): {reprotectBackOut}");
+
+        CaKeyCustodyReport manualReportAfterExternalReprotect = await manualServiceCa.InspectKeyCustodyAsync();
+        Assert.False(manualReportAfterExternalReprotect.HasRuntimeUnlockedPassphrase);
+        Assert.Null(manualServiceCa.ResolveEffectivePassphrase());
+
+        // Unlocking with the new passphrase (secretA) succeeds on the manual-mode instance
+        manualServiceCa.UnlockRuntimePassphrase(secretA);
+        Assert.Equal(secretA, manualServiceCa.ResolveEffectivePassphrase());
+    }
+
     private static async Task<(int ExitCode, string CombinedOutput)> RunCertRoboCliAsync(
         string dbPath,
         string caDir,
         string passFilePath,
-        IReadOnlyList<string> args)
+        IReadOnlyList<string> args,
+        IReadOnlyDictionary<string, string?>? extraEnv = null)
     {
         string appDll = Path.Combine(AppContext.BaseDirectory, "CertRobo.dll");
         ProcessStartInfo psi = new("dotnet")
@@ -681,10 +976,25 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
         }
 
         psi.Environment.Remove("CERTROBO_CA_PASSPHRASE");
+        psi.Environment.Remove("CERTROBO_TEST_FAIL_REPROTECT_AFTER_WRITE");
         psi.Environment["CertRobo__DataDirectory"] = Path.GetDirectoryName(dbPath)!;
         psi.Environment["CertRobo__SqliteFilePath"] = dbPath;
         psi.Environment["CertRobo__CaStorageDirectory"] = caDir;
         psi.Environment["CertRobo__CaPassphraseFile"] = passFilePath;
+        if (extraEnv != null)
+        {
+            foreach ((string k, string? v) in extraEnv)
+            {
+                if (v == null)
+                {
+                    psi.Environment.Remove(k);
+                }
+                else
+                {
+                    psi.Environment[k] = v;
+                }
+            }
+        }
 
         using Process proc = Process.Start(psi)!;
         Task<string> stdoutTask = proc.StandardOutput.ReadToEndAsync();

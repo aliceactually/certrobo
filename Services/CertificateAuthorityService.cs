@@ -13,6 +13,7 @@ using Org.BouncyCastle.Pkcs;
 using Org.BouncyCastle.Security;
 using Org.BouncyCastle.X509;
 using Org.BouncyCastle.X509.Extension;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -29,6 +30,7 @@ public sealed class CaKeyCustodyOptions
     public string? ConfiguredPassphrase { get; set; }
     public string? PublicBaseUrl { get; set; }
     public int CrlValidityHours { get; set; } = 168; // 7 days
+    public int CrossProcessLockTimeoutMs { get; set; } = 30_000;
     public bool AutoCreateDevelopmentCaIfEmpty { get; set; }
 }
 
@@ -95,6 +97,8 @@ public sealed record CaKeyReprotectionResult(
 /// </summary>
 public sealed class CertificateAuthorityService
 {
+    public const string CrossProcessLockFileName = ".ca-lifecycle.lock";
+
     private static readonly SemaphoreSlim SigningAndSerialLock = new(1, 1);
 
     private readonly IDbContextFactory<CertRoboDbContext> _dbFactory;
@@ -126,26 +130,19 @@ public sealed class CertificateAuthorityService
             throw new ArgumentException("Passphrase cannot be empty.", nameof(passphrase));
         }
 
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
-        try
-        {
-            await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
-            await db.EnsureSchemaUpgradedAsync(cancellationToken);
+        await using IAsyncDisposable _ = await AcquireInstanceLifecycleLockAsync(cancellationToken);
+        await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
+        await db.EnsureSchemaUpgradedAsync(cancellationToken);
 
-            await ValidateCustodyCandidateCoreAsync(
-                db,
-                passphrase,
-                secondaryParentPassphrase: null,
-                requireExistingKeyForUnlock: true,
-                cancellationToken);
+        await ValidateCustodyCandidateCoreAsync(
+            db,
+            passphrase,
+            secondaryParentPassphrase: null,
+            requireExistingKeyForUnlock: true,
+            cancellationToken);
 
-            _runtimeUnlockedPassphrase = passphrase;
-            _isExplicitlyLocked = false;
-        }
-        finally
-        {
-            SigningAndSerialLock.Release();
-        }
+        _runtimeUnlockedPassphrase = passphrase;
+        _isExplicitlyLocked = false;
     }
 
     public void LockRuntimePassphrase()
@@ -154,11 +151,99 @@ public sealed class CertificateAuthorityService
         _isExplicitlyLocked = true;
     }
 
-    internal static Task AcquireLifecycleLockAsync(CancellationToken cancellationToken) =>
-        SigningAndSerialLock.WaitAsync(cancellationToken);
+    internal Task<IAsyncDisposable> AcquireInstanceLifecycleLockAsync(CancellationToken cancellationToken = default) =>
+        AcquireLifecycleLockAsync(
+            _options.StorageDirectory,
+            cancellationToken,
+            TimeSpan.FromMilliseconds(Math.Max(100, _options.CrossProcessLockTimeoutMs)));
 
-    internal static void ReleaseLifecycleLock() =>
-        SigningAndSerialLock.Release();
+    public static async Task<IAsyncDisposable> AcquireLifecycleLockAsync(
+        string? storageDirectory,
+        CancellationToken cancellationToken = default,
+        TimeSpan? timeout = null)
+    {
+        TimeSpan effectiveTimeout = timeout ?? TimeSpan.FromSeconds(30);
+        Stopwatch sw = Stopwatch.StartNew();
+
+        if (!await SigningAndSerialLock.WaitAsync(effectiveTimeout, cancellationToken))
+        {
+            throw new TimeoutException("Timed out waiting for in-process CA lifecycle lock.");
+        }
+
+        FileStream? lockStream = null;
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(storageDirectory))
+            {
+                Directory.CreateDirectory(storageDirectory);
+                string lockFilePath = Path.Combine(storageDirectory, CrossProcessLockFileName);
+
+                while (true)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    try
+                    {
+                        lockStream = new FileStream(
+                            lockFilePath,
+                            FileMode.OpenOrCreate,
+                            FileAccess.ReadWrite,
+                            FileShare.None);
+                        RestrictFilePermissionsIfUnix(lockFilePath);
+                        break;
+                    }
+                    catch (IOException ex)
+                    {
+                        TimeSpan remaining = effectiveTimeout - sw.Elapsed;
+                        if (remaining <= TimeSpan.Zero)
+                        {
+                            throw new TimeoutException(
+                                $"Timed out waiting for cross-process CA lifecycle lock '{lockFilePath}'. Another CertRobo process is currently accessing CA storage.",
+                                ex);
+                        }
+
+                        int delayMs = (int)Math.Clamp(remaining.TotalMilliseconds, 10, 25);
+                        await Task.Delay(delayMs, cancellationToken);
+                    }
+                }
+            }
+
+            return new LifecycleLockHandle(lockStream);
+        }
+        catch
+        {
+            lockStream?.Dispose();
+            SigningAndSerialLock.Release();
+            throw;
+        }
+    }
+
+    private sealed class LifecycleLockHandle(FileStream? lockStream) : IAsyncDisposable, IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            try
+            {
+                lockStream?.Dispose();
+            }
+            finally
+            {
+                SigningAndSerialLock.Release();
+            }
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            Dispose();
+            return ValueTask.CompletedTask;
+        }
+    }
 
     public string? ResolveConfiguredPassphrase() =>
         ResolveConfiguredPassphraseWithSource().Passphrase;
@@ -198,20 +283,48 @@ public sealed class CertificateAuthorityService
             return null;
         }
 
+        string? configured = ResolveConfiguredPassphrase();
+        if (!string.IsNullOrEmpty(configured))
+        {
+            if (!string.IsNullOrEmpty(_runtimeUnlockedPassphrase)
+                && !PassphrasesEqual(_runtimeUnlockedPassphrase, configured))
+            {
+                _runtimeUnlockedPassphrase = null;
+            }
+
+            return configured;
+        }
+
         if (!string.IsNullOrEmpty(_runtimeUnlockedPassphrase))
         {
             return _runtimeUnlockedPassphrase;
         }
 
-        return ResolveConfiguredPassphrase();
+        return null;
     }
 
     public async Task<CaKeyCustodyReport> InspectKeyCustodyAsync(
         string? candidatePassphrase = null,
         CancellationToken cancellationToken = default)
     {
+        await using IAsyncDisposable _ = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
         await db.EnsureSchemaUpgradedAsync(cancellationToken);
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        List<CaAuthorityRecord> authorities = await db.CaAuthorities
+            .OrderBy(c => c.Id)
+            .ToListAsync(cancellationToken);
+
+        PendingCaEnrollmentRecord? pending = await db.PendingCaEnrollments
+            .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
+                     && p.Status != PendingCaEnrollmentStatus.Cancelled)
+            .OrderByDescending(p => p.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        EvictStaleRuntimeUnlockIfIncompatible(
+            authorities,
+            pending != null ? [pending] : []);
 
         (string? configuredPassphrase, string configuredSource) = ResolveConfiguredPassphraseWithSource();
         string? effectivePassphrase = !string.IsNullOrEmpty(candidatePassphrase)
@@ -224,11 +337,6 @@ public sealed class CertificateAuthorityService
         bool runtimeMatchesConfigured = !hasConfigured
             || string.IsNullOrEmpty(effectivePassphrase)
             || PassphrasesEqual(effectivePassphrase, configuredPassphrase!);
-
-        DateTimeOffset now = DateTimeOffset.UtcNow;
-        List<CaAuthorityRecord> authorities = await db.CaAuthorities
-            .OrderBy(c => c.Id)
-            .ToListAsync(cancellationToken);
 
         HashSet<int> authoritiesWithUnexpiredCerts = (await db.IssuedCertificates
             .Where(c => c.CaAuthorityId.HasValue
@@ -301,12 +409,6 @@ public sealed class CertificateAuthorityService
                 failureReason));
         }
 
-        PendingCaEnrollmentRecord? pending = await db.PendingCaEnrollments
-            .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
-                     && p.Status != PendingCaEnrollmentStatus.Cancelled)
-            .OrderByDescending(p => p.Id)
-            .FirstOrDefaultAsync(cancellationToken);
-
         PendingCaKeyCustodyStatus? pendingStatus = null;
         bool pendingHealthy = true;
         if (pending != null)
@@ -365,14 +467,16 @@ public sealed class CertificateAuthorityService
         string currentPassphrase,
         string targetStoragePassphrase,
         int? targetAuthorityId = null,
-        CancellationToken cancellationToken = default) =>
-        ReprotectCaKeysAsync([currentPassphrase], targetStoragePassphrase, targetAuthorityId, cancellationToken);
+        CancellationToken cancellationToken = default,
+        Action? onKeysStagedBeforeCommit = null) =>
+        ReprotectCaKeysAsync([currentPassphrase], targetStoragePassphrase, targetAuthorityId, cancellationToken, onKeysStagedBeforeCommit);
 
     public async Task<CaKeyReprotectionResult> ReprotectCaKeysAsync(
         IReadOnlyCollection<string> currentPassphrases,
         string targetStoragePassphrase,
         int? targetAuthorityId = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Action? onKeysStagedBeforeCommit = null)
     {
         if (string.IsNullOrWhiteSpace(targetStoragePassphrase))
         {
@@ -387,7 +491,7 @@ public sealed class CertificateAuthorityService
             throw new ArgumentException("At least one non-empty current key passphrase is required.", nameof(currentPassphrases));
         }
 
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
@@ -495,6 +599,7 @@ public sealed class CertificateAuthorityService
             }
 
             List<string> createdKeyPaths = [];
+            List<string> createdBackupPaths = [];
             List<(CaAuthorityRecord Authority, string NewKeyPath)> stagedAuthorityUpdates = [];
             List<(PendingCaEnrollmentRecord Pending, string NewKeyPath)> stagedPendingUpdates = [];
 
@@ -507,6 +612,7 @@ public sealed class CertificateAuthorityService
                     string backupFilePath = Path.Combine(backupDir, backupFileName);
                     File.Copy(authority.EncryptedPrivateKeyPath, backupFilePath, overwrite: false);
                     RestrictFilePermissionsIfUnix(backupFilePath);
+                    createdBackupPaths.Add(backupFilePath);
 
                     using AsymmetricAlgorithm key = LoadEncryptedKey(authority.EncryptedPrivateKeyPath, srcPass);
                     byte[] reencryptedPkcs8 = key.ExportEncryptedPkcs8PrivateKey(
@@ -544,6 +650,7 @@ public sealed class CertificateAuthorityService
                     string backupFilePath = Path.Combine(backupDir, backupFileName);
                     File.Copy(pending.EncryptedPrivateKeyPath, backupFilePath, overwrite: false);
                     RestrictFilePermissionsIfUnix(backupFilePath);
+                    createdBackupPaths.Add(backupFilePath);
 
                     using AsymmetricAlgorithm key = LoadEncryptedKey(pending.EncryptedPrivateKeyPath, srcPass);
                     byte[] reencryptedPkcs8 = key.ExportEncryptedPkcs8PrivateKey(
@@ -574,6 +681,18 @@ public sealed class CertificateAuthorityService
                     stagedPendingUpdates.Add((pending, newKeyFilePath));
                 }
 
+                if (createdKeyPaths.Count > 0)
+                {
+                    onKeysStagedBeforeCommit?.Invoke();
+                    if (string.Equals(
+                            Environment.GetEnvironmentVariable("CERTROBO_TEST_FAIL_REPROTECT_AFTER_WRITE"),
+                            "1",
+                            StringComparison.Ordinal))
+                    {
+                        throw new IOException("Simulated mid-migration I/O failure after writing re-protected key file.");
+                    }
+                }
+
                 await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
                 foreach ((CaAuthorityRecord authority, string newKeyPath) in stagedAuthorityUpdates)
                 {
@@ -588,7 +707,7 @@ public sealed class CertificateAuthorityService
             }
             catch
             {
-                foreach (string createdPath in createdKeyPaths)
+                foreach (string createdPath in createdKeyPaths.Concat(createdBackupPaths))
                 {
                     try
                     {
@@ -622,7 +741,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -729,7 +848,7 @@ public sealed class CertificateAuthorityService
             throw new ArgumentOutOfRangeException(nameof(requestedPathLengthConstraint), "Path length constraint cannot be negative.");
         }
 
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
@@ -843,7 +962,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -889,7 +1008,7 @@ public sealed class CertificateAuthorityService
         string? passphraseOverride = null,
         CancellationToken cancellationToken = default)
     {
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
@@ -1058,7 +1177,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -1071,7 +1190,7 @@ public sealed class CertificateAuthorityService
         string? passphraseOverride = null,
         CancellationToken cancellationToken = default)
     {
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
@@ -1193,7 +1312,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -1205,7 +1324,7 @@ public sealed class CertificateAuthorityService
         int pendingEnrollmentId,
         CancellationToken cancellationToken = default)
     {
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
@@ -1251,7 +1370,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -1370,7 +1489,7 @@ public sealed class CertificateAuthorityService
             throw new ArgumentException("A non-empty passphrase is required to protect the CA signing key.", nameof(passphrase));
         }
 
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await ThrowIfUnfinishedPendingEnrollmentExistsAsync(cancellationToken);
@@ -1493,7 +1612,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -1534,7 +1653,7 @@ public sealed class CertificateAuthorityService
             throw new ArgumentException("Imported CA private key PEM is missing or exceeds maximum permitted size.", nameof(privateKeyPem));
         }
 
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await ThrowIfUnfinishedPendingEnrollmentExistsAsync(cancellationToken);
@@ -1586,7 +1705,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -1620,7 +1739,7 @@ public sealed class CertificateAuthorityService
             throw new ArgumentException("PKCS#12 archive could not be decoded.", nameof(pkcs12Bytes), ex);
         }
 
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await ThrowIfUnfinishedPendingEnrollmentExistsAsync(cancellationToken);
@@ -1694,7 +1813,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -1738,7 +1857,7 @@ public sealed class CertificateAuthorityService
         ValidatedCsrRequest req = eval.ValidatedRequest;
         ApplicationUser user = eval.User;
 
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
@@ -1751,6 +1870,7 @@ public sealed class CertificateAuthorityService
                 return new(false, "No active Certificate Authority is configured.", null, null, null);
             }
 
+            EvictStaleRuntimeUnlockIfIncompatible([ca], []);
             string? passphrase = ResolveEffectivePassphrase();
             if (string.IsNullOrEmpty(passphrase))
             {
@@ -1967,7 +2087,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -1977,7 +2097,7 @@ public sealed class CertificateAuthorityService
         string revokedByUserName,
         CancellationToken cancellationToken = default)
     {
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
@@ -2005,6 +2125,7 @@ public sealed class CertificateAuthorityService
                 CaAuthorityRecord? ca = await db.CaAuthorities
                     .FirstOrDefaultAsync(c => c.Id == certRecord.CaAuthorityId.Value, cancellationToken);
 
+                EvictStaleRuntimeUnlockIfIncompatible(ca != null ? [ca] : [], []);
                 string? passphrase = ResolveEffectivePassphrase();
                 if (ca != null && !string.IsNullOrEmpty(passphrase))
                 {
@@ -2016,7 +2137,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -2058,7 +2179,7 @@ public sealed class CertificateAuthorityService
             return (false, "Serial number must be valid hexadecimal.");
         }
 
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
@@ -2111,6 +2232,7 @@ public sealed class CertificateAuthorityService
 
             await db.SaveChangesAsync(cancellationToken);
 
+            EvictStaleRuntimeUnlockIfIncompatible([ca], []);
             string? passphrase = ResolveEffectivePassphrase();
             if (!string.IsNullOrEmpty(passphrase))
             {
@@ -2121,13 +2243,13 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
     public async Task<PublishedCrlRecord?> RefreshActiveCrlAsync(CancellationToken cancellationToken = default)
     {
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
@@ -2140,6 +2262,7 @@ public sealed class CertificateAuthorityService
                 return null;
             }
 
+            EvictStaleRuntimeUnlockIfIncompatible([ca], []);
             string? passphrase = ResolveEffectivePassphrase();
             if (string.IsNullOrEmpty(passphrase))
             {
@@ -2155,7 +2278,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -2163,17 +2286,18 @@ public sealed class CertificateAuthorityService
         TimeSpan dueWithin,
         CancellationToken cancellationToken = default)
     {
-        await SigningAndSerialLock.WaitAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
             DateTimeOffset now = DateTimeOffset.UtcNow;
             DateTimeOffset dueBefore = now.Add(dueWithin);
-            string? passphrase = ResolveEffectivePassphrase();
 
             List<CaAuthorityRecord> authorities = await db.CaAuthorities
                 .OrderBy(c => c.Id)
                 .ToListAsync(cancellationToken);
+            EvictStaleRuntimeUnlockIfIncompatible(authorities, []);
+            string? passphrase = ResolveEffectivePassphrase();
             List<IssuedCertificateRecord> maintainedCertificates = await db.IssuedCertificates
                 .Where(c => c.CaAuthorityId.HasValue
                          && (c.Status == IssuanceStatus.Issued || c.Status == IssuanceStatus.Revoked))
@@ -2253,7 +2377,7 @@ public sealed class CertificateAuthorityService
         }
         finally
         {
-            SigningAndSerialLock.Release();
+            await lifecycleLock.DisposeAsync();
         }
     }
 
@@ -3040,15 +3164,6 @@ public sealed class CertificateAuthorityService
                 $"The supplied CA storage passphrase does not match the configured persistent CA custody secret ({configuredSource}). All CA keys must use the same custody passphrase so the active issuer and historical CRLs remain operational across restarts.");
         }
 
-        if (!requireExistingKeyForUnlock
-            && !_isExplicitlyLocked
-            && !string.IsNullOrEmpty(_runtimeUnlockedPassphrase)
-            && !PassphrasesEqual(candidatePassphrase, _runtimeUnlockedPassphrase))
-        {
-            throw new InvalidOperationException(
-                "The supplied CA storage passphrase does not match the currently unlocked runtime CA passphrase. All active and historical CA keys must share one storage passphrase.");
-        }
-
         DateTimeOffset now = DateTimeOffset.UtcNow;
         List<CaAuthorityRecord> authorities = await db.CaAuthorities
             .OrderBy(c => c.Id)
@@ -3059,6 +3174,17 @@ public sealed class CertificateAuthorityService
                      && p.Status != PendingCaEnrollmentStatus.Cancelled)
             .OrderBy(p => p.Id)
             .ToListAsync(cancellationToken);
+
+        EvictStaleRuntimeUnlockIfIncompatible(authorities, pendingEnrollments);
+
+        if (!requireExistingKeyForUnlock
+            && !_isExplicitlyLocked
+            && !string.IsNullOrEmpty(_runtimeUnlockedPassphrase)
+            && !PassphrasesEqual(candidatePassphrase, _runtimeUnlockedPassphrase))
+        {
+            throw new InvalidOperationException(
+                "The supplied CA storage passphrase does not match the currently unlocked runtime CA passphrase. All active and historical CA keys must share one storage passphrase.");
+        }
 
         if (requireExistingKeyForUnlock && authorities.Count == 0 && pendingEnrollments.Count == 0)
         {
@@ -3102,6 +3228,35 @@ public sealed class CertificateAuthorityService
                 throw new InvalidOperationException(
                     $"CA key custody validation failed for pending CA request '{pending.CaName}' (ID #{pending.Id}): {pendingErr}");
             }
+        }
+    }
+
+    private void EvictStaleRuntimeUnlockIfIncompatible(
+        IReadOnlyCollection<CaAuthorityRecord> authorities,
+        IReadOnlyCollection<PendingCaEnrollmentRecord> pendingEnrollments)
+    {
+        if (string.IsNullOrEmpty(_runtimeUnlockedPassphrase))
+        {
+            return;
+        }
+
+        string? configured = ResolveConfiguredPassphrase();
+        if (!string.IsNullOrEmpty(configured) && !PassphrasesEqual(_runtimeUnlockedPassphrase, configured))
+        {
+            _runtimeUnlockedPassphrase = null;
+            return;
+        }
+
+        bool anyAuthorityIncompatible = authorities.Any(a =>
+            File.Exists(a.EncryptedPrivateKeyPath)
+            && !TryVerifyAuthorityKey(a, _runtimeUnlockedPassphrase, out _));
+        bool anyPendingIncompatible = pendingEnrollments.Any(p =>
+            File.Exists(p.EncryptedPrivateKeyPath)
+            && !TryVerifyPendingKey(p, _runtimeUnlockedPassphrase, out _));
+
+        if (anyAuthorityIncompatible || anyPendingIncompatible)
+        {
+            _runtimeUnlockedPassphrase = null;
         }
     }
 
