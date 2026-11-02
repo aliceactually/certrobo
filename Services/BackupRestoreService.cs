@@ -19,7 +19,10 @@ public sealed class BackupRestoreService(
         CancellationToken cancellationToken = default)
     {
         string tempSnapshotDb = Path.Combine(Path.GetTempPath(), $"certrobo-backup-{Guid.NewGuid():N}.db");
-        await CertificateAuthorityService.AcquireLifecycleLockAsync(cancellationToken);
+        IAsyncDisposable lifecycleLock = await CertificateAuthorityService.AcquireLifecycleLockAsync(
+            caOptions.StorageDirectory,
+            cancellationToken,
+            TimeSpan.FromMilliseconds(Math.Max(100, caOptions.CrossProcessLockTimeoutMs)));
         try
         {
             await using (CertRoboDbContext db = await dbFactory.CreateDbContextAsync(cancellationToken))
@@ -72,7 +75,7 @@ public sealed class BackupRestoreService(
             }
             finally
             {
-                CertificateAuthorityService.ReleaseLifecycleLock();
+                await lifecycleLock.DisposeAsync();
             }
         }
     }
@@ -83,39 +86,50 @@ public sealed class BackupRestoreService(
         string targetCaStorageDir,
         string targetDataProtectionKeysDir)
     {
-        SqliteConnection.ClearAllPools();
-
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(targetSqliteFilePath))!);
-        Directory.CreateDirectory(targetCaStorageDir);
-        Directory.CreateDirectory(targetDataProtectionKeysDir);
-
-        using MemoryStream ms = new(archiveBytes);
-        using ZipArchive zip = new(ms, ZipArchiveMode.Read);
-
-        foreach (ZipArchiveEntry entry in zip.Entries)
+        IAsyncDisposable lifecycleLock = CertificateAuthorityService
+            .AcquireLifecycleLockAsync(targetCaStorageDir)
+            .GetAwaiter()
+            .GetResult();
+        try
         {
-            if (entry.FullName == "database/certrobo.db")
-            {
-                entry.ExtractToFile(targetSqliteFilePath, overwrite: true);
-                RestrictFilePermissionsIfUnix(targetSqliteFilePath);
-            }
-            else if (entry.FullName.StartsWith("ca/", StringComparison.Ordinal) && entry.FullName.EndsWith(".p8.enc", StringComparison.Ordinal))
-            {
-                string fileName = Path.GetFileName(entry.FullName);
-                string destPath = Path.Combine(targetCaStorageDir, fileName);
-                entry.ExtractToFile(destPath, overwrite: true);
-                RestrictFilePermissionsIfUnix(destPath);
-            }
-            else if (entry.FullName.StartsWith("dataprotection/", StringComparison.Ordinal) && entry.FullName.EndsWith(".xml", StringComparison.Ordinal))
-            {
-                string fileName = Path.GetFileName(entry.FullName);
-                string destPath = Path.Combine(targetDataProtectionKeysDir, fileName);
-                entry.ExtractToFile(destPath, overwrite: true);
-                RestrictFilePermissionsIfUnix(destPath);
-            }
-        }
+            SqliteConnection.ClearAllPools();
 
-        RewriteRestoredKeyPaths(targetSqliteFilePath, targetCaStorageDir);
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(targetSqliteFilePath))!);
+            Directory.CreateDirectory(targetCaStorageDir);
+            Directory.CreateDirectory(targetDataProtectionKeysDir);
+
+            using MemoryStream ms = new(archiveBytes);
+            using ZipArchive zip = new(ms, ZipArchiveMode.Read);
+
+            foreach (ZipArchiveEntry entry in zip.Entries)
+            {
+                if (entry.FullName == "database/certrobo.db")
+                {
+                    entry.ExtractToFile(targetSqliteFilePath, overwrite: true);
+                    RestrictFilePermissionsIfUnix(targetSqliteFilePath);
+                }
+                else if (entry.FullName.StartsWith("ca/", StringComparison.Ordinal) && entry.FullName.EndsWith(".p8.enc", StringComparison.Ordinal))
+                {
+                    string fileName = Path.GetFileName(entry.FullName);
+                    string destPath = Path.Combine(targetCaStorageDir, fileName);
+                    entry.ExtractToFile(destPath, overwrite: true);
+                    RestrictFilePermissionsIfUnix(destPath);
+                }
+                else if (entry.FullName.StartsWith("dataprotection/", StringComparison.Ordinal) && entry.FullName.EndsWith(".xml", StringComparison.Ordinal))
+                {
+                    string fileName = Path.GetFileName(entry.FullName);
+                    string destPath = Path.Combine(targetDataProtectionKeysDir, fileName);
+                    entry.ExtractToFile(destPath, overwrite: true);
+                    RestrictFilePermissionsIfUnix(destPath);
+                }
+            }
+
+            RewriteRestoredKeyPaths(targetSqliteFilePath, targetCaStorageDir);
+        }
+        finally
+        {
+            lifecycleLock.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
     }
 
     private static void RewriteRestoredKeyPaths(string sqliteFilePath, string caStorageDir)

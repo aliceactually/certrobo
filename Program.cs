@@ -73,7 +73,10 @@ CaKeyCustodyOptions caOptions = new()
     PassphraseFilePath = builder.Configuration["CertRobo:CaPassphraseFile"],
     ConfiguredPassphrase = builder.Configuration["CertRobo:CaPassphrase"],
     PublicBaseUrl = builder.Configuration["CertRobo:PublicBaseUrl"],
-    CrlValidityHours = int.TryParse(builder.Configuration["CertRobo:CrlValidityHours"], out int crlHrs) ? crlHrs : 168
+    CrlValidityHours = int.TryParse(builder.Configuration["CertRobo:CrlValidityHours"], out int crlHrs) ? crlHrs : 168,
+    CrossProcessLockTimeoutMs = int.TryParse(builder.Configuration["CertRobo:CrossProcessLockTimeoutMs"], out int lockTimeoutMs) && lockTimeoutMs > 0
+        ? lockTimeoutMs
+        : 30_000
 };
 builder.Services.AddSingleton(caOptions);
 
@@ -168,16 +171,25 @@ using (IServiceScope scope = app.Services.CreateScope())
             return;
         }
         string outputZipPath = args[backupFlagIdx + 1];
-        BackupRestoreService backupService = scope.ServiceProvider.GetRequiredService<BackupRestoreService>();
-        byte[] archiveBytes = await backupService.CreateConsistentBackupArchiveAsync(sqliteDbPath, dpKeysDir);
-        string? parentDir = Path.GetDirectoryName(Path.GetFullPath(outputZipPath));
-        if (!string.IsNullOrEmpty(parentDir))
+        try
         {
-            Directory.CreateDirectory(parentDir);
+            BackupRestoreService backupService = scope.ServiceProvider.GetRequiredService<BackupRestoreService>();
+            byte[] archiveBytes = await backupService.CreateConsistentBackupArchiveAsync(sqliteDbPath, dpKeysDir);
+            string? parentDir = Path.GetDirectoryName(Path.GetFullPath(outputZipPath));
+            if (!string.IsNullOrEmpty(parentDir))
+            {
+                Directory.CreateDirectory(parentDir);
+            }
+            await File.WriteAllBytesAsync(outputZipPath, archiveBytes);
+            Console.WriteLine($"Consistent backup written to '{outputZipPath}' ({archiveBytes.Length} bytes).");
+            return;
         }
-        await File.WriteAllBytesAsync(outputZipPath, archiveBytes);
-        Console.WriteLine($"Consistent backup written to '{outputZipPath}' ({archiveBytes.Length} bytes).");
-        return;
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Backup failed: {ex.Message}");
+            Environment.ExitCode = 1;
+            return;
+        }
     }
 
     // Handle CLI legacy settings.xml inspection / defaults import:
@@ -267,25 +279,34 @@ using (IServiceScope scope = app.Services.CreateScope())
 
         SubjectDefaultsConfig defaults = await accountService.GetSubjectDefaultsAsync();
         CaAuthorityRecord? parent = subordinate ? await caService.GetActiveAuthorityAsync() : null;
-        CaAuthorityRecord created = await caService.CreateSelfSignedOrIntermediateCaAsync(
-            caName,
-            commonName,
-            defaults.Country,
-            defaults.StateOrProvince,
-            defaults.Locality,
-            defaults.Organisation,
-            defaults.OrganisationalUnit,
-            family,
-            bits,
-            validityDays,
-            passphrase,
-            crlDistributionPointUrl: cdpUrl,
-            authorityIssuerCertUrl: aiaUrl,
-            parentAuthority: parent,
-            parentPassphrase: passphrase);
+        try
+        {
+            CaAuthorityRecord created = await caService.CreateSelfSignedOrIntermediateCaAsync(
+                caName,
+                commonName,
+                defaults.Country,
+                defaults.StateOrProvince,
+                defaults.Locality,
+                defaults.Organisation,
+                defaults.OrganisationalUnit,
+                family,
+                bits,
+                validityDays,
+                passphrase,
+                crlDistributionPointUrl: cdpUrl,
+                authorityIssuerCertUrl: aiaUrl,
+                parentAuthority: parent,
+                parentPassphrase: passphrase);
 
-        Console.WriteLine($"Initialized and activated {(created.IsIntermediate ? "Intermediate" : "Root")} CA '{created.Name}' (SKI={created.SubjectKeyIdentifierHex}).");
-        return;
+            Console.WriteLine($"Initialized and activated {(created.IsIntermediate ? "Intermediate" : "Root")} CA '{created.Name}' (SKI={created.SubjectKeyIdentifierHex}).");
+            return;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"CA initialization failed: {ex.Message}");
+            Environment.ExitCode = 1;
+            return;
+        }
     }
 
     // Handle CLI external CA CSR generation:
@@ -325,25 +346,34 @@ using (IServiceScope scope = app.Services.CreateScope())
         }
 
         SubjectDefaultsConfig defaults = await accountService.GetSubjectDefaultsAsync();
-        PendingCaEnrollmentRecord pending = await caService.CreatePendingCaEnrollmentAsync(
-            caName,
-            commonName,
-            defaults.Country,
-            defaults.StateOrProvince,
-            defaults.Locality,
-            defaults.Organisation,
-            defaults.OrganisationalUnit,
-            family,
-            bits,
-            passphrase,
-            requestedPathLengthConstraint: 0,
-            crlDistributionPointUrl: cdpUrl,
-            authorityIssuerCertUrl: aiaUrl,
-            emailAddress: defaults.EmailAddress);
+        try
+        {
+            PendingCaEnrollmentRecord pending = await caService.CreatePendingCaEnrollmentAsync(
+                caName,
+                commonName,
+                defaults.Country,
+                defaults.StateOrProvince,
+                defaults.Locality,
+                defaults.Organisation,
+                defaults.OrganisationalUnit,
+                family,
+                bits,
+                passphrase,
+                requestedPathLengthConstraint: 0,
+                crlDistributionPointUrl: cdpUrl,
+                authorityIssuerCertUrl: aiaUrl,
+                emailAddress: defaults.EmailAddress);
 
-        await File.WriteAllTextAsync(outCsrPath, pending.CsrPem);
-        Console.WriteLine($"Generated pending Issuing CA request #{pending.Id} '{pending.CaName}' (SKI={pending.SubjectKeyIdentifierHex}) -> {outCsrPath}");
-        return;
+            await File.WriteAllTextAsync(outCsrPath, pending.CsrPem);
+            Console.WriteLine($"Generated pending Issuing CA request #{pending.Id} '{pending.CaName}' (SKI={pending.SubjectKeyIdentifierHex}) -> {outCsrPath}");
+            return;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"External CA request failed: {ex.Message}");
+            Environment.ExitCode = 1;
+            return;
+        }
     }
 
     // Handle CLI external CA completion & activation:
@@ -407,9 +437,116 @@ using (IServiceScope scope = app.Services.CreateScope())
             return;
         }
 
-        CaAuthorityRecord activated = await caService.ActivatePendingCaEnrollmentAsync(pending.Id);
-        Console.WriteLine($"Validated and activated external Issuing CA '{activated.Name}' (SKI={activated.SubjectKeyIdentifierHex}).");
+        try
+        {
+            CaAuthorityRecord activated = await caService.ActivatePendingCaEnrollmentAsync(pending.Id);
+            Console.WriteLine($"Validated and activated external Issuing CA '{activated.Name}' (SKI={activated.SubjectKeyIdentifierHex}).");
+            return;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"External CA activation failed: {ex.Message}");
+            Environment.ExitCode = 1;
+            return;
+        }
+    }
+
+    // Handle CLI CA custody diagnostic verification:
+    // dotnet run -- --verify-ca-custody
+    if (args.Contains("--verify-ca-custody", StringComparer.OrdinalIgnoreCase))
+    {
+        CertificateAuthorityService caService = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
+        CaKeyCustodyReport report = await caService.InspectKeyCustodyAsync();
+        Console.WriteLine($"Configured Persistent Custody: {(report.HasConfiguredPersistentPassphrase ? report.ConfiguredPersistentSource : "None (manual runtime unlock required after restart)")}");
+        Console.WriteLine($"Effective Passphrase Available: {report.HasEffectivePassphrase}");
+        foreach (CaAuthorityKeyCustodyStatus auth in report.Authorities)
+        {
+            string status = auth.CanDecryptWithEffectivePassphrase ? "OK" : $"FAILED ({auth.FailureReason})";
+            Console.WriteLine($"CA #{auth.CaAuthorityId} '{auth.CaName}' (Active={auth.IsActive}, MaintainCrl={auth.RequiresCrlMaintenance}): {status}");
+        }
+        if (report.PendingEnrollment != null)
+        {
+            string pStatus = report.PendingEnrollment.CanDecryptWithEffectivePassphrase
+                ? "OK"
+                : $"FAILED ({report.PendingEnrollment.FailureReason})";
+            Console.WriteLine($"Pending CA #{report.PendingEnrollment.PendingEnrollmentId} '{report.PendingEnrollment.CaName}': {pStatus}");
+        }
+
+        bool hasStoredKeys = report.Authorities.Count > 0 || report.PendingEnrollment != null;
+        if (!report.IsCustodyHealthy || (hasStoredKeys && !report.HasEffectivePassphrase))
+        {
+            Console.Error.WriteLine("CA key custody check failed: one or more stored CA keys cannot be unlocked with the current custody secret.");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        Console.WriteLine("CA key custody check passed.");
         return;
+    }
+
+    // Handle CLI CA key re-protection / migration to shared custody secret:
+    // dotnet run -- --reprotect-ca-keys <sourcePassphraseFile>
+    int reprotectIdx = Array.IndexOf(args, "--reprotect-ca-keys");
+    if (reprotectIdx >= 0)
+    {
+        if (reprotectIdx + 1 >= args.Length)
+        {
+            Console.Error.WriteLine("Usage: --reprotect-ca-keys <sourcePassphraseFile>");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        string sourcePassFile = args[reprotectIdx + 1];
+        if (!File.Exists(sourcePassFile))
+        {
+            Console.Error.WriteLine($"Source passphrase file not found: {sourcePassFile}");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        CertificateAuthorityService caService = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
+        string? targetPassphrase = caService.ResolveConfiguredPassphrase();
+        if (string.IsNullOrEmpty(targetPassphrase))
+        {
+            Console.Error.WriteLine("Target CA storage passphrase must be configured via CERTROBO_CA_PASSPHRASE, CertRobo:CaPassphraseFile, or CertRobo:CaPassphrase.");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        string[] sourceLines = (await File.ReadAllLinesAsync(sourcePassFile))
+            .Select(l => l.Trim())
+            .Where(l => !string.IsNullOrEmpty(l))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (sourceLines.Length == 0)
+        {
+            Console.Error.WriteLine("Source passphrase file did not contain any non-empty passphrases.");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        try
+        {
+            CaKeyReprotectionResult reprotectResult = await caService.ReprotectCaKeysAsync(
+                sourceLines,
+                targetPassphrase);
+            CaKeyCustodyReport postReport = await caService.InspectKeyCustodyAsync();
+            if (!postReport.IsCustodyHealthy || !postReport.HasEffectivePassphrase)
+            {
+                Console.Error.WriteLine("CA key re-protection failed post-migration custody verification.");
+                Environment.ExitCode = 1;
+                return;
+            }
+            Console.WriteLine(reprotectResult.SummaryMessage);
+            return;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"CA key re-protection failed: {ex.Message}");
+            Environment.ExitCode = 1;
+            return;
+        }
     }
 
     // Handle CLI CSR issuance:

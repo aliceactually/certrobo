@@ -190,7 +190,14 @@
                             <div class="operation-panel">
                                 <h4>Signing Key Custody</h4>
                                 <p class="text-muted-theme small mb-2">
-                                    Provide the storage passphrase to unlock the encrypted PKCS#8 CA private key in runtime memory.
+                                    @if (custodyReport?.HasConfiguredPersistentPassphrase == true)
+                                    {
+                                        <span>Persistent custody is configured (@custodyReport.ConfiguredPersistentSource). All active and maintained historical CA keys must use this shared custody passphrase.</span>
+                                    }
+                                    else
+                                    {
+                                        <span>No persistent passphrase file or environment secret is configured. Provide the storage passphrase to unlock the CA key in runtime memory (resets to locked on service restart).</span>
+                                    }
                                 </p>
                                 <div class="mb-2">
                                     <label class="form-label" for="ca-unlock-passphrase">CA Key Passphrase</label>
@@ -202,6 +209,12 @@
                                                autocomplete="off"
                                                @bind="unlockPassphrase" />
                                         <RadzenButton Text="Unlock CA" Click="@UnlockCaClick" />
+                                        @if (IsCaUnlocked)
+                                        {
+                                            <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="LockCaClick">
+                                                Lock Runtime Key
+                                            </button>
+                                        }
                                     </div>
                                 </div>
                             </div>
@@ -220,6 +233,33 @@
                             </div>
                         </div>
                     </div>
+
+                    @if (custodyReport != null && !custodyReport.IsCustodyHealthy && custodyReport.HasEffectivePassphrase)
+                    {
+                        <div class="alert alert-warning mb-3" role="alert">
+                            <strong>CA Key Custody Attention Required:</strong>
+                            One or more stored CA keys cannot be unlocked with the current shared custody passphrase.
+                            <ul class="mb-2 mt-1 small">
+                                @foreach (var badAuth in custodyReport.Authorities.Where(a => !a.CanDecryptWithEffectivePassphrase || (custodyReport.HasConfiguredPersistentPassphrase && !a.CanDecryptWithConfiguredPassphrase)))
+                                {
+                                    <li><strong>@badAuth.CaName (ID #@badAuth.CaAuthorityId):</strong> @badAuth.FailureReason</li>
+                                }
+                            </ul>
+                            <div class="row g-2 align-items-end">
+                                <div class="col-md-5">
+                                    <label class="form-label small mb-1" for="reprotect-legacy-passphrase">Previous Key Passphrase (for incompatible key)</label>
+                                    <input id="reprotect-legacy-passphrase"
+                                           class="form-control form-control-sm"
+                                           type="password"
+                                           autocomplete="off"
+                                           @bind="reprotectSourcePassphrase" />
+                                </div>
+                                <div class="col-md-4">
+                                    <RadzenButton Text="Re-protect Keys to Current Custody" Size="ButtonSize.Small" Click="@ReprotectIncompatibleKeysClick" />
+                                </div>
+                            </div>
+                        </div>
+                    }
 
                     <div class="pt-3 border-top d-flex flex-wrap align-items-center justify-content-between gap-2">
                         <div>
@@ -1488,6 +1528,7 @@
     private CaProvisionMode caProvisionMode = CaProvisionMode.None;
 
     private CaAuthorityRecord? activeCa;
+    private CaKeyCustodyReport? custodyReport;
     private PendingCaEnrollmentRecord? pendingEnrollment;
     private CaActivationPreviewSummary? pendingActivationSummary;
     private AdCsCesConnectorConfig cesConfig = new();
@@ -1500,6 +1541,7 @@
 
     // CA Unlock / Create / Import state
     private string unlockPassphrase = "";
+    private string reprotectSourcePassphrase = "";
     private string newCaName = "CertRobo Root CA";
     private string newCaCommonName = "ca.contoso.com";
     private string newCaKeySpec = "ECDSA-384";
@@ -1568,7 +1610,9 @@
     private string seedCommonName = "";
     private int seedReasonCode = 0;
 
-    private bool IsCaUnlocked => !string.IsNullOrEmpty(CaService.ResolveEffectivePassphrase());
+    private bool IsCaUnlocked =>
+        !string.IsNullOrEmpty(CaService.ResolveEffectivePassphrase())
+        && (activeCa == null || custodyReport?.ActiveAuthorityDecryptable != false);
 
     private UserSummaryDto? SelectedUser =>
         users.FirstOrDefault(u => u.Id == selectedUserId) ?? users.FirstOrDefault();
@@ -1653,6 +1697,7 @@
     private async Task ReloadAllAsync()
     {
         activeCa = await CaService.GetActiveAuthorityAsync();
+        custodyReport = await CaService.InspectKeyCustodyAsync();
         pendingEnrollment = await CaService.GetActivePendingEnrollmentAsync();
         pendingActivationSummary = CertificateAuthorityService.DeserializeActivationSummary(pendingEnrollment);
         if (pendingEnrollment != null && !string.IsNullOrWhiteSpace(pendingEnrollment.UpstreamRequestId))
@@ -1727,19 +1772,52 @@
         }
     }
 
-    private Task UnlockCaClick()
+    private async Task UnlockCaClick()
     {
         try
         {
-            CaService.UnlockRuntimePassphrase(unlockPassphrase);
+            await CaService.UnlockRuntimePassphraseAsync(unlockPassphrase);
             unlockPassphrase = "";
-            Notify(Radzen.NotificationSeverity.Success, "CA Unlocked", "CA passphrase set in runtime memory.");
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Success, "CA Unlocked", "Verified CA signing key custody and unlocked passphrase in runtime memory.");
         }
         catch (Exception ex)
         {
-            Notify(Radzen.NotificationSeverity.Error, "Error", ex.Message);
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Error, "Unlock Error", ex.Message);
         }
-        return Task.CompletedTask;
+    }
+
+    private async Task LockCaClick()
+    {
+        CaService.LockRuntimePassphrase();
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Info, "CA Locked", "Cleared runtime CA passphrase from memory.");
+    }
+
+    private async Task ReprotectIncompatibleKeysClick()
+    {
+        try
+        {
+            string? targetPass = CaService.ResolveEffectivePassphrase();
+            if (string.IsNullOrEmpty(targetPass))
+            {
+                Notify(Radzen.NotificationSeverity.Error, "Recovery Error", "Unlock or configure the target CA storage passphrase before re-protecting keys.");
+                return;
+            }
+
+            CaKeyReprotectionResult result = await CaService.ReprotectCaKeysAsync(
+                reprotectSourcePassphrase,
+                targetPass);
+            reprotectSourcePassphrase = "";
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Success, "CA Keys Re-protected", result.SummaryMessage);
+        }
+        catch (Exception ex)
+        {
+            await ReloadAllAsync();
+            Notify(Radzen.NotificationSeverity.Error, "Recovery Error", ex.Message);
+        }
     }
 
     private async Task RefreshCrlClick()
@@ -1769,6 +1847,10 @@
                 _ => (CertificateKeyFamily.Rsa, 4096)
             };
 
+            string effectivePass = !string.IsNullOrWhiteSpace(newCaPassphrase)
+                ? newCaPassphrase
+                : (CaService.ResolveEffectivePassphrase() ?? string.Empty);
+
             CaAuthorityRecord? parent = createAsSubordinateOfActive ? activeCa : null;
             await CaService.CreateSelfSignedOrIntermediateCaAsync(
                 newCaName,
@@ -1781,11 +1863,11 @@
                 family,
                 bits,
                 newCaValidityDays,
-                newCaPassphrase,
+                effectivePass,
                 crlDistributionPointUrl: newCaCdpUrl,
                 authorityIssuerCertUrl: newCaAiaUrl,
                 parentAuthority: parent,
-                parentPassphrase: CaService.ResolveEffectivePassphrase() ?? newCaPassphrase);
+                parentPassphrase: effectivePass);
 
             newCaPassphrase = "";
             caProvisionMode = CaProvisionMode.None;
@@ -1802,13 +1884,17 @@
     {
         try
         {
+            string effectiveStoragePass = !string.IsNullOrWhiteSpace(importStoragePassphrase)
+                ? importStoragePassphrase
+                : (CaService.ResolveEffectivePassphrase() ?? string.Empty);
+
             await CaService.ImportCaAsync(
                 importCaName,
                 importCertPem,
                 string.IsNullOrWhiteSpace(importChainPem) ? null : importChainPem,
                 importKeyPem,
                 string.IsNullOrWhiteSpace(importInputPassphrase) ? null : importInputPassphrase,
-                importStoragePassphrase,
+                effectiveStoragePass,
                 crlDistributionPointUrl: newCaCdpUrl,
                 authorityIssuerCertUrl: newCaAiaUrl,
                 initialSerialFloor: importSerialFloor,
