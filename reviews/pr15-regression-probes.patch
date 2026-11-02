@@ -1,0 +1,74 @@
+diff --git a/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs b/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
+index 527417f..9331665 100644
+--- a/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
++++ b/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
+@@ -761,0 +762,69 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
++    [Fact]
++    public async Task ReviewProbe_EquivalentSerialsProducePermanentPendingLoop()
++    {
++        const string secret = "Disposable-Test-Secret-Only!2026";
++        string dbPath = Path.Combine(_tempRoot, "leading-zero.db");
++        string caDir = Path.Combine(_tempRoot, "leading-zero-ca");
++        using ServiceProvider sp = BuildServiceProvider(dbPath, caDir, configuredPassphrase: secret);
++        CertificateAuthorityService caService = sp.GetRequiredService<CertificateAuthorityService>();
++        ApplicationUser admin = await BootstrapAdminAsync(sp);
++        await caService.CreateSelfSignedOrIntermediateCaAsync(
++            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
++            CertificateKeyFamily.Ecdsa, 256, 365, secret);
++        IssuanceOutcome leaf = await IssueLeafAsync(caService, admin.Id, "host.contoso.com");
++        RevocationOutcome first = await caService.RevokeCertificateAsync(leaf.Record!.Id, CrlReason.KeyCompromise, "admin");
++        Assert.True(first.CrlPublished);
++        RevocationOutcome seeded = await caService.SeedRevokedSerialAsync("00" + leaf.Record.SerialNumberHex, "host.contoso.com", CrlReason.Superseded, "admin");
++        Assert.True(seeded.CrlPublished);
++        Assert.Single(await caService.GetCertificateIdsWithUnpublishedRevocationsAsync());
++        long initialCrlNumber = seeded.PublishedCrl!.CrlNumber;
++        for (int i = 0; i < 2; i++)
++        {
++            IReadOnlyList<CrlRefreshOutcome> retry = await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
++            Assert.Single(retry);
++            Assert.True(retry[0].Succeeded);
++            Assert.Equal(initialCrlNumber + i + 1, retry[0].PublishedCrl!.CrlNumber);
++            Assert.Single(await caService.GetCertificateIdsWithUnpublishedRevocationsAsync());
++        }
++    }
++
++    [Fact]
++    public async Task ReviewProbe_RealPersistenceFailureContaminatesOtherIssuerRefresh()
++    {
++        const string secret = "Disposable-Test-Secret-Only!2026";
++        string dbPath = Path.Combine(_tempRoot, "failure-isolation.db");
++        string caDir = Path.Combine(_tempRoot, "failure-isolation-ca");
++        using ServiceProvider sp = BuildServiceProvider(dbPath, caDir, configuredPassphrase: secret);
++        CertificateAuthorityService caService = sp.GetRequiredService<CertificateAuthorityService>();
++        ApplicationUser admin = await BootstrapAdminAsync(sp);
++        CaAuthorityRecord a = await caService.CreateSelfSignedOrIntermediateCaAsync(
++            "CA A", "a.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
++            CertificateKeyFamily.Ecdsa, 256, 365, secret);
++        IssuanceOutcome leafA = await IssueLeafAsync(caService, admin.Id, "a1.contoso.com");
++        CaAuthorityRecord b = await caService.CreateSelfSignedOrIntermediateCaAsync(
++            "CA B", "b.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
++            CertificateKeyFamily.Ecdsa, 256, 365, secret);
++        IssuanceOutcome leafB = await IssueLeafAsync(caService, admin.Id, "b1.contoso.com");
++        caService.LockRuntimePassphrase();
++        Assert.True((await caService.RevokeCertificateAsync(leafA.Record!.Id, CrlReason.KeyCompromise, "admin")).IsPendingPublication);
++        Assert.True((await caService.RevokeCertificateAsync(leafB.Record!.Id, CrlReason.KeyCompromise, "admin")).IsPendingPublication);
++        caService.UnlockRuntimePassphrase(secret);
++        using (IServiceScope scope = sp.CreateScope())
++        {
++            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++            await db.Database.ExecuteSqlRawAsync($"CREATE TRIGGER fail_first_issuer BEFORE INSERT ON PublishedCrls WHEN NEW.CaAuthorityId = {a.Id} BEGIN SELECT RAISE(ABORT, 'synthetic issuer-specific failure'); END;");
++        }
++        IReadOnlyList<CrlRefreshOutcome> results = await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
++        Assert.False(results.Single(x => x.CaAuthorityId == a.Id).Succeeded);
++        Assert.False(results.Single(x => x.CaAuthorityId == b.Id).Succeeded);
++        Assert.Equal(1, (await caService.GetLatestCrlAsync(caAuthorityId: b.Id))!.CrlNumber);
++        using (IServiceScope scope = sp.CreateScope())
++        {
++            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++            await db.Database.ExecuteSqlRawAsync("DROP TRIGGER fail_first_issuer;");
++        }
++        IReadOnlyList<CrlRefreshOutcome> retry = await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
++        Assert.All(retry, result => Assert.True(result.Succeeded, result.ErrorMessage));
++        Assert.Equal(2, (await caService.GetLatestCrlAsync(caAuthorityId: b.Id))!.CrlNumber);
++    }
++
