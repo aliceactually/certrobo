@@ -1,0 +1,54 @@
+diff --git a/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs b/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
+index 12a0ee4..5796f24 100644
+--- a/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
++++ b/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
+@@ -1574,0 +1575,49 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
++    [Fact]
++    public async Task ReviewRound4_SeedMatchingFailedIssuanceMustAppearOnCrl()
++    {
++        const string secret = "Disposable-Test-Secret-Only!2026";
++        using ServiceProvider sp = BuildServiceProvider(Path.Combine(_tempRoot, "r4failed.db"), Path.Combine(_tempRoot, "r4failed-ca"), configuredPassphrase: secret);
++        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
++        ApplicationUser admin = await BootstrapAdminAsync(sp);
++        CaAuthorityRecord ca = await service.CreateSelfSignedOrIntermediateCaAsync(
++            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI", CertificateKeyFamily.Ecdsa, 256, 365, secret);
++        using (IServiceScope scope = sp.CreateScope())
++        {
++            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++            db.IssuedCertificates.Add(new IssuedCertificateRecord {
++                CaAuthorityId = ca.Id, SerialNumberHex = "00ABCD", SerialNumberValue = 43981,
++                ProfileId = "test", CommonName = "failed.contoso.com", SubjectAlternativeNamesCsv = "",
++                SubjectDistinguishedName = "", IssuerDistinguishedName = "", KeyAlgorithm = "ECDSA", KeySizeBits = 256,
++                ThumbprintSha256 = "", RequestedByUserId = admin.Id, RequestedByUserName = "original",
++                Status = IssuanceStatus.Failed, FailureOrDenialReason = "Signing failed"
++            });
++            await db.SaveChangesAsync();
++        }
++        RevocationOutcome result = await service.SeedRevokedSerialAsync("ABCD", "legacy.contoso.com", CrlReason.KeyCompromise, "operator");
++        Assert.True(result.CrlPublished);
++        Assert.True(CrlContainsSerial(result.PublishedCrl!.CrlDer, "ABCD", CrlReason.KeyCompromise));
++    }
++
++    [Fact]
++    public async Task ReviewRound4_NewSeedAuditInsertFailureDoesNotLeaveSilentRevocation()
++    {
++        const string secret = "Disposable-Test-Secret-Only!2026";
++        using ServiceProvider sp = BuildServiceProvider(Path.Combine(_tempRoot, "r4atomic.db"), Path.Combine(_tempRoot, "r4atomic-ca"), configuredPassphrase: secret);
++        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
++        await BootstrapAdminAsync(sp);
++        CaAuthorityRecord ca = await service.CreateSelfSignedOrIntermediateCaAsync(
++            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI", CertificateKeyFamily.Ecdsa, 256, 365, secret);
++        await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(50));
++        using (IServiceScope scope = sp.CreateScope())
++        {
++            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++            await db.Database.ExecuteSqlRawAsync("CREATE TRIGGER reject_r4_event BEFORE INSERT ON SerialRevocationEvents BEGIN SELECT RAISE(FAIL, 'simulated audit insert failure'); END;");
++        }
++        await Assert.ThrowsAnyAsync<Exception>(() => service.SeedRevokedSerialAsync("ACDC", "legacy.contoso.com", CrlReason.KeyCompromise, "operator"));
++        Assert.False(await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(100)));
++        using IServiceScope checkScope = sp.CreateScope();
++        CertRoboDbContext checkDb = checkScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++        IssuedCertificateRecord? orphan = await checkDb.IssuedCertificates.FirstOrDefaultAsync(c => c.CaAuthorityId == ca.Id && c.SerialNumberHex == "ACDC");
++        Assert.Null(orphan);
++    }
++
