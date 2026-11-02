@@ -48,6 +48,33 @@ public sealed record CrlRefreshOutcome(
     PublishedCrlRecord? PublishedCrl,
     string? ErrorMessage);
 
+public enum RevocationPublicationStatus
+{
+    Rejected = 0,
+    Published = 1,
+    PendingSignerLocked = 2,
+    PendingPublicationFailed = 3,
+    PendingIssuerUnavailable = 4
+}
+
+public sealed record RevocationOutcome(
+    bool Succeeded,
+    bool RevocationAccepted,
+    bool CrlPublished,
+    RevocationPublicationStatus PublicationStatus,
+    string? ErrorMessage,
+    IssuedCertificateRecord? CertificateRecord = null,
+    PublishedCrlRecord? PublishedCrl = null)
+{
+    public bool IsPendingPublication => RevocationAccepted && !CrlPublished;
+
+    public void Deconstruct(out bool succeeded, out string? errorMessage)
+    {
+        succeeded = Succeeded;
+        errorMessage = ErrorMessage;
+    }
+}
+
 public sealed record CaAuthorityKeyCustodyStatus(
     int CaAuthorityId,
     string CaName,
@@ -107,6 +134,8 @@ public sealed class CertificateAuthorityService
 
     private string? _runtimeUnlockedPassphrase;
     private bool _isExplicitlyLocked;
+
+    public Action<CaAuthorityRecord>? CrlPublicationFaultInjector { get; set; }
 
     public CertificateAuthorityService(
         IDbContextFactory<CertRoboDbContext> dbFactory,
@@ -1482,11 +1511,17 @@ public sealed class CertificateAuthorityService
         string authorityIssuerCertUrl = "/ca.crt",
         CaAuthorityRecord? parentAuthority = null,
         string? parentPassphrase = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int? pathLengthConstraint = null)
     {
         if (string.IsNullOrWhiteSpace(passphrase))
         {
             throw new ArgumentException("A non-empty passphrase is required to protect the CA signing key.", nameof(passphrase));
+        }
+
+        if (pathLengthConstraint.HasValue && pathLengthConstraint.Value < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(pathLengthConstraint), "Path length constraint cannot be negative.");
         }
 
         IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
@@ -1518,12 +1553,14 @@ public sealed class CertificateAuthorityService
             CertificateRequest certReq = CreateCertificateRequestForKey(subjectDn, subjectKey);
 
             // CA BasicConstraints (critical)
-            bool isIntermediate = parentAuthority != null;
+            bool isSubordinate = parentAuthority != null;
+            bool hasPathLen = pathLengthConstraint.HasValue || isSubordinate;
+            int effectivePathLen = pathLengthConstraint ?? 0;
             certReq.CertificateExtensions.Add(
                 new X509BasicConstraintsExtension(
                     certificateAuthority: true,
-                    hasPathLengthConstraint: isIntermediate,
-                    pathLengthConstraint: isIntermediate ? 0 : 0,
+                    hasPathLengthConstraint: hasPathLen,
+                    pathLengthConstraint: hasPathLen ? effectivePathLen : 0,
                     critical: true));
 
             // CA KeyUsage: KeyCertSign | CrlSign | DigitalSignature (critical)
@@ -1588,6 +1625,22 @@ public sealed class CertificateAuthorityService
 
             using (issuedCaCert)
             {
+                bool validatedIsIntermediate;
+                string normalizedChainPem;
+                try
+                {
+                    ValidateCaCertificateAndKeyMatch(
+                        issuedCaCert,
+                        subjectKey,
+                        string.IsNullOrWhiteSpace(chainPem) ? null : chainPem,
+                        out validatedIsIntermediate,
+                        out normalizedChainPem);
+                }
+                catch (ArgumentException ex)
+                {
+                    throw new InvalidOperationException(ex.Message, ex);
+                }
+
                 string certPem = issuedCaCert.ExportCertificatePem() + "\n";
                 byte[] encryptedPkcs8 = subjectKey.ExportEncryptedPkcs8PrivateKey(
                     passphrase,
@@ -1598,9 +1651,9 @@ public sealed class CertificateAuthorityService
 
                 return await PersistAndActivateCaCoreAsync(
                     caName,
-                    isIntermediate,
+                    validatedIsIntermediate,
                     certPem,
-                    chainPem,
+                    normalizedChainPem,
                     encryptedPkcs8,
                     passphrase,
                     crlDistributionPointUrl,
@@ -1718,7 +1771,8 @@ public sealed class CertificateAuthorityService
         string authorityIssuerCertUrl = "/ca.crt",
         long initialSerialFloor = 1000,
         long initialCrlNumberFloor = 0,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? selectedCertificateThumbprintSha256 = null)
     {
         if (string.IsNullOrWhiteSpace(storagePassphrase))
         {
@@ -1759,57 +1813,116 @@ public sealed class CertificateAuthorityService
                     ex);
             }
 
-            X509Certificate2? caCertWithKey = collection.FirstOrDefault(c => c.HasPrivateKey)
-                ?? throw new ArgumentException("PKCS#12 archive does not contain a certificate with a private key.");
-
-            using AsymmetricAlgorithm key = ExtractExportablePrivateKey(caCertWithKey);
-
-            StringBuilder extraChainBuilder = new();
-            foreach (X509Certificate2 other in collection)
+            try
             {
-                if (!other.Thumbprint.Equals(caCertWithKey.Thumbprint, StringComparison.OrdinalIgnoreCase))
+                List<X509Certificate2> distinctCertsWithKey = [];
+                HashSet<string> seenKeyCertThumbprints = new(StringComparer.OrdinalIgnoreCase);
+                foreach (X509Certificate2 cert in collection)
                 {
-                    extraChainBuilder.AppendLine(other.ExportCertificatePem());
+                    if (cert.HasPrivateKey)
+                    {
+                        string sha256 = cert.GetCertHashString(HashAlgorithmName.SHA256);
+                        if (seenKeyCertThumbprints.Add(sha256))
+                        {
+                            distinctCertsWithKey.Add(cert);
+                        }
+                    }
                 }
-            }
 
-            ValidateCaCertificateAndKeyMatch(
-                caCertWithKey,
-                key,
-                extraChainBuilder.ToString(),
-                out bool isIntermediate,
-                out string normalizedChainPem);
+                if (distinctCertsWithKey.Count == 0)
+                {
+                    throw new ArgumentException("PKCS#12 archive does not contain a certificate with a private key.");
+                }
 
-            await using (CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken))
-            {
-                await db.EnsureSchemaUpgradedAsync(cancellationToken);
-                await ValidateCustodyCandidateCoreAsync(
-                    db,
+                X509Certificate2 caCertWithKey;
+                if (!string.IsNullOrWhiteSpace(selectedCertificateThumbprintSha256))
+                {
+                    string normalizedSelectedThumbprint = selectedCertificateThumbprintSha256
+                        .Trim()
+                        .Replace(":", "")
+                        .Replace(" ", "");
+                    caCertWithKey = distinctCertsWithKey.FirstOrDefault(c =>
+                            c.GetCertHashString(HashAlgorithmName.SHA256)
+                                .Equals(normalizedSelectedThumbprint, StringComparison.OrdinalIgnoreCase))
+                        ?? throw new ArgumentException(
+                            $"PKCS#12 archive does not contain a private-key certificate matching SHA-256 thumbprint '{normalizedSelectedThumbprint}'.",
+                            nameof(selectedCertificateThumbprintSha256));
+                }
+                else if (distinctCertsWithKey.Count > 1)
+                {
+                    string candidatesSummary = string.Join(
+                        "; ",
+                        distinctCertsWithKey
+                            .OrderBy(c => c.GetCertHashString(HashAlgorithmName.SHA256), StringComparer.OrdinalIgnoreCase)
+                            .Select(c => $"'{c.Subject}' (SHA-256: {c.GetCertHashString(HashAlgorithmName.SHA256)})"));
+                    throw new ArgumentException(
+                        $"PKCS#12 archive is ambiguous because it contains {distinctCertsWithKey.Count} distinct certificates with private keys ({candidatesSummary}). Provide a PKCS#12 archive containing only the single target CA private key (plus optional public chain certificates) or specify selectedCertificateThumbprintSha256 explicitly.",
+                        nameof(pkcs12Bytes));
+                }
+                else
+                {
+                    caCertWithKey = distinctCertsWithKey[0];
+                }
+
+                using AsymmetricAlgorithm key = ExtractExportablePrivateKey(caCertWithKey);
+
+                string selectedSha256 = caCertWithKey.GetCertHashString(HashAlgorithmName.SHA256);
+                HashSet<string> addedChainThumbprints = new(StringComparer.OrdinalIgnoreCase) { selectedSha256 };
+                StringBuilder extraChainBuilder = new();
+                foreach (X509Certificate2 other in collection)
+                {
+                    string otherSha256 = other.GetCertHashString(HashAlgorithmName.SHA256);
+                    if (addedChainThumbprints.Add(otherSha256))
+                    {
+                        extraChainBuilder.AppendLine(other.ExportCertificatePem());
+                    }
+                }
+
+                ValidateCaCertificateAndKeyMatch(
+                    caCertWithKey,
+                    key,
+                    extraChainBuilder.ToString(),
+                    out bool isIntermediate,
+                    out string normalizedChainPem);
+
+                await using (CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken))
+                {
+                    await db.EnsureSchemaUpgradedAsync(cancellationToken);
+                    await ValidateCustodyCandidateCoreAsync(
+                        db,
+                        storagePassphrase,
+                        secondaryParentPassphrase: null,
+                        requireExistingKeyForUnlock: false,
+                        cancellationToken);
+                }
+
+                byte[] encryptedPkcs8 = key.ExportEncryptedPkcs8PrivateKey(
                     storagePassphrase,
-                    secondaryParentPassphrase: null,
-                    requireExistingKeyForUnlock: false,
+                    new PbeParameters(
+                        PbeEncryptionAlgorithm.Aes256Cbc,
+                        HashAlgorithmName.SHA256,
+                        iterationCount: 100_000));
+
+                return await PersistAndActivateCaCoreAsync(
+                    caName,
+                    isIntermediate,
+                    caCertWithKey.ExportCertificatePem() + "\n",
+                    normalizedChainPem,
+                    encryptedPkcs8,
+                    storagePassphrase,
+                    crlDistributionPointUrl,
+                    authorityIssuerCertUrl,
+                    initialSerialFloor,
+                    initialCrlNumberFloor,
                     cancellationToken);
             }
-
-            byte[] encryptedPkcs8 = key.ExportEncryptedPkcs8PrivateKey(
-                storagePassphrase,
-                new PbeParameters(
-                    PbeEncryptionAlgorithm.Aes256Cbc,
-                    HashAlgorithmName.SHA256,
-                    iterationCount: 100_000));
-
-            return await PersistAndActivateCaCoreAsync(
-                caName,
-                isIntermediate,
-                caCertWithKey.ExportCertificatePem() + "\n",
-                normalizedChainPem,
-                encryptedPkcs8,
-                storagePassphrase,
-                crlDistributionPointUrl,
-                authorityIssuerCertUrl,
-                initialSerialFloor,
-                initialCrlNumberFloor,
-                cancellationToken);
+            finally
+            {
+                foreach (X509Certificate2 cert in collection)
+                {
+                    cert.Dispose();
+                }
+            }
         }
         finally
         {
@@ -2091,7 +2204,7 @@ public sealed class CertificateAuthorityService
         }
     }
 
-    public async Task<(bool Succeeded, string? ErrorMessage)> RevokeCertificateAsync(
+    public async Task<RevocationOutcome> RevokeCertificateAsync(
         int certificateId,
         int revocationReasonCode,
         string revokedByUserName,
@@ -2106,12 +2219,22 @@ public sealed class CertificateAuthorityService
 
             if (certRecord == null)
             {
-                return (false, "Certificate record not found.");
+                return new(
+                    Succeeded: false,
+                    RevocationAccepted: false,
+                    CrlPublished: false,
+                    RevocationPublicationStatus.Rejected,
+                    "Certificate record not found.");
             }
 
             if (certRecord.Status != IssuanceStatus.Issued && certRecord.Status != IssuanceStatus.Revoked)
             {
-                return (false, $"Certificate in status '{certRecord.Status}' cannot be revoked.");
+                return new(
+                    Succeeded: false,
+                    RevocationAccepted: false,
+                    CrlPublished: false,
+                    RevocationPublicationStatus.Rejected,
+                    $"Certificate in status '{certRecord.Status}' cannot be revoked.");
             }
 
             certRecord.Status = IssuanceStatus.Revoked;
@@ -2120,20 +2243,7 @@ public sealed class CertificateAuthorityService
             certRecord.RevokedByUserName = revokedByUserName;
             await db.SaveChangesAsync(cancellationToken);
 
-            if (certRecord.CaAuthorityId.HasValue)
-            {
-                CaAuthorityRecord? ca = await db.CaAuthorities
-                    .FirstOrDefaultAsync(c => c.Id == certRecord.CaAuthorityId.Value, cancellationToken);
-
-                EvictStaleRuntimeUnlockIfIncompatible(ca != null ? [ca] : [], []);
-                string? passphrase = ResolveEffectivePassphrase();
-                if (ca != null && !string.IsNullOrEmpty(passphrase))
-                {
-                    await GenerateAndPersistCrlInternalAsync(db, ca, passphrase, cancellationToken);
-                }
-            }
-
-            return (true, null);
+            return await TryPublishRevocationCrlCoreAsync(db, certRecord, cancellationToken);
         }
         finally
         {
@@ -2145,7 +2255,7 @@ public sealed class CertificateAuthorityService
     /// Seeds an already-revoked serial number from an imported legacy CA so CRL continuity is preserved,
     /// and refreshes the active CA's CRL if unlocked.
     /// </summary>
-    public async Task<(bool Succeeded, string? ErrorMessage)> SeedRevokedSerialAsync(
+    public async Task<RevocationOutcome> SeedRevokedSerialAsync(
         string serialNumberHex,
         string? commonName,
         int revocationReasonCode,
@@ -2155,7 +2265,12 @@ public sealed class CertificateAuthorityService
     {
         if (string.IsNullOrWhiteSpace(serialNumberHex))
         {
-            return (false, "Serial number (hex) is required.");
+            return new(
+                Succeeded: false,
+                RevocationAccepted: false,
+                CrlPublished: false,
+                RevocationPublicationStatus.Rejected,
+                "Serial number (hex) is required.");
         }
 
         string cleanHex = serialNumberHex.Trim().Replace(":", "").Replace(" ", "").ToUpperInvariant();
@@ -2171,12 +2286,22 @@ public sealed class CertificateAuthorityService
             BigInteger bi = new(1, serialBytes);
             if (bi.CompareTo(BigInteger.Zero) <= 0)
             {
-                return (false, "Serial number must represent a positive integer.");
+                return new(
+                    Succeeded: false,
+                    RevocationAccepted: false,
+                    CrlPublished: false,
+                    RevocationPublicationStatus.Rejected,
+                    "Serial number must represent a positive integer.");
             }
         }
         catch (FormatException)
         {
-            return (false, "Serial number must be valid hexadecimal.");
+            return new(
+                Succeeded: false,
+                RevocationAccepted: false,
+                CrlPublished: false,
+                RevocationPublicationStatus.Rejected,
+                "Serial number must be valid hexadecimal.");
         }
 
         IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
@@ -2189,13 +2314,19 @@ public sealed class CertificateAuthorityService
 
             if (ca == null)
             {
-                return (false, "No active CA is configured.");
+                return new(
+                    Succeeded: false,
+                    RevocationAccepted: false,
+                    CrlPublished: false,
+                    RevocationPublicationStatus.Rejected,
+                    "No active CA is configured.");
             }
 
             IssuedCertificateRecord? existing = await db.IssuedCertificates
                 .FirstOrDefaultAsync(c => c.CaAuthorityId == ca.Id && c.SerialNumberHex == cleanHex, cancellationToken);
 
             DateTimeOffset effectiveRevokedAt = revokedAtUtc ?? DateTimeOffset.UtcNow;
+            IssuedCertificateRecord targetRecord;
 
             if (existing != null)
             {
@@ -2203,6 +2334,7 @@ public sealed class CertificateAuthorityService
                 existing.RevokedAtUtc ??= effectiveRevokedAt;
                 existing.RevocationReasonCode = revocationReasonCode;
                 existing.RevokedByUserName = revokedByUserName;
+                targetRecord = existing;
             }
             else
             {
@@ -2219,6 +2351,8 @@ public sealed class CertificateAuthorityService
                     KeyAlgorithm = "LEGACY",
                     KeySizeBits = 0,
                     ThumbprintSha256 = "LEGACY-" + cleanHex,
+                    NotBeforeUtc = ca.NotBeforeUtc,
+                    NotAfterUtc = ca.NotAfterUtc,
                     RequestedByUserId = "legacy-migration",
                     RequestedByUserName = revokedByUserName,
                     Status = IssuanceStatus.Revoked,
@@ -2228,22 +2362,99 @@ public sealed class CertificateAuthorityService
                     RevokedByUserName = revokedByUserName
                 };
                 db.IssuedCertificates.Add(seeded);
+                targetRecord = seeded;
             }
 
             await db.SaveChangesAsync(cancellationToken);
 
-            EvictStaleRuntimeUnlockIfIncompatible([ca], []);
-            string? passphrase = ResolveEffectivePassphrase();
-            if (!string.IsNullOrEmpty(passphrase))
-            {
-                await GenerateAndPersistCrlInternalAsync(db, ca, passphrase, cancellationToken);
-            }
-
-            return (true, null);
+            return await TryPublishRevocationCrlCoreAsync(db, targetRecord, cancellationToken);
         }
         finally
         {
             await lifecycleLock.DisposeAsync();
+        }
+    }
+
+    private async Task<RevocationOutcome> TryPublishRevocationCrlCoreAsync(
+        CertRoboDbContext db,
+        IssuedCertificateRecord certRecord,
+        CancellationToken cancellationToken)
+    {
+        if (!certRecord.CaAuthorityId.HasValue)
+        {
+            return new(
+                Succeeded: false,
+                RevocationAccepted: true,
+                CrlPublished: false,
+                RevocationPublicationStatus.PendingIssuerUnavailable,
+                $"Revocation recorded for serial {certRecord.SerialNumberHex}, but CRL publication could not be completed because the certificate has no associated issuing CA authority.",
+                certRecord,
+                null);
+        }
+
+        CaAuthorityRecord? ca = await db.CaAuthorities
+            .FirstOrDefaultAsync(c => c.Id == certRecord.CaAuthorityId.Value, cancellationToken);
+
+        if (ca == null)
+        {
+            return new(
+                Succeeded: false,
+                RevocationAccepted: true,
+                CrlPublished: false,
+                RevocationPublicationStatus.PendingIssuerUnavailable,
+                $"Revocation recorded for serial {certRecord.SerialNumberHex}, but CRL publication could not be completed because issuing CA #{certRecord.CaAuthorityId.Value} was not found.",
+                certRecord,
+                null);
+        }
+
+        EvictStaleRuntimeUnlockIfIncompatible([ca], []);
+        string? passphrase = ResolveEffectivePassphrase();
+        if (string.IsNullOrEmpty(passphrase))
+        {
+            return new(
+                Succeeded: false,
+                RevocationAccepted: true,
+                CrlPublished: false,
+                RevocationPublicationStatus.PendingSignerLocked,
+                $"Revocation recorded for serial {certRecord.SerialNumberHex}, but CRL publication is pending because the CA signing key is locked. Unlock the CA and refresh the CRL to publish this revocation.",
+                certRecord,
+                null);
+        }
+
+        if (!TryVerifyAuthorityKey(ca, passphrase, out string? custodyErr))
+        {
+            return new(
+                Succeeded: false,
+                RevocationAccepted: true,
+                CrlPublished: false,
+                RevocationPublicationStatus.PendingPublicationFailed,
+                $"Revocation recorded for serial {certRecord.SerialNumberHex}, but CRL publication failed and remains pending: {custodyErr}",
+                certRecord,
+                null);
+        }
+
+        try
+        {
+            PublishedCrlRecord publishedCrl = await GenerateAndPersistCrlInternalAsync(db, ca, passphrase, cancellationToken);
+            return new(
+                Succeeded: true,
+                RevocationAccepted: true,
+                CrlPublished: true,
+                RevocationPublicationStatus.Published,
+                null,
+                certRecord,
+                publishedCrl);
+        }
+        catch (Exception ex)
+        {
+            return new(
+                Succeeded: false,
+                RevocationAccepted: true,
+                CrlPublished: false,
+                RevocationPublicationStatus.PendingPublicationFailed,
+                $"Revocation recorded for serial {certRecord.SerialNumberHex}, but CRL publication failed and remains pending: {ex.Message}",
+                certRecord,
+                null);
         }
     }
 
@@ -2299,24 +2510,67 @@ public sealed class CertificateAuthorityService
             EvictStaleRuntimeUnlockIfIncompatible(authorities, []);
             string? passphrase = ResolveEffectivePassphrase();
             List<IssuedCertificateRecord> maintainedCertificates = await db.IssuedCertificates
-                .Where(c => c.CaAuthorityId.HasValue
-                         && (c.Status == IssuanceStatus.Issued || c.Status == IssuanceStatus.Revoked))
+                .Where(c => c.Status == IssuanceStatus.Issued || c.Status == IssuanceStatus.Revoked)
                 .ToListAsync(cancellationToken);
             HashSet<int> authoritiesWithUnexpiredCertificates = maintainedCertificates
-                .Where(c => c.NotAfterUtc > now)
+                .Where(c => c.CaAuthorityId.HasValue && c.NotAfterUtc > now)
                 .Select(c => c.CaAuthorityId!.Value)
                 .ToHashSet();
+            Dictionary<int, List<IssuedCertificateRecord>> revokedByAuthority = maintainedCertificates
+                .Where(c => c.CaAuthorityId.HasValue && c.Status == IssuanceStatus.Revoked)
+                .GroupBy(c => c.CaAuthorityId!.Value)
+                .ToDictionary(g => g.Key, g => g.ToList());
+            HashSet<int> knownAuthorityIds = authorities.Select(a => a.Id).ToHashSet();
             List<CrlRefreshOutcome> outcomes = [];
+
+            if (maintainedCertificates.Any(c => !c.CaAuthorityId.HasValue && c.Status == IssuanceStatus.Revoked))
+            {
+                outcomes.Add(new(
+                    0,
+                    "Unassigned Issuer",
+                    false,
+                    null,
+                    "One or more revoked certificates have no assigned issuing CA authority; CRL publication cannot be completed."));
+            }
+
+            foreach (int missingCaId in revokedByAuthority.Keys.Where(id => !knownAuthorityIds.Contains(id)).OrderBy(id => id))
+            {
+                outcomes.Add(new(
+                    missingCaId,
+                    $"Missing CA #{missingCaId}",
+                    false,
+                    null,
+                    $"Issuing CA #{missingCaId} was not found in storage; cannot publish pending revocation(s)."));
+            }
 
             foreach (CaAuthorityRecord authority in authorities)
             {
+                PublishedCrlRecord? latest = await db.PublishedCrls
+                    .Where(c => c.CaAuthorityId == authority.Id)
+                    .OrderByDescending(c => c.CrlNumber)
+                    .FirstOrDefaultAsync(cancellationToken);
+
+                bool hasUnpublishedRevocations = HasUnpublishedRevocations(
+                    latest,
+                    revokedByAuthority.GetValueOrDefault(authority.Id));
+
                 if (authority.NotAfterUtc <= now)
                 {
+                    if (hasUnpublishedRevocations || authority.IsActive)
+                    {
+                        outcomes.Add(new(
+                            authority.Id,
+                            authority.Name,
+                            false,
+                            null,
+                            $"Could not refresh CRL for stored issuer '{authority.Name}': CA certificate expired at {authority.NotAfterUtc:O}."));
+                    }
                     continue;
                 }
 
                 bool shouldMaintain = authority.IsActive
-                    || authoritiesWithUnexpiredCertificates.Contains(authority.Id);
+                    || authoritiesWithUnexpiredCertificates.Contains(authority.Id)
+                    || hasUnpublishedRevocations;
                 if (!shouldMaintain)
                 {
                     continue;
@@ -2334,14 +2588,12 @@ public sealed class CertificateAuthorityService
                     continue;
                 }
 
-                PublishedCrlRecord? latest = await db.PublishedCrls
-                    .Where(c => c.CaAuthorityId == authority.Id)
-                    .OrderByDescending(c => c.CrlNumber)
-                    .FirstOrDefaultAsync(cancellationToken);
-                if (latest != null && latest.NextUpdateUtc > dueBefore)
+                bool isDueBySchedule = latest == null || latest.NextUpdateUtc <= dueBefore;
+                if (!hasUnpublishedRevocations && !isDueBySchedule)
                 {
                     continue;
                 }
+
                 if (string.IsNullOrEmpty(passphrase))
                 {
                     outcomes.Add(new(
@@ -2380,6 +2632,192 @@ public sealed class CertificateAuthorityService
             await lifecycleLock.DisposeAsync();
         }
     }
+
+    public async Task<IReadOnlySet<int>> GetCertificateIdsWithUnpublishedRevocationsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
+        List<IssuedCertificateRecord> revokedCerts = await db.IssuedCertificates
+            .Where(c => c.Status == IssuanceStatus.Revoked)
+            .ToListAsync(cancellationToken);
+
+        if (revokedCerts.Count == 0)
+        {
+            return new HashSet<int>();
+        }
+
+        HashSet<int> knownAuthorityIds = (await db.CaAuthorities
+            .Select(a => a.Id)
+            .ToListAsync(cancellationToken))
+            .ToHashSet();
+
+        HashSet<int> unpublishedIds = [];
+        foreach (IssuedCertificateRecord unattached in revokedCerts.Where(c => !c.CaAuthorityId.HasValue || !knownAuthorityIds.Contains(c.CaAuthorityId.Value)))
+        {
+            unpublishedIds.Add(unattached.Id);
+        }
+
+        foreach (IGrouping<int, IssuedCertificateRecord> group in revokedCerts
+            .Where(c => c.CaAuthorityId.HasValue && knownAuthorityIds.Contains(c.CaAuthorityId.Value))
+            .GroupBy(c => c.CaAuthorityId!.Value))
+        {
+            PublishedCrlRecord? latestCrl = await db.PublishedCrls
+                .Where(c => c.CaAuthorityId == group.Key)
+                .OrderByDescending(c => c.CrlNumber)
+                .FirstOrDefaultAsync(cancellationToken);
+
+            if (latestCrl == null || latestCrl.CrlDer is not { Length: > 0 })
+            {
+                foreach (IssuedCertificateRecord r in group)
+                {
+                    unpublishedIds.Add(r.Id);
+                }
+                continue;
+            }
+
+            X509Crl? parsedCrl = null;
+            try
+            {
+                parsedCrl = new X509CrlParser().ReadCrl(latestCrl.CrlDer);
+            }
+            catch
+            {
+            }
+
+            if (parsedCrl == null)
+            {
+                foreach (IssuedCertificateRecord r in group)
+                {
+                    unpublishedIds.Add(r.Id);
+                }
+                continue;
+            }
+
+            foreach (IssuedCertificateRecord r in group)
+            {
+                if (IsCertificateRevocationUnpublished(parsedCrl, r))
+                {
+                    unpublishedIds.Add(r.Id);
+                }
+            }
+        }
+
+        return unpublishedIds;
+    }
+
+    public static bool HasUnpublishedRevocations(
+        PublishedCrlRecord? latestCrl,
+        IReadOnlyList<IssuedCertificateRecord>? revokedCertificates)
+    {
+        if (latestCrl == null)
+        {
+            return true;
+        }
+
+        if (revokedCertificates == null || revokedCertificates.Count == 0)
+        {
+            return false;
+        }
+
+        if (latestCrl.CrlDer is not { Length: > 0 })
+        {
+            return true;
+        }
+
+        X509Crl parsedCrl;
+        try
+        {
+            parsedCrl = new X509CrlParser().ReadCrl(latestCrl.CrlDer);
+        }
+        catch
+        {
+            return true;
+        }
+
+        foreach (IssuedCertificateRecord revoked in revokedCertificates)
+        {
+            if (IsCertificateRevocationUnpublished(parsedCrl, revoked))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsCertificateRevocationUnpublished(
+        X509Crl parsedCrl,
+        IssuedCertificateRecord revoked)
+    {
+        if (string.IsNullOrWhiteSpace(revoked.SerialNumberHex))
+        {
+            return false;
+        }
+
+        BigInteger serialBigInt;
+        try
+        {
+            serialBigInt = new BigInteger(1, Convert.FromHexString(revoked.SerialNumberHex));
+        }
+        catch
+        {
+            return true;
+        }
+
+        X509CrlEntry? entry = parsedCrl.GetRevokedCertificate(serialBigInt);
+        if (entry == null)
+        {
+            return true;
+        }
+
+        int expectedReason = revoked.RevocationReasonCode ?? CrlReason.Unspecified;
+        int actualReason = ExtractCrlEntryReasonCode(entry);
+        if (actualReason != expectedReason)
+        {
+            return true;
+        }
+
+        if (revoked.RevokedAtUtc.HasValue)
+        {
+            DateTime expectedRevDateUtc = TruncateToSeconds(revoked.RevokedAtUtc.Value.UtcDateTime);
+            DateTime actualRevDateUtc = TruncateToSeconds(entry.RevocationDate.ToUniversalTime());
+            if (expectedRevDateUtc != actualRevDateUtc)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static int ExtractCrlEntryReasonCode(X509CrlEntry entry)
+    {
+        Asn1OctetString? extOctets = entry.GetExtensionValue(X509Extensions.ReasonCode);
+        if (extOctets == null)
+        {
+            return CrlReason.Unspecified;
+        }
+
+        try
+        {
+            DerEnumerated enumerated = DerEnumerated.GetInstance(Asn1Object.FromByteArray(extOctets.GetOctets()));
+            return enumerated.Value.IntValueExact;
+        }
+        catch
+        {
+            return CrlReason.Unspecified;
+        }
+    }
+
+    private static DateTime TruncateToSeconds(DateTime utcDateTime) =>
+        new(
+            utcDateTime.Year,
+            utcDateTime.Month,
+            utcDateTime.Day,
+            utcDateTime.Hour,
+            utcDateTime.Minute,
+            utcDateTime.Second,
+            DateTimeKind.Utc);
 
     public async Task<PublishedCrlRecord?> GetLatestCrlAsync(
         CancellationToken cancellationToken = default,
@@ -2547,7 +2985,27 @@ public sealed class CertificateAuthorityService
         string passphrase,
         CancellationToken cancellationToken)
     {
+        CrlPublicationFaultInjector?.Invoke(ca);
+
         using X509Certificate2 issuerDotNetCert = X509Certificate2.CreateFromPem(ca.IssuerCertificatePem);
+        X509BasicConstraintsExtension? issuerBc = issuerDotNetCert.Extensions
+            .OfType<X509BasicConstraintsExtension>()
+            .FirstOrDefault();
+        if (issuerBc == null || !issuerBc.CertificateAuthority || !issuerBc.Critical)
+        {
+            throw new InvalidOperationException(
+                $"Cannot publish a CRL for CA '{ca.Name}' because its certificate is missing a critical BasicConstraints CA=true extension.");
+        }
+
+        X509KeyUsageExtension? issuerKu = issuerDotNetCert.Extensions
+            .OfType<X509KeyUsageExtension>()
+            .FirstOrDefault();
+        if (issuerKu == null || (issuerKu.KeyUsages & X509KeyUsageFlags.CrlSign) == 0)
+        {
+            throw new InvalidOperationException(
+                $"Cannot publish a CRL for CA '{ca.Name}' because its certificate KeyUsage does not include CrlSign.");
+        }
+
         using AsymmetricAlgorithm issuerDotNetKey = LoadEncryptedKey(ca.EncryptedPrivateKeyPath, passphrase);
 
         BcX509Certificate bcIssuerCert = new X509CertificateParser().ReadCertificate(issuerDotNetCert.RawData);
@@ -2559,7 +3017,6 @@ public sealed class CertificateAuthorityService
             .MaxAsync(cancellationToken) ?? 0L;
 
         long nextCrlNumber = Math.Max(ca.LastCrlNumber, maxExistingCrl) + 1;
-        ca.LastCrlNumber = nextCrlNumber;
 
         DateTimeOffset now = DateTimeOffset.UtcNow;
         DateTimeOffset thisUpdate = now.AddMinutes(-1);
@@ -2582,6 +3039,7 @@ public sealed class CertificateAuthorityService
         List<IssuedCertificateRecord> revokedCerts = await db.IssuedCertificates
             .Where(c => c.CaAuthorityId == ca.Id && c.Status == IssuanceStatus.Revoked)
             .OrderBy(c => c.SerialNumberValue)
+            .ThenBy(c => c.Id)
             .ToListAsync(cancellationToken);
 
         foreach (IssuedCertificateRecord revoked in revokedCerts)
@@ -2620,6 +3078,8 @@ public sealed class CertificateAuthorityService
         string crlPem = "-----BEGIN X509 CRL-----\n"
             + ChunkBase64(Convert.ToBase64String(crlDer), 64)
             + "\n-----END X509 CRL-----\n";
+
+        ca.LastCrlNumber = nextCrlNumber;
 
         PublishedCrlRecord crlRecord = new()
         {
@@ -2927,7 +3387,7 @@ public sealed class CertificateAuthorityService
                 foreach (X509Certificate2 cert in extra)
                 {
                     disposableChainCerts.Add(cert);
-                    if (cert.SubjectName.RawData.SequenceEqual(cert.IssuerName.RawData))
+                    if (CaChainAndConstraintValidator.IsSelfSignedCryptographically(cert))
                     {
                         chain.ChainPolicy.CustomTrustStore.Add(cert);
                     }
@@ -2962,31 +3422,40 @@ public sealed class CertificateAuthorityService
     {
         // Verify CA BasicConstraints
         X509BasicConstraintsExtension? bc = caCert.Extensions.OfType<X509BasicConstraintsExtension>().FirstOrDefault()
-            ?? throw new ArgumentException("Imported CA certificate is missing BasicConstraints extension.");
+            ?? throw new ArgumentException("CA certificate is missing the required BasicConstraints extension.");
         if (!bc.CertificateAuthority)
         {
-            throw new ArgumentException("Imported certificate is not a CA certificate (BasicConstraints CA=false).");
+            throw new ArgumentException("Certificate is not a CA certificate (BasicConstraints CA=false).");
         }
         if (!bc.Critical)
         {
-            throw new ArgumentException("Imported CA certificate BasicConstraints extension must be critical.");
+            throw new ArgumentException("CA certificate BasicConstraints extension must be critical.");
+        }
+        if (bc.HasPathLengthConstraint && bc.PathLengthConstraint < 0)
+        {
+            throw new ArgumentException("CA certificate BasicConstraints pathLenConstraint cannot be negative.");
         }
 
-        // Verify KeyUsage if present includes KeyCertSign
-        X509KeyUsageExtension? ku = caCert.Extensions.OfType<X509KeyUsageExtension>().FirstOrDefault();
-        if (ku != null && (ku.KeyUsages & X509KeyUsageFlags.KeyCertSign) == 0)
+        // Verify KeyUsage is present and includes both KeyCertSign and CrlSign
+        X509KeyUsageExtension? ku = caCert.Extensions.OfType<X509KeyUsageExtension>().FirstOrDefault()
+            ?? throw new ArgumentException("CA certificate is missing the required KeyUsage extension (KeyCertSign and CrlSign are required).");
+        if ((ku.KeyUsages & X509KeyUsageFlags.KeyCertSign) == 0)
         {
-            throw new ArgumentException("Imported CA certificate KeyUsage does not allow KeyCertSign.");
+            throw new ArgumentException("CA certificate KeyUsage does not allow KeyCertSign.");
+        }
+        if ((ku.KeyUsages & X509KeyUsageFlags.CrlSign) == 0)
+        {
+            throw new ArgumentException("CA certificate KeyUsage does not allow CrlSign, which CertRobo requires to publish CRLs.");
         }
 
         DateTimeOffset now = DateTimeOffset.UtcNow;
         if (now < caCert.NotBefore.ToUniversalTime())
         {
-            throw new ArgumentException($"Imported CA certificate is not yet valid (NotBefore: {caCert.NotBefore.ToUniversalTime():yyyy-MM-dd HH:mm:ss} UTC).");
+            throw new ArgumentException($"CA certificate is not yet valid (NotBefore: {caCert.NotBefore.ToUniversalTime():yyyy-MM-dd HH:mm:ss} UTC).");
         }
         if (now > caCert.NotAfter.ToUniversalTime())
         {
-            throw new ArgumentException($"Imported CA certificate has expired (NotAfter: {caCert.NotAfter.ToUniversalTime():yyyy-MM-dd HH:mm:ss} UTC).");
+            throw new ArgumentException($"CA certificate has expired (NotAfter: {caCert.NotAfter.ToUniversalTime():yyyy-MM-dd HH:mm:ss} UTC).");
         }
 
         // Verify public/private key match via SubjectPublicKeyInfo comparison
@@ -2997,65 +3466,65 @@ public sealed class CertificateAuthorityService
             throw new ArgumentException("Provided private key does not match the CA certificate's public key.");
         }
 
-        bool selfIssued = caCert.SubjectName.RawData.SequenceEqual(caCert.IssuerName.RawData);
-        isIntermediate = !selfIssued;
+        bool isSelfSignedRoot = CaChainAndConstraintValidator.IsSelfSignedCryptographically(caCert);
+        isIntermediate = !isSelfSignedRoot;
         normalizedChainPem = string.Empty;
 
         if (isIntermediate)
         {
             if (string.IsNullOrWhiteSpace(chainCertsPem))
             {
-                throw new ArgumentException("Intermediate CA import requires the parent/root certificate chain PEM.");
+                if (CaChainAndConstraintValidator.IsSelfIssued(caCert))
+                {
+                    throw new ArgumentException("CA certificate is self-issued but failed self-signature verification, and no parent/root certificate chain PEM was provided.");
+                }
+                throw new ArgumentException("Intermediate CA requires the parent/root certificate chain PEM.");
             }
 
             List<X509Certificate2> parsedChain = CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
                 null, chainCertsPem, "imported chain certificates");
             try
             {
-                if (parsedChain.Count == 0)
+                string caThumbprint = caCert.GetCertHashString(HashAlgorithmName.SHA256);
+                List<X509Certificate2> ancestorCandidates = parsedChain
+                    .Where(c => !c.GetCertHashString(HashAlgorithmName.SHA256).Equals(caThumbprint, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (ancestorCandidates.Count == 0)
                 {
-                    throw new ArgumentException("No valid certificates were found in the supplied chain PEM.");
+                    throw new ArgumentException("No valid parent/root certificates were found in the supplied chain PEM.");
                 }
 
-                using X509Chain chain = new();
-                chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-                chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
-                foreach (X509Certificate2 c in parsedChain)
+                var (chainResolved, chainErr, orderedChain) = CaChainAndConstraintValidator.ResolveUnambiguousCryptographicChain(
+                    caCert,
+                    ancestorCandidates);
+                if (!chainResolved || orderedChain == null)
                 {
-                    if (c.SubjectName.RawData.SequenceEqual(c.IssuerName.RawData))
-                    {
-                        chain.ChainPolicy.CustomTrustStore.Add(c);
-                    }
-                    else
-                    {
-                        chain.ChainPolicy.ExtraStore.Add(c);
-                    }
+                    throw new ArgumentException($"Intermediate CA chain validation failed: {chainErr}");
                 }
 
-                if (!chain.Build(caCert))
+                var (ancOk, ancErr) = CaChainAndConstraintValidator.ValidateAncestorChainCapabilities(orderedChain, now);
+                if (!ancOk)
                 {
-                    string statuses = string.Join(", ", chain.ChainStatus.Select(s => $"{s.Status}: {s.StatusInformation}"));
-                    throw new ArgumentException($"Intermediate CA chain validation failed: {statuses}");
+                    throw new ArgumentException($"Intermediate CA chain validation failed: {ancErr}");
                 }
 
-                List<X509Certificate2> orderedChainList = [caCert];
-                StringBuilder ordered = new();
-                // Skip element 0 (which is caCert itself) and append parent(s) up to root in order
-                for (int i = 1; i < chain.ChainElements.Count; i++)
-                {
-                    X509Certificate2 elemCert = chain.ChainElements[i].Certificate;
-                    if (!CaChainAndConstraintValidator.VerifySignatureCryptographically(chain.ChainElements[i - 1].Certificate, elemCert, out string? sigErr))
-                    {
-                        throw new ArgumentException($"Intermediate CA chain signature verification failed: {sigErr}");
-                    }
-                    orderedChainList.Add(elemCert);
-                    ordered.AppendLine(elemCert.ExportCertificatePem());
-                }
-
-                var (extOk, extErr, _, _, _) = CaChainAndConstraintValidator.EvaluateChainExtensionsAndRestrictions(orderedChainList);
+                var (extOk, extErr, _, _, _) = CaChainAndConstraintValidator.EvaluateChainExtensionsAndRestrictions(orderedChain);
                 if (!extOk)
                 {
-                    throw new ArgumentException(extErr ?? "Imported CA chain contains unsupported restrictions.");
+                    throw new ArgumentException(extErr ?? "CA chain contains unsupported restrictions.");
+                }
+
+                var (dotNetChainOk, dotNetChainErr) = CaChainAndConstraintValidator.VerifyWithDotNetCustomRootChain(orderedChain, now);
+                if (!dotNetChainOk)
+                {
+                    throw new ArgumentException($"Intermediate CA chain validation failed: {dotNetChainErr}");
+                }
+
+                StringBuilder ordered = new();
+                for (int i = 1; i < orderedChain.Count; i++)
+                {
+                    ordered.AppendLine(orderedChain[i].ExportCertificatePem().Trim());
                 }
 
                 normalizedChainPem = ordered.ToString();
@@ -3072,7 +3541,7 @@ public sealed class CertificateAuthorityService
             var (extOk, extErr, _, _, _) = CaChainAndConstraintValidator.EvaluateChainExtensionsAndRestrictions([caCert]);
             if (!extOk)
             {
-                throw new ArgumentException(extErr ?? "Imported CA certificate contains unsupported restrictions.");
+                throw new ArgumentException(extErr ?? "CA certificate contains unsupported restrictions.");
             }
         }
     }

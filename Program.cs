@@ -549,6 +549,32 @@ using (IServiceScope scope = app.Services.CreateScope())
         }
     }
 
+    // Handle CLI CRL refresh / pending revocation publication:
+    // dotnet run -- --refresh-crls
+    if (args.Contains("--refresh-crls", StringComparer.OrdinalIgnoreCase))
+    {
+        CertificateAuthorityService caService = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
+        IReadOnlyList<CrlRefreshOutcome> outcomes = await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+        bool anyFailed = false;
+        foreach (CrlRefreshOutcome outcome in outcomes)
+        {
+            if (outcome.Succeeded && outcome.PublishedCrl != null)
+            {
+                Console.WriteLine($"Published CRL #{outcome.PublishedCrl.CrlNumber} for CA #{outcome.CaAuthorityId} '{outcome.CaName}'.");
+            }
+            else
+            {
+                anyFailed = true;
+                Console.Error.WriteLine($"CRL refresh failed for CA #{outcome.CaAuthorityId} '{outcome.CaName}': {outcome.ErrorMessage}");
+            }
+        }
+        if (anyFailed)
+        {
+            Environment.ExitCode = 1;
+        }
+        return;
+    }
+
     // Handle CLI CSR issuance:
     // dotnet run -- --issue-csr <username> <csrPath> <outCertPath> [<outChainPath>]
     int issueIdx = Array.IndexOf(args, "--issue-csr");

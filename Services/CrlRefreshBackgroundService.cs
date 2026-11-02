@@ -9,11 +9,13 @@ public sealed class CrlRefreshBackgroundService(
     ILogger<CrlRefreshBackgroundService> logger) : BackgroundService
 {
     private static readonly TimeSpan CheckInterval = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan PendingRetryInterval = TimeSpan.FromMinutes(1);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
         {
+            bool anyPendingOrFailed = false;
             try
             {
                 IReadOnlyList<CrlRefreshOutcome> outcomes = await caService.RefreshDueCrlsAsync(
@@ -32,6 +34,7 @@ public sealed class CrlRefreshBackgroundService(
                     }
                     else
                     {
+                        anyPendingOrFailed = true;
                         logger.LogWarning(
                             "CRL refresh failed for CA '{CaName}' (AuthorityId={AuthorityId}): {ErrorMessage}",
                             outcome.CaName,
@@ -46,12 +49,13 @@ public sealed class CrlRefreshBackgroundService(
             }
             catch (Exception ex)
             {
+                anyPendingOrFailed = true;
                 logger.LogError(ex, "Scheduled CRL refresh encountered an error.");
             }
 
             try
             {
-                await Task.Delay(CheckInterval, stoppingToken);
+                await Task.Delay(anyPendingOrFailed ? PendingRetryInterval : CheckInterval, stoppingToken);
             }
             catch (OperationCanceledException)
             {

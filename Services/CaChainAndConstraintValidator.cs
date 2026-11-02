@@ -1059,85 +1059,10 @@ public static class CaChainAndConstraintValidator
 
         // orderedChain[0] is candidateCaCert, orderedChain[1] is immediate parent, ..., orderedChain[^1] is self-signed Root CA
         // 6. Validate validity periods, BasicConstraints, KeyUsage, pathLengthConstraint, and extensions across the entire chain
-        int nonSelfIssuedIntermediateCountBelow = 1; // candidateCaCert itself is 1 non-self-issued intermediate CA when it issues leaf certs!
-        for (int i = 1; i < orderedChain.Count; i++)
+        var (ancestorsOk, ancestorsError) = ValidateAncestorChainCapabilities(orderedChain, now);
+        if (!ancestorsOk)
         {
-            X509Certificate2 ancestor = orderedChain[i];
-            bool isRoot = i == orderedChain.Count - 1;
-            string roleName = isRoot ? "Root CA" : $"Parent Intermediate CA #{i}";
-
-            DateTimeOffset ancNotBefore = ancestor.NotBefore.ToUniversalTime();
-            DateTimeOffset ancNotAfter = ancestor.NotAfter.ToUniversalTime();
-            if (now < ancNotBefore)
-            {
-                return new(
-                    false,
-                    $"{roleName} '{ancestor.Subject}' is not yet valid (NotBefore: {ancNotBefore:yyyy-MM-dd HH:mm:ss} UTC).",
-                    null,
-                    null,
-                    null);
-            }
-            if (now > ancNotAfter)
-            {
-                return new(
-                    false,
-                    $"{roleName} '{ancestor.Subject}' has expired (NotAfter: {ancNotAfter:yyyy-MM-dd HH:mm:ss} UTC).",
-                    null,
-                    null,
-                    null);
-            }
-
-            X509BasicConstraintsExtension? ancBc = ancestor.Extensions
-                .OfType<X509BasicConstraintsExtension>()
-                .FirstOrDefault();
-
-            if (ancBc == null || !ancBc.CertificateAuthority)
-            {
-                return new(
-                    false,
-                    $"{roleName} '{ancestor.Subject}' is not a valid CA certificate (BasicConstraints CA=true is missing).",
-                    null,
-                    null,
-                    null);
-            }
-            if (!ancBc.Critical)
-            {
-                return new(
-                    false,
-                    $"{roleName} '{ancestor.Subject}' BasicConstraints extension is not critical as required for CA use under RFC 5280.",
-                    null,
-                    null,
-                    null);
-            }
-
-            if (ancBc.HasPathLengthConstraint && ancBc.PathLengthConstraint < nonSelfIssuedIntermediateCountBelow)
-            {
-                return new(
-                    false,
-                    $"{roleName} '{ancestor.Subject}' has BasicConstraints pathLenConstraint={ancBc.PathLengthConstraint}, which is exceeded when '{candidateCaCert.Subject}' acts as an issuing intermediate CA (requires pathLenConstraint >= {nonSelfIssuedIntermediateCountBelow}).",
-                    null,
-                    null,
-                    null);
-            }
-
-            X509KeyUsageExtension? ancKu = ancestor.Extensions
-                .OfType<X509KeyUsageExtension>()
-                .FirstOrDefault();
-
-            if (ancKu != null && (ancKu.KeyUsages & X509KeyUsageFlags.KeyCertSign) == 0)
-            {
-                return new(
-                    false,
-                    $"{roleName} '{ancestor.Subject}' KeyUsage ({ancKu.KeyUsages}) does not allow KeyCertSign.",
-                    null,
-                    null,
-                    null);
-            }
-
-            if (!IsSelfIssued(ancestor))
-            {
-                nonSelfIssuedIntermediateCountBelow++;
-            }
+            return new(false, ancestorsError, null, null, null);
         }
 
         // 7. Inspect critical extensions, EKU constraints, and NameConstraints before asking the
@@ -1151,28 +1076,10 @@ public static class CaChainAndConstraintValidator
         }
 
         // 8. Also verify via .NET X509Chain with CustomRootTrust (never trusting OS store)
-        using (X509Chain dotNetChain = new())
+        var (dotNetChainOk, dotNetChainErr) = VerifyWithDotNetCustomRootChain(orderedChain, now);
+        if (!dotNetChainOk)
         {
-            dotNetChain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-            dotNetChain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
-            dotNetChain.ChainPolicy.VerificationTime = now.UtcDateTime;
-
-            for (int i = 1; i < orderedChain.Count - 1; i++)
-            {
-                dotNetChain.ChainPolicy.ExtraStore.Add(orderedChain[i]);
-            }
-            dotNetChain.ChainPolicy.CustomTrustStore.Add(orderedChain[^1]);
-
-            if (!dotNetChain.Build(candidateCaCert))
-            {
-                string statuses = string.Join(", ", dotNetChain.ChainStatus.Select(s => $"{s.Status}: {s.StatusInformation}"));
-                return new(
-                    false,
-                    $"X.509 chain validation failed: {statuses}",
-                    null,
-                    null,
-                    null);
-            }
+            return new(false, dotNetChainErr, null, null, null);
         }
 
         // 9. Build ordered chain PEM (excluding index 0 which is candidateCaCert itself)
@@ -1239,7 +1146,110 @@ public static class CaChainAndConstraintValidator
         return new(true, null, issuerCertPem, orderedChainPem, summary);
     }
 
-    private static (bool Succeeded, string? ErrorMessage, List<X509Certificate2>? OrderedChain) ResolveUnambiguousCryptographicChain(
+    public static (bool IsValid, string? ErrorMessage) ValidateAncestorChainCapabilities(
+        IReadOnlyList<X509Certificate2> orderedChain,
+        DateTimeOffset now)
+    {
+        X509Certificate2 candidateCaCert = orderedChain[0];
+        int nonSelfIssuedIntermediateCountBelow = IsSelfIssued(candidateCaCert) ? 0 : 1;
+
+        for (int i = 1; i < orderedChain.Count; i++)
+        {
+            X509Certificate2 ancestor = orderedChain[i];
+            bool isRoot = i == orderedChain.Count - 1;
+            string roleName = isRoot ? "Root CA" : $"Parent Intermediate CA #{i}";
+
+            DateTimeOffset ancNotBefore = ancestor.NotBefore.ToUniversalTime();
+            DateTimeOffset ancNotAfter = ancestor.NotAfter.ToUniversalTime();
+            if (now < ancNotBefore)
+            {
+                return (
+                    false,
+                    $"{roleName} '{ancestor.Subject}' is not yet valid (NotBefore: {ancNotBefore:yyyy-MM-dd HH:mm:ss} UTC).");
+            }
+            if (now > ancNotAfter)
+            {
+                return (
+                    false,
+                    $"{roleName} '{ancestor.Subject}' has expired (NotAfter: {ancNotAfter:yyyy-MM-dd HH:mm:ss} UTC).");
+            }
+
+            X509BasicConstraintsExtension? ancBc = ancestor.Extensions
+                .OfType<X509BasicConstraintsExtension>()
+                .FirstOrDefault();
+
+            if (ancBc == null || !ancBc.CertificateAuthority)
+            {
+                return (
+                    false,
+                    $"{roleName} '{ancestor.Subject}' is not a valid CA certificate (BasicConstraints CA=true is missing).");
+            }
+            if (!ancBc.Critical)
+            {
+                return (
+                    false,
+                    $"{roleName} '{ancestor.Subject}' BasicConstraints extension is not critical as required for CA use under RFC 5280.");
+            }
+
+            if (ancBc.HasPathLengthConstraint && ancBc.PathLengthConstraint < nonSelfIssuedIntermediateCountBelow)
+            {
+                return (
+                    false,
+                    $"{roleName} '{ancestor.Subject}' has BasicConstraints pathLenConstraint={ancBc.PathLengthConstraint}, which is exceeded when '{candidateCaCert.Subject}' acts as an issuing intermediate CA (requires pathLenConstraint >= {nonSelfIssuedIntermediateCountBelow}).");
+            }
+
+            X509KeyUsageExtension? ancKu = ancestor.Extensions
+                .OfType<X509KeyUsageExtension>()
+                .FirstOrDefault();
+
+            if (ancKu == null)
+            {
+                return (
+                    false,
+                    $"{roleName} '{ancestor.Subject}' is missing the required KeyUsage extension (KeyCertSign is required).");
+            }
+
+            if ((ancKu.KeyUsages & X509KeyUsageFlags.KeyCertSign) == 0)
+            {
+                return (
+                    false,
+                    $"{roleName} '{ancestor.Subject}' KeyUsage ({ancKu.KeyUsages}) does not allow KeyCertSign.");
+            }
+
+            if (!IsSelfIssued(ancestor))
+            {
+                nonSelfIssuedIntermediateCountBelow++;
+            }
+        }
+
+        return (true, null);
+    }
+
+    public static (bool IsValid, string? ErrorMessage) VerifyWithDotNetCustomRootChain(
+        IReadOnlyList<X509Certificate2> orderedChain,
+        DateTimeOffset now)
+    {
+        using X509Chain dotNetChain = new();
+        dotNetChain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        dotNetChain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+        dotNetChain.ChainPolicy.VerificationTime = now.UtcDateTime;
+
+        for (int i = 1; i < orderedChain.Count - 1; i++)
+        {
+            dotNetChain.ChainPolicy.ExtraStore.Add(orderedChain[i]);
+        }
+        dotNetChain.ChainPolicy.CustomTrustStore.Add(orderedChain[^1]);
+
+        if (!dotNetChain.Build(orderedChain[0]))
+        {
+            string statuses = string.Join(", ", dotNetChain.ChainStatus.Select(s => $"{s.Status}: {s.StatusInformation}"));
+            return (false, $"X.509 chain validation failed: {statuses}");
+        }
+
+        return (true, null);
+    }
+
+    public static (bool Succeeded, string? ErrorMessage, List<X509Certificate2>? OrderedChain) ResolveUnambiguousCryptographicChain(
         X509Certificate2 leafCaCert,
         IReadOnlyList<X509Certificate2> candidateAncestors)
     {
@@ -1282,20 +1292,19 @@ public static class CaChainAndConstraintValidator
                 List<X509Certificate2> nextPath = [.. currentPath, parent];
                 HashSet<string> nextVisited = new(visitedThumbprints, StringComparer.OrdinalIgnoreCase) { parentFp };
 
-                if (IsSelfIssued(parent))
+                string? rootSigErr = null;
+                if (IsSelfIssued(parent) && VerifySignatureCryptographically(parent, parent, out rootSigErr))
                 {
-                    if (VerifySignatureCryptographically(parent, parent, out string? rootSigErr))
-                    {
-                        validChainsToRoot.Add(nextPath);
-                    }
-                    else
-                    {
-                        verifyFailureReasons.Add($"Root CA '{parent.Subject}' failed self-signature verification: {rootSigErr}");
-                    }
+                    validChainsToRoot.Add(nextPath);
                 }
                 else
                 {
+                    int countBefore = validChainsToRoot.Count;
                     Walk(nextPath, nextVisited);
+                    if (IsSelfIssued(parent) && validChainsToRoot.Count == countBefore && rootSigErr != null)
+                    {
+                        verifyFailureReasons.Add($"Root CA '{parent.Subject}' failed self-signature verification: {rootSigErr}");
+                    }
                 }
             }
         }
