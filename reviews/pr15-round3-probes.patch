@@ -1,0 +1,83 @@
+diff --git a/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs b/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
+index 6897974..069dbde 100644
+--- a/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
++++ b/Tests/CertRobo.Tests/CaCrlLifecycleRegressionTests.cs
+@@ -1399,0 +1400,78 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
++    [Fact]
++    public async Task ReviewProbe_RevokeReportsEquivalentIssuedRowAsRevoked()
++    {
++        const string secret = "Disposable-Test-Secret-Only!2026";
++        using ServiceProvider sp = BuildServiceProvider(Path.Combine(_tempRoot, "review-status.db"), Path.Combine(_tempRoot, "review-status-ca"), configuredPassphrase: secret);
++        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
++        ApplicationUser admin = await BootstrapAdminAsync(sp);
++        CaAuthorityRecord ca = await service.CreateSelfSignedOrIntermediateCaAsync(
++            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
++            CertificateKeyFamily.Ecdsa, 256, 365, secret);
++        IssuanceOutcome leaf = await IssueLeafAsync(service, admin.Id, "host.contoso.com");
++        int duplicateId;
++        using (IServiceScope scope = sp.CreateScope())
++        {
++            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++            IssuedCertificateRecord duplicate = new()
++            {
++                CaAuthorityId = ca.Id, SerialNumberHex = "00" + leaf.Record!.SerialNumberHex,
++                SerialNumberValue = leaf.Record.SerialNumberValue, ProfileId = leaf.Record.ProfileId,
++                CommonName = leaf.Record.CommonName, SubjectAlternativeNamesCsv = leaf.Record.SubjectAlternativeNamesCsv,
++                SubjectDistinguishedName = leaf.Record.SubjectDistinguishedName, IssuerDistinguishedName = leaf.Record.IssuerDistinguishedName,
++                KeyAlgorithm = leaf.Record.KeyAlgorithm, KeySizeBits = leaf.Record.KeySizeBits,
++                ThumbprintSha256 = leaf.Record.ThumbprintSha256, CertificatePem = leaf.CertificatePem!, ChainPem = leaf.Record.ChainPem,
++                NotBeforeUtc = leaf.Record.NotBeforeUtc, NotAfterUtc = leaf.Record.NotAfterUtc,
++                RequestedByUserId = admin.Id, RequestedByUserName = "another-operator", Status = IssuanceStatus.Issued
++            };
++            db.IssuedCertificates.Add(duplicate);
++            await db.SaveChangesAsync();
++            duplicateId = duplicate.Id;
++        }
++        RevocationOutcome outcome = await service.RevokeCertificateAsync(leaf.Record!.Id, CrlReason.KeyCompromise, "admin");
++        Assert.True(outcome.CrlPublished);
++        Assert.True(CrlContainsSerial(outcome.PublishedCrl!.CrlDer, leaf.Record.SerialNumberHex, CrlReason.KeyCompromise));
++        using IServiceScope checkScope = sp.CreateScope();
++        CertRoboDbContext checkDb = checkScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++        IssuedCertificateRecord duplicateAfter = (await checkDb.IssuedCertificates.FindAsync(duplicateId))!;
++        Assert.Equal(IssuanceStatus.Revoked, duplicateAfter.Status);
++    }
++
++    [Fact]
++    public async Task ReviewProbe_ReconcilePreservesSiblingRevocationActor()
++    {
++        const string secret = "Disposable-Test-Secret-Only!2026";
++        using ServiceProvider sp = BuildServiceProvider(Path.Combine(_tempRoot, "review-status.db"), Path.Combine(_tempRoot, "review-status-ca"), configuredPassphrase: secret);
++        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
++        ApplicationUser admin = await BootstrapAdminAsync(sp);
++        CaAuthorityRecord ca = await service.CreateSelfSignedOrIntermediateCaAsync(
++            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
++            CertificateKeyFamily.Ecdsa, 256, 365, secret);
++        IssuanceOutcome leaf = await IssueLeafAsync(service, admin.Id, "host.contoso.com");
++        int duplicateId;
++        using (IServiceScope scope = sp.CreateScope())
++        {
++            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++            IssuedCertificateRecord duplicate = new()
++            {
++                CaAuthorityId = ca.Id, SerialNumberHex = "00" + leaf.Record!.SerialNumberHex,
++                SerialNumberValue = leaf.Record.SerialNumberValue, ProfileId = leaf.Record.ProfileId,
++                CommonName = leaf.Record.CommonName, SubjectAlternativeNamesCsv = leaf.Record.SubjectAlternativeNamesCsv,
++                SubjectDistinguishedName = leaf.Record.SubjectDistinguishedName, IssuerDistinguishedName = leaf.Record.IssuerDistinguishedName,
++                KeyAlgorithm = leaf.Record.KeyAlgorithm, KeySizeBits = leaf.Record.KeySizeBits,
++                ThumbprintSha256 = leaf.Record.ThumbprintSha256, CertificatePem = leaf.CertificatePem!, ChainPem = leaf.Record.ChainPem,
++                NotBeforeUtc = leaf.Record.NotBeforeUtc, NotAfterUtc = leaf.Record.NotAfterUtc,
++                RequestedByUserId = admin.Id, RequestedByUserName = "another-operator", Status = IssuanceStatus.Revoked, RevokedAtUtc = DateTimeOffset.UtcNow.AddDays(-2), RevocationReasonCode = CrlReason.Superseded, RevokedByUserName = "original-operator"
++            };
++            db.IssuedCertificates.Add(duplicate);
++            await db.SaveChangesAsync();
++            duplicateId = duplicate.Id;
++        }
++        RevocationOutcome outcome = await service.RevokeCertificateAsync(leaf.Record!.Id, CrlReason.KeyCompromise, "admin");
++        Assert.True(outcome.CrlPublished);
++        Assert.True(CrlContainsSerial(outcome.PublishedCrl!.CrlDer, leaf.Record.SerialNumberHex, CrlReason.KeyCompromise));
++        using IServiceScope checkScope = sp.CreateScope();
++        CertRoboDbContext checkDb = checkScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
++        IssuedCertificateRecord duplicateAfter = (await checkDb.IssuedCertificates.FindAsync(duplicateId))!;
++        Assert.Equal("original-operator", duplicateAfter.RevokedByUserName);
++    }
++
