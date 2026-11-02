@@ -306,10 +306,15 @@ sudo systemctl enable --now nginx.service
      ```
 
 4. **Consistent Backup, Restore, and Cutover Notes**
-   * `BackupRestoreService` creates a consistent online snapshot (`VACUUM INTO`) of `certrobo.db` together with `ca/*.p8.enc` and `dataprotection-keys/*.xml`. This includes pending external-enrolment records, pending encrypted keys, non-secret WSTEP continuation data, encrypted connector credentials, and the Data Protection keys needed to recover those credentials. You can download a backup archive from `/admin` or run from the CLI:
+   * `BackupRestoreService` creates a consistent online snapshot (`VACUUM INTO`) of `certrobo.db` together with `ca/*.p8.enc` and `dataprotection-keys/*.xml`. This includes pending external-enrolment records, pending encrypted keys, non-secret WSTEP continuation data, encrypted connector credentials, and the Data Protection keys needed to recover those credentials. The archive does **not** contain `/etc/certrobo/ca.pass` or `certrobo.env`: back up the CA passphrase securely and separately, along with the configuration needed to restore it. The original passphrase is required to unlock its encrypted signing keys. Protect the archive itself: it contains Data Protection keys and sensitive application state. You can download a backup archive from `/admin` or run from the CLI:
      ```bash
      sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --backup /var/lib/certrobo/backups/certrobo-backup.zip'
+     ```
+   * Before restoring, stop CertRobo and any other processes that access its data. Restore the corresponding passphrase and configuration securely, then restore the archive and restart the service. Test recovery on a separate system before relying on the backup.
+     ```bash
+     sudo systemctl stop certrobo.service
      sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --restore /var/lib/certrobo/backups/certrobo-backup.zip'
+     sudo systemctl start certrobo.service
      ```
    * Note that rolling back to an earlier backup after certificates have been delivered to clients cannot undo trust in already-issued certificates; if importing an existing CA identity from AD CS, fence the old signer first, set the initial serial and CRL number floors above the highest previously issued values, and seed any unexpired revoked serials in `/admin`.
 
