@@ -1621,9 +1621,21 @@
     private string seedCommonName = "";
     private int seedReasonCode = 0;
 
-    private bool IsCaUnlocked =>
-        !string.IsNullOrEmpty(CaService.ResolveEffectivePassphrase())
-        && (activeCa == null || custodyReport?.ActiveAuthorityDecryptable != false);
+    private bool IsCaUnlocked
+    {
+        get
+        {
+            try
+            {
+                return !string.IsNullOrEmpty(CaService.ResolveEffectivePassphrase())
+                    && (activeCa == null || custodyReport?.ActiveAuthorityDecryptable != false);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
 
     private UserSummaryDto? SelectedUser =>
         users.FirstOrDefault(u => u.Id == selectedUserId) ?? users.FirstOrDefault();

@@ -958,7 +958,7 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
             Assert.Equal(crlBeforeConflict, (await caService.GetLatestCrlAsync())!.CrlNumber);
         }
 
-        // Reconciling the conflicting serial via SeedRevokedSerialAsync deduplicates the rows and converges
+        // Reconciling the conflicting serial via SeedRevokedSerialAsync aligns revocation metadata without deleting either row and converges
         RevocationOutcome reconciled = await caService.SeedRevokedSerialAsync(
             "00:04:B0",
             "conflict.contoso.com",
@@ -968,6 +968,13 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
         Assert.Equal(crlBeforeConflict + 1, reconciled.PublishedCrl!.CrlNumber);
         Assert.Empty(await caService.GetCertificateIdsWithUnpublishedRevocationsAsync());
         Assert.Empty(await caService.RefreshDueCrlsAsync(TimeSpan.FromHours(24)));
+
+        using (IServiceScope checkScope = sp.CreateScope())
+        {
+            CertRoboDbContext checkDb = checkScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            Assert.NotNull(await checkDb.IssuedCertificates.FindAsync(conflictId1));
+            Assert.NotNull(await checkDb.IssuedCertificates.FindAsync(conflictId2));
+        }
     }
 
     [Fact]
@@ -1118,6 +1125,306 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
         {
             caService.CrlPublicationFaultInjector = null;
             await bgService.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task ReviewFollowup_RevokeAndSeed_PreserveAllEquivalentSerialLedgerRecords_IncludingOnPublicationFailure()
+    {
+        const string secret = "Disposable-Test-Secret-Only!2026";
+        string dbPath = Path.Combine(_tempRoot, "preserve-ledger.db");
+        string caDir = Path.Combine(_tempRoot, "preserve-ledger-ca");
+
+        using ServiceProvider sp = BuildServiceProvider(dbPath, caDir, configuredPassphrase: secret);
+        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
+        ApplicationUser admin = await BootstrapAdminAsync(sp);
+
+        CaAuthorityRecord ca = await service.CreateSelfSignedOrIntermediateCaAsync(
+            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
+            CertificateKeyFamily.Ecdsa, 256, 365, secret);
+
+        IssuanceOutcome leaf = await IssueLeafAsync(service, admin.Id, "host.contoso.com");
+        IssuanceOutcome otherRealLeaf = await IssueLeafAsync(service, admin.Id, "other-certificate.contoso.com");
+
+        int duplicateId;
+        using (IServiceScope scope = sp.CreateScope())
+        {
+            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord duplicate = new()
+            {
+                CaAuthorityId = ca.Id,
+                SerialNumberHex = "00" + leaf.Record!.SerialNumberHex,
+                SerialNumberValue = leaf.Record.SerialNumberValue,
+                ProfileId = otherRealLeaf.Record!.ProfileId,
+                CommonName = "other-certificate.contoso.com",
+                SubjectAlternativeNamesCsv = "other-certificate.contoso.com",
+                SubjectDistinguishedName = "CN=other-certificate.contoso.com",
+                IssuerDistinguishedName = leaf.Record.IssuerDistinguishedName,
+                KeyAlgorithm = otherRealLeaf.Record.KeyAlgorithm,
+                KeySizeBits = otherRealLeaf.Record.KeySizeBits,
+                ThumbprintSha256 = "DIFFERENT-HISTORICAL-RECORD",
+                CertificatePem = otherRealLeaf.CertificatePem!,
+                ChainPem = otherRealLeaf.Record.ChainPem,
+                NotBeforeUtc = otherRealLeaf.Record.NotBeforeUtc,
+                NotAfterUtc = otherRealLeaf.Record.NotAfterUtc,
+                RequestedByUserId = admin.Id,
+                RequestedByUserName = "other-operator",
+                Status = IssuanceStatus.Issued
+            };
+            db.IssuedCertificates.Add(duplicate);
+            await db.SaveChangesAsync();
+            duplicateId = duplicate.Id;
+        }
+
+        // 1. Revoke first record while CRL publication fails -> both ledger records must remain intact
+        service.CrlPublicationFaultInjector = _ => throw new IOException("Simulated CRL failure on revoke.");
+        RevocationOutcome failedRevoke = await service.RevokeCertificateAsync(leaf.Record!.Id, CrlReason.KeyCompromise, "admin");
+        service.CrlPublicationFaultInjector = null;
+
+        Assert.True(failedRevoke.RevocationAccepted);
+        Assert.False(failedRevoke.CrlPublished);
+        Assert.True(failedRevoke.IsPendingPublication);
+
+        using (IServiceScope checkScope1 = sp.CreateScope())
+        {
+            CertRoboDbContext checkDb = checkScope1.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord? preservedPrimary = await checkDb.IssuedCertificates.FindAsync(leaf.Record.Id);
+            IssuedCertificateRecord? preservedDuplicate = await checkDb.IssuedCertificates.FindAsync(duplicateId);
+            Assert.NotNull(preservedPrimary);
+            Assert.NotNull(preservedDuplicate);
+            Assert.Equal("host.contoso.com", preservedPrimary.CommonName);
+            Assert.Equal("other-certificate.contoso.com", preservedDuplicate.CommonName);
+            Assert.Equal("other-operator", preservedDuplicate.RequestedByUserName);
+            Assert.Equal("DIFFERENT-HISTORICAL-RECORD", preservedDuplicate.ThumbprintSha256);
+            Assert.Equal(otherRealLeaf.CertificatePem, preservedDuplicate.CertificatePem);
+        }
+
+        // 2. Revoke first record with CRL publication succeeding (exact ReviewProbe_RevokeMustPreserveEquivalentSerialLedgerRecords check)
+        RevocationOutcome outcome = await service.RevokeCertificateAsync(leaf.Record.Id, CrlReason.KeyCompromise, "admin");
+        Assert.True(outcome.RevocationAccepted);
+        Assert.True(outcome.CrlPublished);
+
+        using (IServiceScope checkScope2 = sp.CreateScope())
+        {
+            CertRoboDbContext checkDb = checkScope2.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord? preservedDuplicate = await checkDb.IssuedCertificates.FindAsync(duplicateId);
+            Assert.NotNull(preservedDuplicate);
+            Assert.Equal("other-certificate.contoso.com", preservedDuplicate.CommonName);
+            Assert.Equal("other-operator", preservedDuplicate.RequestedByUserName);
+            Assert.Equal(otherRealLeaf.CertificatePem, preservedDuplicate.CertificatePem);
+        }
+
+        // 3. Seed equivalent serial with publication failure, then with publication success -> both ledger records remain preserved
+        service.CrlPublicationFaultInjector = _ => throw new IOException("Simulated CRL failure on seed.");
+        RevocationOutcome failedSeed = await service.SeedRevokedSerialAsync(
+            "00" + leaf.Record.SerialNumberHex,
+            "host.contoso.com",
+            CrlReason.Superseded,
+            "admin");
+        service.CrlPublicationFaultInjector = null;
+        Assert.True(failedSeed.RevocationAccepted);
+        Assert.False(failedSeed.CrlPublished);
+
+        RevocationOutcome succeededSeed = await service.SeedRevokedSerialAsync(
+            "00" + leaf.Record.SerialNumberHex,
+            "host.contoso.com",
+            CrlReason.Superseded,
+            "admin");
+        Assert.True(succeededSeed.RevocationAccepted);
+        Assert.True(succeededSeed.CrlPublished);
+        Assert.Empty(await service.GetCertificateIdsWithUnpublishedRevocationsAsync());
+
+        using (IServiceScope checkScope3 = sp.CreateScope())
+        {
+            CertRoboDbContext checkDb = checkScope3.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord? preservedPrimary = await checkDb.IssuedCertificates.FindAsync(leaf.Record.Id);
+            IssuedCertificateRecord? preservedDuplicate = await checkDb.IssuedCertificates.FindAsync(duplicateId);
+            Assert.NotNull(preservedPrimary);
+            Assert.NotNull(preservedDuplicate);
+            Assert.Equal("host.contoso.com", preservedPrimary.CommonName);
+            Assert.Equal("other-certificate.contoso.com", preservedDuplicate.CommonName);
+            Assert.Equal("other-operator", preservedDuplicate.RequestedByUserName);
+            Assert.Equal(otherRealLeaf.CertificatePem, preservedDuplicate.CertificatePem);
+            Assert.Equal(IssuanceStatus.Revoked, preservedPrimary.Status);
+            Assert.Equal(IssuanceStatus.Revoked, preservedDuplicate.Status);
+            Assert.Equal(CrlReason.Superseded, preservedPrimary.RevocationReasonCode);
+            Assert.Equal(CrlReason.Superseded, preservedDuplicate.RevocationReasonCode);
+        }
+    }
+
+    [Fact]
+    public async Task ReviewFollowup_PostSaveFailures_InPassphraseFile_AndContextOrQueryStage_ReturnPendingOutcome_SignalWorker_AndPreserveCancellation()
+    {
+        const string secret = "Disposable-Test-Secret-Only!2026";
+        string dbPath = Path.Combine(_tempRoot, "unreadable-passphrase.db");
+        string caDir = Path.Combine(_tempRoot, "unreadable-passphrase-ca");
+        string passFile = Path.Combine(_tempRoot, "unreadable.pass");
+        await File.WriteAllTextAsync(passFile, secret);
+
+        FaultInjectingDbContextFactory? faultDbFactory = null;
+        using ServiceProvider sp = BuildServiceProvider(dbPath, caDir, passFilePath: passFile, wrapDbFactory: options =>
+        {
+            faultDbFactory = new FaultInjectingDbContextFactory(options);
+            return faultDbFactory;
+        });
+
+        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
+        ApplicationUser admin = await BootstrapAdminAsync(sp);
+
+        await service.CreateSelfSignedOrIntermediateCaAsync(
+            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI",
+            CertificateKeyFamily.Ecdsa, 256, 365, secret);
+
+        IssuanceOutcome leaf1 = await IssueLeafAsync(service, admin.Id, "host1.contoso.com");
+        IssuanceOutcome leaf2 = await IssueLeafAsync(service, admin.Id, "host2.contoso.com");
+        IssuanceOutcome leaf3 = await IssueLeafAsync(service, admin.Id, "host3.contoso.com");
+
+        // Drain any initial wake signal
+        await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(50));
+
+        // 1. Passphrase-resolution stage failure (unreadable passphrase file on Unix)
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(passFile, UnixFileMode.None);
+            try
+            {
+                RevocationOutcome unreadableRevoke = await service.RevokeCertificateAsync(
+                    leaf1.Record!.Id,
+                    CrlReason.KeyCompromise,
+                    "admin");
+                Assert.False(unreadableRevoke.Succeeded);
+                Assert.True(unreadableRevoke.RevocationAccepted);
+                Assert.False(unreadableRevoke.CrlPublished);
+                Assert.True(unreadableRevoke.IsPendingPublication);
+                Assert.Equal(RevocationPublicationStatus.PendingPublicationFailed, unreadableRevoke.PublicationStatus);
+                Assert.True(await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(250)));
+
+                RevocationOutcome unreadableSeed = await service.SeedRevokedSerialAsync(
+                    "01:AA:BB:CC",
+                    "legacy-unreadable.contoso.com",
+                    CrlReason.Superseded,
+                    "admin");
+                Assert.False(unreadableSeed.Succeeded);
+                Assert.True(unreadableSeed.RevocationAccepted);
+                Assert.False(unreadableSeed.CrlPublished);
+                Assert.Equal(RevocationPublicationStatus.PendingPublicationFailed, unreadableSeed.PublicationStatus);
+                Assert.True(await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(250)));
+
+                // RefreshDueCrlsAsync reports the passphrase-read error per authority without throwing
+                IReadOnlyList<CrlRefreshOutcome> unreadableRefresh = await service.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+                Assert.Single(unreadableRefresh);
+                Assert.False(unreadableRefresh[0].Succeeded);
+            }
+            finally
+            {
+                File.SetUnixFileMode(passFile, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+
+            using (IServiceScope checkScope = sp.CreateScope())
+            {
+                CertRoboDbContext checkDb = checkScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+                IssuedCertificateRecord saved = (await checkDb.IssuedCertificates.FindAsync(leaf1.Record!.Id))!;
+                Assert.Equal(IssuanceStatus.Revoked, saved.Status);
+            }
+
+            PublishedCrlRecord currentBeforeRetry = (await service.GetLatestCrlAsync())!;
+            Assert.False(CrlContainsSerial(currentBeforeRetry.CrlDer, leaf1.Record!.SerialNumberHex));
+
+            IReadOnlyList<CrlRefreshOutcome> recoveredRefresh = await service.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+            Assert.Single(recoveredRefresh);
+            Assert.True(recoveredRefresh[0].Succeeded, recoveredRefresh[0].ErrorMessage);
+            Assert.True(CrlContainsSerial(recoveredRefresh[0].PublishedCrl!.CrlDer, leaf1.Record.SerialNumberHex, CrlReason.KeyCompromise));
+            Assert.True(CrlContainsSerial(recoveredRefresh[0].PublishedCrl!.CrlDer, "01AABBCC", CrlReason.Superseded));
+        }
+
+        // 2. Context / query stage failure after saving revocation (when TryPublishRevocationCrlCoreAsync opens crlDb)
+        await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(50));
+        Assert.NotNull(faultDbFactory);
+        // Context #1 in RevokeCertificateAsync saves the revocation; Context #2 in TryPublishRevocationCrlCoreAsync throws
+        faultDbFactory!.FailOnContextCreationNumber = 2;
+        try
+        {
+            RevocationOutcome contextFailOutcome = await service.RevokeCertificateAsync(
+                leaf2.Record!.Id,
+                CrlReason.AffiliationChanged,
+                "admin");
+            Assert.False(contextFailOutcome.Succeeded);
+            Assert.True(contextFailOutcome.RevocationAccepted);
+            Assert.False(contextFailOutcome.CrlPublished);
+            Assert.Equal(RevocationPublicationStatus.PendingPublicationFailed, contextFailOutcome.PublicationStatus);
+            Assert.Contains("Simulated post-save DbContext creation failure", contextFailOutcome.ErrorMessage);
+            Assert.True(await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(250)));
+        }
+        finally
+        {
+            faultDbFactory.FailOnContextCreationNumber = 0;
+        }
+
+        using (IServiceScope checkScope2 = sp.CreateScope())
+        {
+            CertRoboDbContext checkDb = checkScope2.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord saved2 = (await checkDb.IssuedCertificates.FindAsync(leaf2.Record!.Id))!;
+            Assert.Equal(IssuanceStatus.Revoked, saved2.Status);
+        }
+
+        IReadOnlyList<CrlRefreshOutcome> retryAfterContextFault = await service.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+        Assert.Single(retryAfterContextFault);
+        Assert.True(retryAfterContextFault[0].Succeeded, retryAfterContextFault[0].ErrorMessage);
+        Assert.True(CrlContainsSerial(retryAfterContextFault[0].PublishedCrl!.CrlDer, leaf2.Record!.SerialNumberHex, CrlReason.AffiliationChanged));
+
+        // 3. Cancellation semantics during post-save publication: OperationCanceledException is propagated while still signaling worker
+        await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(50));
+        using CancellationTokenSource cts = new();
+        service.CrlPublicationFaultInjector = _ =>
+        {
+            cts.Cancel();
+            cts.Token.ThrowIfCancellationRequested();
+        };
+        try
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                service.RevokeCertificateAsync(leaf3.Record!.Id, CrlReason.CessationOfOperation, "admin", cts.Token));
+            Assert.True(await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(250)));
+        }
+        finally
+        {
+            service.CrlPublicationFaultInjector = null;
+        }
+
+        IReadOnlyList<CrlRefreshOutcome> retryAfterCancel = await service.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+        Assert.Single(retryAfterCancel);
+        Assert.True(retryAfterCancel[0].Succeeded, retryAfterCancel[0].ErrorMessage);
+        Assert.True(CrlContainsSerial(retryAfterCancel[0].PublishedCrl!.CrlDer, leaf3.Record!.SerialNumberHex, CrlReason.CessationOfOperation));
+    }
+
+    private sealed class FaultInjectingDbContextFactory(DbContextOptions<CertRoboDbContext> options)
+        : IDbContextFactory<CertRoboDbContext>
+    {
+        private int _creationCount;
+        private int _failOnCreationNumber;
+
+        public int FailOnContextCreationNumber
+        {
+            get => _failOnCreationNumber;
+            set
+            {
+                _creationCount = 0;
+                _failOnCreationNumber = value;
+            }
+        }
+
+        public CertRoboDbContext CreateDbContext()
+        {
+            if (_failOnCreationNumber > 0 && Interlocked.Increment(ref _creationCount) == _failOnCreationNumber)
+            {
+                throw new InvalidOperationException("Simulated post-save DbContext creation failure.");
+            }
+            return new CertRoboDbContext(options);
+        }
+
+        public Task<CertRoboDbContext> CreateDbContextAsync(CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(CreateDbContext());
         }
     }
 
@@ -1301,13 +1608,25 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
         string sqlitePath,
         string caStorageDir,
         string? passFilePath = null,
-        string? configuredPassphrase = null)
+        string? configuredPassphrase = null,
+        Func<DbContextOptions<CertRoboDbContext>, IDbContextFactory<CertRoboDbContext>>? wrapDbFactory = null)
     {
         ServiceCollection services = new();
         services.AddLogging();
         services.AddDataProtection();
         services.AddDbContextFactory<CertRoboDbContext>(options =>
             options.UseSqlite($"Data Source={sqlitePath}"));
+        if (wrapDbFactory != null)
+        {
+            ServiceDescriptor existingFactory = services.Single(d => d.ServiceType == typeof(IDbContextFactory<CertRoboDbContext>));
+            services.Remove(existingFactory);
+            services.AddSingleton<IDbContextFactory<CertRoboDbContext>>(_ =>
+            {
+                DbContextOptionsBuilder<CertRoboDbContext> builder = new();
+                builder.UseSqlite($"Data Source={sqlitePath}");
+                return wrapDbFactory(builder.Options);
+            });
+        }
         services.AddScoped(sp =>
             sp.GetRequiredService<IDbContextFactory<CertRoboDbContext>>().CreateDbContext());
 
