@@ -954,6 +954,274 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
         Assert.Equal(secretA, manualServiceCa.ResolveEffectivePassphrase());
     }
 
+    [Fact]
+    public async Task DocumentedRecoveryShellProcedure_EnforcesStopAndBackupPrerequisites_AndHandlesExpectedPreMigrationCustodyMismatch()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        string readmePath = LocateRepositoryReadmePath();
+        string readmeContent = await File.ReadAllTextAsync(readmePath);
+        string recoveryBlock = ExtractRecoveryBashBlock(readmeContent);
+
+        // 1. Failed systemctl stop prevents backup, migration, and service start
+        var (stopFailExit, stopFailOut, stopFailCalls) = await RunStubbedRecoveryShellBlockAsync(
+            recoveryBlock,
+            stopExitCode: 1,
+            backupExitCode: 0,
+            initialVerifyExitCode: 1,
+            reprotectExitCode: 0,
+            postVerifyExitCode: 0,
+            startExitCode: 0);
+        Assert.NotEqual(0, stopFailExit);
+        Assert.Contains("ERROR: Failed to stop certrobo.service", stopFailOut);
+        Assert.Equal(["systemctl:stop:certrobo.service"], stopFailCalls);
+
+        // 2. Failed --backup prevents migration and service start
+        var (backupFailExit, backupFailOut, backupFailCalls) = await RunStubbedRecoveryShellBlockAsync(
+            recoveryBlock,
+            stopExitCode: 0,
+            backupExitCode: 1,
+            initialVerifyExitCode: 1,
+            reprotectExitCode: 0,
+            postVerifyExitCode: 0,
+            startExitCode: 0);
+        Assert.NotEqual(0, backupFailExit);
+        Assert.Contains("ERROR: Pre-migration backup failed", backupFailOut);
+        Assert.Equal(
+            ["systemctl:stop:certrobo.service", "certrobo:--backup"],
+            backupFailCalls);
+
+        // 3. Expected initial --verify-ca-custody failure (nonzero) does NOT abort migration;
+        //    successful --reprotect-ca-keys and post-migration --verify-ca-custody proceed to start the service
+        var (happyExit, happyOut, happyCalls) = await RunStubbedRecoveryShellBlockAsync(
+            recoveryBlock,
+            stopExitCode: 0,
+            backupExitCode: 0,
+            initialVerifyExitCode: 1,
+            reprotectExitCode: 0,
+            postVerifyExitCode: 0,
+            startExitCode: 0);
+        Assert.True(happyExit == 0, $"Expected happy recovery flow to exit 0, got ({happyExit}): {happyOut}");
+        Assert.Contains("Pre-migration custody mismatch confirmed", happyOut);
+        Assert.Equal(
+            [
+                "systemctl:stop:certrobo.service",
+                "certrobo:--backup",
+                "certrobo:--verify-ca-custody#1",
+                "certrobo:--reprotect-ca-keys",
+                "certrobo:--verify-ca-custody#2",
+                "systemctl:start:certrobo.service"
+            ],
+            happyCalls);
+
+        // 4. Failed --reprotect-ca-keys aborts and keeps certrobo.service stopped
+        var (reprotectFailExit, reprotectFailOut, reprotectFailCalls) = await RunStubbedRecoveryShellBlockAsync(
+            recoveryBlock,
+            stopExitCode: 0,
+            backupExitCode: 0,
+            initialVerifyExitCode: 1,
+            reprotectExitCode: 1,
+            postVerifyExitCode: 0,
+            startExitCode: 0);
+        Assert.NotEqual(0, reprotectFailExit);
+        Assert.Contains("ERROR: CA key custody migration or post-migration verification failed", reprotectFailOut);
+        Assert.Equal(
+            [
+                "systemctl:stop:certrobo.service",
+                "certrobo:--backup",
+                "certrobo:--verify-ca-custody#1",
+                "certrobo:--reprotect-ca-keys"
+            ],
+            reprotectFailCalls);
+
+        // 5. Failed post-migration --verify-ca-custody aborts and keeps certrobo.service stopped
+        var (postVerifyFailExit, postVerifyFailOut, postVerifyFailCalls) = await RunStubbedRecoveryShellBlockAsync(
+            recoveryBlock,
+            stopExitCode: 0,
+            backupExitCode: 0,
+            initialVerifyExitCode: 1,
+            reprotectExitCode: 0,
+            postVerifyExitCode: 1,
+            startExitCode: 0);
+        Assert.NotEqual(0, postVerifyFailExit);
+        Assert.Contains("ERROR: CA key custody migration or post-migration verification failed", postVerifyFailOut);
+        Assert.Equal(
+            [
+                "systemctl:stop:certrobo.service",
+                "certrobo:--backup",
+                "certrobo:--verify-ca-custody#1",
+                "certrobo:--reprotect-ca-keys",
+                "certrobo:--verify-ca-custody#2"
+            ],
+            postVerifyFailCalls);
+    }
+
+    private static string LocateRepositoryReadmePath()
+    {
+        DirectoryInfo? dir = new(AppContext.BaseDirectory);
+        while (dir != null)
+        {
+            string candidate = Path.Combine(dir.FullName, "README.md");
+            if (File.Exists(candidate) && File.Exists(Path.Combine(dir.FullName, "CertRobo.csproj")))
+            {
+                return candidate;
+            }
+            dir = dir.Parent;
+        }
+
+        throw new FileNotFoundException("Could not locate repository README.md.");
+    }
+
+    private static string ExtractRecoveryBashBlock(string readmeContent)
+    {
+        const string marker = "**CA Key Custody Verification & Mixed-Passphrase Recovery:**";
+        int markerIdx = readmeContent.IndexOf(marker, StringComparison.Ordinal);
+        Assert.True(markerIdx >= 0, "Could not find recovery section marker in README.md.");
+
+        const string fenceStart = "```bash";
+        int startIdx = readmeContent.IndexOf(fenceStart, markerIdx, StringComparison.Ordinal);
+        Assert.True(startIdx >= 0, "Could not find ```bash fence in recovery section.");
+        startIdx += fenceStart.Length;
+
+        int endIdx = readmeContent.IndexOf("```", startIdx, StringComparison.Ordinal);
+        Assert.True(endIdx > startIdx, "Could not find closing ``` fence in recovery section.");
+
+        return readmeContent[startIdx..endIdx].Trim();
+    }
+
+    private async Task<(int ExitCode, string CombinedOutput, IReadOnlyList<string> Invocations)> RunStubbedRecoveryShellBlockAsync(
+        string recoveryBlock,
+        int stopExitCode,
+        int backupExitCode,
+        int initialVerifyExitCode,
+        int reprotectExitCode,
+        int postVerifyExitCode,
+        int startExitCode)
+    {
+        string sandboxDir = Path.Combine(_tempRoot, $"shell-stub-{Guid.NewGuid():N}");
+        string binDir = Path.Combine(sandboxDir, "bin");
+        string optDir = Path.Combine(sandboxDir, "opt-certrobo");
+        string etcDir = Path.Combine(sandboxDir, "etc-certrobo");
+        string logFile = Path.Combine(sandboxDir, "invocations.log");
+        string verifyCounterFile = Path.Combine(sandboxDir, "verify.count");
+        Directory.CreateDirectory(binDir);
+        Directory.CreateDirectory(optDir);
+        Directory.CreateDirectory(etcDir);
+
+        string envFile = Path.Combine(etcDir, "certrobo.env");
+        await File.WriteAllTextAsync(envFile, "ASPNETCORE_ENVIRONMENT=Production\n");
+
+        string sudoPath = Path.Combine(binDir, "sudo");
+        await File.WriteAllTextAsync(
+            sudoPath,
+            """
+            #!/bin/sh
+            if [ "$1" = "-u" ]; then
+                shift 2
+            fi
+            if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
+                rewritten=$(printf '%s' "$3" | sed "s|/etc/certrobo/certrobo.env|$STUB_ENV_FILE|g; s|/opt/certrobo|$STUB_OPT_DIR|g")
+                exec /bin/sh -c "$rewritten"
+            fi
+            exec "$@"
+            """);
+
+        string systemctlPath = Path.Combine(binDir, "systemctl");
+        await File.WriteAllTextAsync(
+            systemctlPath,
+            """
+            #!/bin/sh
+            echo "systemctl:$1:$2" >> "$STUB_LOG_FILE"
+            if [ "$1" = "stop" ]; then
+                exit "${STUB_STOP_EXIT:-0}"
+            fi
+            if [ "$1" = "start" ]; then
+                exit "${STUB_START_EXIT:-0}"
+            fi
+            exit 0
+            """);
+
+        string certRoboStubPath = Path.Combine(optDir, "CertRobo");
+        await File.WriteAllTextAsync(
+            certRoboStubPath,
+            """
+            #!/bin/sh
+            case "$1" in
+                --backup)
+                    echo "certrobo:--backup" >> "$STUB_LOG_FILE"
+                    exit "${STUB_BACKUP_EXIT:-0}"
+                    ;;
+                --verify-ca-custody)
+                    count=0
+                    if [ -f "$STUB_VERIFY_COUNT_FILE" ]; then
+                        count=$(cat "$STUB_VERIFY_COUNT_FILE")
+                    fi
+                    count=$((count + 1))
+                    echo "$count" > "$STUB_VERIFY_COUNT_FILE"
+                    echo "certrobo:--verify-ca-custody#$count" >> "$STUB_LOG_FILE"
+                    if [ "$count" -eq 1 ]; then
+                        exit "${STUB_INITIAL_VERIFY_EXIT:-0}"
+                    fi
+                    exit "${STUB_POST_VERIFY_EXIT:-0}"
+                    ;;
+                --reprotect-ca-keys)
+                    echo "certrobo:--reprotect-ca-keys" >> "$STUB_LOG_FILE"
+                    exit "${STUB_REPROTECT_EXIT:-0}"
+                    ;;
+                *)
+                    echo "certrobo:$1" >> "$STUB_LOG_FILE"
+                    exit 1
+                    ;;
+            esac
+            """);
+
+        if (!OperatingSystem.IsWindows())
+        {
+            UnixFileMode execMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+            File.SetUnixFileMode(sudoPath, execMode);
+            File.SetUnixFileMode(systemctlPath, execMode);
+            File.SetUnixFileMode(certRoboStubPath, execMode);
+        }
+
+        ProcessStartInfo psi = new("/bin/sh")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            WorkingDirectory = sandboxDir
+        };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add(recoveryBlock);
+
+        string existingPath = Environment.GetEnvironmentVariable("PATH") ?? "/usr/bin:/bin";
+        psi.Environment["PATH"] = $"{binDir}:{existingPath}";
+        psi.Environment["STUB_ENV_FILE"] = envFile;
+        psi.Environment["STUB_OPT_DIR"] = optDir;
+        psi.Environment["STUB_LOG_FILE"] = logFile;
+        psi.Environment["STUB_VERIFY_COUNT_FILE"] = verifyCounterFile;
+        psi.Environment["STUB_STOP_EXIT"] = stopExitCode.ToString();
+        psi.Environment["STUB_BACKUP_EXIT"] = backupExitCode.ToString();
+        psi.Environment["STUB_INITIAL_VERIFY_EXIT"] = initialVerifyExitCode.ToString();
+        psi.Environment["STUB_REPROTECT_EXIT"] = reprotectExitCode.ToString();
+        psi.Environment["STUB_POST_VERIFY_EXIT"] = postVerifyExitCode.ToString();
+        psi.Environment["STUB_START_EXIT"] = startExitCode.ToString();
+
+        using Process proc = Process.Start(psi)!;
+        Task<string> stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        Task<string> stderrTask = proc.StandardError.ReadToEndAsync();
+        await proc.WaitForExitAsync();
+        string combined = (await stdoutTask) + "\n" + (await stderrTask);
+
+        IReadOnlyList<string> invocations = File.Exists(logFile)
+            ? (await File.ReadAllLinesAsync(logFile)).Where(l => !string.IsNullOrWhiteSpace(l)).ToList()
+            : [];
+
+        return (proc.ExitCode, combined, invocations);
+    }
+
     private static async Task<(int ExitCode, string CombinedOutput)> RunCertRoboCliAsync(
         string dbPath,
         string caDir,

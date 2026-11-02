@@ -325,19 +325,28 @@ sudo systemctl enable --now nginx.service
    * **CA Key Custody Verification & Mixed-Passphrase Recovery:**
      If a deployment previously encrypted a historical or replacement CA key with a different passphrase (or rotated `/etc/certrobo/ca.pass`), stop the running service, take an offline backup, and converge all stored keys to the configured shared custody secret without overwriting original `.p8.enc` key files. Keep a separate, secure offline copy of all legacy and current passphrases before starting; never use the sole copy of a passphrase as a staging file on the host:
      ```bash
-     # 1. Stop the running service so it cannot race key migration or retain a stale in-memory passphrase
-     sudo systemctl stop certrobo.service
+     # 1. Stop the running service and take a consistent offline backup before modifying key custody
+     if ! sudo systemctl stop certrobo.service; then
+         echo "ERROR: Failed to stop certrobo.service; aborting CA key custody migration." >&2
+         false
+     elif ! sudo -u certrobo sh -c 'set -e; set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --backup /var/lib/certrobo/backups/pre-reprotect-backup.zip'; then
+         echo "ERROR: Pre-migration backup failed; aborting CA key custody migration." >&2
+         false
+     else
+         # 2. Inspect current custody status (a nonzero exit is expected before mixed-passphrase keys are re-protected)
+         if ! sudo -u certrobo sh -c 'set -e; set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --verify-ca-custody'; then
+             echo "Pre-migration custody mismatch confirmed; proceeding with key re-protection." >&2
+         fi
 
-     # 2. Take a consistent backup while the service is stopped
-     sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --backup /var/lib/certrobo/backups/pre-reprotect-backup.zip'
-
-     # 3. Inspect current custody status across active, historical, and pending CA keys
-     sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --verify-ca-custody'
-
-     # 4. Re-protect incompatible keys using a mode-0600 staging file containing the previous passphrase(s) (one per line),
-     #    verify custody health, and start the service only if both migration and verification succeed
-     sudo -u certrobo sh -c 'set -e; set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --reprotect-ca-keys /etc/certrobo/legacy-ca.pass && ./CertRobo --verify-ca-custody' \
-       && sudo systemctl start certrobo.service
+         # 3. Re-protect incompatible keys, verify post-migration custody health, and start the service only if both succeed
+         if sudo -u certrobo sh -c 'set -e; set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --reprotect-ca-keys /etc/certrobo/legacy-ca.pass' \
+             && sudo -u certrobo sh -c 'set -e; set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --verify-ca-custody'; then
+             sudo systemctl start certrobo.service
+         else
+             echo "ERROR: CA key custody migration or post-migration verification failed; keeping certrobo.service stopped." >&2
+             false
+         fi
+     fi
      ```
      Do **not** delete `/etc/certrobo/legacy-ca.pass` or retire your independent offline copy of the legacy passphrase(s) until `--reprotect-ca-keys` and `--verify-ca-custody` have both exited `0`, `certrobo.service` has started cleanly, and active issuance and CRL refresh have been verified. Note that file deletion utilities (such as `rm` or `shred`) do not guarantee physical erasure on SSDs, copy-on-write filesystems, or journaled/networked storage.
 
