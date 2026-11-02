@@ -1572,6 +1572,233 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
         Assert.True(CrlContainsSerial(retryAfterCancel[0].PublishedCrl!.CrlDer, leaf3.Record!.SerialNumberHex, CrlReason.CessationOfOperation));
     }
 
+    [Fact]
+    public async Task ReviewRound4_SeedMatchingFailedIssuanceMustAppearOnCrl()
+    {
+        const string secret = "Disposable-Test-Secret-Only!2026";
+        using ServiceProvider sp = BuildServiceProvider(
+            Path.Combine(_tempRoot, "r4failed.db"),
+            Path.Combine(_tempRoot, "r4failed-ca"),
+            configuredPassphrase: secret);
+        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
+        ApplicationUser admin = await BootstrapAdminAsync(sp);
+        CaAuthorityRecord ca = await service.CreateSelfSignedOrIntermediateCaAsync(
+            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI", CertificateKeyFamily.Ecdsa, 256, 365, secret);
+
+        int failedAltId;
+        int failedIdenticalId;
+        int pendingAltId;
+        int pendingIdenticalId;
+
+        using (IServiceScope scope = sp.CreateScope())
+        {
+            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord failedAlt = new()
+            {
+                CaAuthorityId = ca.Id,
+                SerialNumberHex = "00ABCD",
+                SerialNumberValue = 43981,
+                ProfileId = "test",
+                CommonName = "failed-alt.contoso.com",
+                SubjectAlternativeNamesCsv = "",
+                SubjectDistinguishedName = "",
+                IssuerDistinguishedName = "",
+                KeyAlgorithm = "ECDSA",
+                KeySizeBits = 256,
+                ThumbprintSha256 = "",
+                RequestedByUserId = admin.Id,
+                RequestedByUserName = "original",
+                Status = IssuanceStatus.Failed,
+                FailureOrDenialReason = "Signing failed"
+            };
+            IssuedCertificateRecord failedIdentical = new()
+            {
+                CaAuthorityId = ca.Id,
+                SerialNumberHex = "BEEF",
+                SerialNumberValue = 48879,
+                ProfileId = "test",
+                CommonName = "failed-identical.contoso.com",
+                SubjectAlternativeNamesCsv = "",
+                SubjectDistinguishedName = "",
+                IssuerDistinguishedName = "",
+                KeyAlgorithm = "ECDSA",
+                KeySizeBits = 256,
+                ThumbprintSha256 = "",
+                RequestedByUserId = admin.Id,
+                RequestedByUserName = "original",
+                Status = IssuanceStatus.Failed,
+                FailureOrDenialReason = "Signing failed"
+            };
+            IssuedCertificateRecord pendingAlt = new()
+            {
+                CaAuthorityId = ca.Id,
+                SerialNumberHex = "00CAFE",
+                SerialNumberValue = 51966,
+                ProfileId = "test",
+                CommonName = "pending-alt.contoso.com",
+                SubjectAlternativeNamesCsv = "",
+                SubjectDistinguishedName = "",
+                IssuerDistinguishedName = "",
+                KeyAlgorithm = "ECDSA",
+                KeySizeBits = 256,
+                ThumbprintSha256 = "",
+                RequestedByUserId = admin.Id,
+                RequestedByUserName = "original",
+                Status = IssuanceStatus.Pending
+            };
+            IssuedCertificateRecord pendingIdentical = new()
+            {
+                CaAuthorityId = ca.Id,
+                SerialNumberHex = "FACE",
+                SerialNumberValue = 64206,
+                ProfileId = "test",
+                CommonName = "pending-identical.contoso.com",
+                SubjectAlternativeNamesCsv = "",
+                SubjectDistinguishedName = "",
+                IssuerDistinguishedName = "",
+                KeyAlgorithm = "ECDSA",
+                KeySizeBits = 256,
+                ThumbprintSha256 = "",
+                RequestedByUserId = admin.Id,
+                RequestedByUserName = "original",
+                Status = IssuanceStatus.Pending
+            };
+            db.IssuedCertificates.AddRange(failedAlt, failedIdentical, pendingAlt, pendingIdentical);
+            await db.SaveChangesAsync();
+            failedAltId = failedAlt.Id;
+            failedIdenticalId = failedIdentical.Id;
+            pendingAltId = pendingAlt.Id;
+            pendingIdenticalId = pendingIdentical.Id;
+        }
+
+        // 1. Exact probe: Failed row with alternate encoding "00ABCD", seed "ABCD"
+        RevocationOutcome result = await service.SeedRevokedSerialAsync(
+            "ABCD",
+            "legacy.contoso.com",
+            CrlReason.KeyCompromise,
+            "operator");
+        Assert.True(result.CrlPublished);
+        Assert.True(CrlContainsSerial(result.PublishedCrl!.CrlDer, "ABCD", CrlReason.KeyCompromise));
+
+        // 2. Failed row with identical encoding "BEEF", seed "BEEF" while signer is locked -> pending status, then publish
+        service.LockRuntimePassphrase();
+        RevocationOutcome lockedBeef = await service.SeedRevokedSerialAsync(
+            "BEEF",
+            "legacy-beef.contoso.com",
+            CrlReason.Superseded,
+            "operator");
+        Assert.True(lockedBeef.RevocationAccepted);
+        Assert.False(lockedBeef.CrlPublished);
+        Assert.True(lockedBeef.IsPendingPublication);
+
+        IReadOnlySet<int> pendingSet = await service.GetCertificateIdsWithUnpublishedRevocationsAsync();
+        Assert.Contains(lockedBeef.CertificateRecord!.Id, pendingSet);
+        Assert.DoesNotContain(failedIdenticalId, pendingSet);
+
+        service.UnlockRuntimePassphrase(secret);
+        IReadOnlyList<CrlRefreshOutcome> beefRefresh = await service.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
+        Assert.Single(beefRefresh);
+        Assert.True(beefRefresh[0].Succeeded, beefRefresh[0].ErrorMessage);
+        Assert.True(CrlContainsSerial(beefRefresh[0].PublishedCrl!.CrlDer, "BEEF", CrlReason.Superseded));
+
+        // 3. Pending rows with alternate ("00CAFE") and identical ("FACE") encodings
+        RevocationOutcome cafeResult = await service.SeedRevokedSerialAsync(
+            "CAFE",
+            "legacy-cafe.contoso.com",
+            CrlReason.AffiliationChanged,
+            "operator");
+        Assert.True(cafeResult.CrlPublished);
+        Assert.True(CrlContainsSerial(cafeResult.PublishedCrl!.CrlDer, "CAFE", CrlReason.AffiliationChanged));
+
+        RevocationOutcome faceResult = await service.SeedRevokedSerialAsync(
+            "00:FA:CE",
+            "legacy-face.contoso.com",
+            CrlReason.CessationOfOperation,
+            "operator");
+        Assert.True(faceResult.CrlPublished);
+        Assert.True(CrlContainsSerial(faceResult.PublishedCrl!.CrlDer, "FACE", CrlReason.CessationOfOperation));
+        Assert.Empty(await service.GetCertificateIdsWithUnpublishedRevocationsAsync());
+
+        // Verify all 4 Failed/Pending issuance records were preserved untouched with their original statuses
+        using (IServiceScope checkScope = sp.CreateScope())
+        {
+            CertRoboDbContext checkDb = checkScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            Assert.Equal(IssuanceStatus.Failed, (await checkDb.IssuedCertificates.FindAsync(failedAltId))!.Status);
+            Assert.Equal(IssuanceStatus.Failed, (await checkDb.IssuedCertificates.FindAsync(failedIdenticalId))!.Status);
+            Assert.Equal(IssuanceStatus.Pending, (await checkDb.IssuedCertificates.FindAsync(pendingAltId))!.Status);
+            Assert.Equal(IssuanceStatus.Pending, (await checkDb.IssuedCertificates.FindAsync(pendingIdenticalId))!.Status);
+        }
+    }
+
+    [Fact]
+    public async Task ReviewRound4_NewSeedAuditInsertFailureDoesNotLeaveSilentRevocation()
+    {
+        const string secret = "Disposable-Test-Secret-Only!2026";
+        using ServiceProvider sp = BuildServiceProvider(
+            Path.Combine(_tempRoot, "r4atomic.db"),
+            Path.Combine(_tempRoot, "r4atomic-ca"),
+            configuredPassphrase: secret);
+        CertificateAuthorityService service = sp.GetRequiredService<CertificateAuthorityService>();
+        ApplicationUser admin = await BootstrapAdminAsync(sp);
+        CaAuthorityRecord ca = await service.CreateSelfSignedOrIntermediateCaAsync(
+            "Test CA", "ca.contoso.com", "US", "Colorado", "Denver", "Test", "PKI", CertificateKeyFamily.Ecdsa, 256, 365, secret);
+        IssuanceOutcome leaf = await IssueLeafAsync(service, admin.Id, "atomic-leaf.contoso.com");
+        await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(50));
+
+        using (IServiceScope scope = sp.CreateScope())
+        {
+            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            await db.Database.ExecuteSqlRawAsync(
+                "CREATE TRIGGER reject_r4_event BEFORE INSERT ON SerialRevocationEvents BEGIN SELECT RAISE(FAIL, 'simulated audit insert failure'); END;");
+        }
+
+        // 1. Exact probe: new seed audit insert failure rolls back the new IssuedCertificateRecord and does not signal wake
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            service.SeedRevokedSerialAsync("ACDC", "legacy.contoso.com", CrlReason.KeyCompromise, "operator"));
+        Assert.False(await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(100)));
+
+        // 2. Also verify RevokeCertificateAsync rolls back the status change on leaf when SerialRevocationEvents insert fails
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            service.RevokeCertificateAsync(leaf.Record!.Id, CrlReason.KeyCompromise, "admin"));
+        Assert.False(await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(100)));
+
+        using (IServiceScope checkScope = sp.CreateScope())
+        {
+            CertRoboDbContext checkDb = checkScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            IssuedCertificateRecord? orphan = await checkDb.IssuedCertificates
+                .FirstOrDefaultAsync(c => c.CaAuthorityId == ca.Id && c.SerialNumberHex == "ACDC");
+            Assert.Null(orphan);
+
+            IssuedCertificateRecord? leafAfterRollback = await checkDb.IssuedCertificates.FindAsync(leaf.Record!.Id);
+            Assert.NotNull(leafAfterRollback);
+            Assert.Equal(IssuanceStatus.Issued, leafAfterRollback.Status);
+            Assert.Null(leafAfterRollback.RevokedAtUtc);
+            Assert.Null(leafAfterRollback.RevokedByUserName);
+        }
+
+        // 3. Drop trigger and verify pre-commit cancellation rolls back cleanly without signaling,
+        //    whereas post-commit cancellation preserves the committed seed and signals the worker
+        using (IServiceScope dropScope = sp.CreateScope())
+        {
+            CertRoboDbContext db = dropScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            await db.Database.ExecuteSqlRawAsync("DROP TRIGGER reject_r4_event;");
+        }
+
+        using (CancellationTokenSource preCancelled = new())
+        {
+            preCancelled.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                service.SeedRevokedSerialAsync("DEAD", "cancelled.contoso.com", CrlReason.KeyCompromise, "operator", cancellationToken: preCancelled.Token));
+            Assert.False(await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(100)));
+        }
+
+        using (IServiceScope checkScope2 = sp.CreateScope())
+        {
+            CertRoboDbContext checkDb = checkScope2.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            Assert.Null(await checkDb.IssuedCertificates.FirstOrDefaultAsync(c => c.CaAuthorityId == ca.Id && c.SerialNumberHex == "DEAD"));
+        }
+    }
+
     private sealed class FaultInjectingDbContextFactory(DbContextOptions<CertRoboDbContext> options)
         : IDbContextFactory<CertRoboDbContext>
     {

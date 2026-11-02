@@ -2287,74 +2287,79 @@ public sealed class CertificateAuthorityService
                     $"Certificate in status '{certRecord.Status}' cannot be revoked.");
             }
 
-            bool targetWasAlreadyRevoked = certRecord.Status == IssuanceStatus.Revoked;
-            DateTimeOffset effectiveRevokedAt = certRecord.RevokedAtUtc ?? DateTimeOffset.UtcNow;
-            certRecord.Status = IssuanceStatus.Revoked;
-            if (!targetWasAlreadyRevoked)
+            await using (var tx = await db.Database.BeginTransactionAsync(cancellationToken))
             {
-                certRecord.RevokedAtUtc = effectiveRevokedAt;
-                certRecord.RevocationReasonCode = revocationReasonCode;
-                certRecord.RevokedByUserName = revokedByUserName;
-            }
-            else
-            {
-                certRecord.RevokedAtUtc ??= effectiveRevokedAt;
-                certRecord.RevocationReasonCode ??= revocationReasonCode;
-                certRecord.RevokedByUserName ??= revokedByUserName;
-            }
-
-            if (certRecord.CaAuthorityId.HasValue
-                && TryNormalizePositiveSerialHex(certRecord.SerialNumberHex, out BigInteger certSerialBi, out string canonicalCertHex, out _))
-            {
-                List<IssuedCertificateRecord> sameIssuerRecords = await db.IssuedCertificates
-                    .Where(c => c.CaAuthorityId == certRecord.CaAuthorityId.Value && c.Id != certRecord.Id)
-                    .ToListAsync(cancellationToken);
-
-                List<IssuedCertificateRecord> siblingSerialRecords = sameIssuerRecords
-                    .Where(c => TryNormalizePositiveSerialHex(c.SerialNumberHex, out BigInteger otherBi, out _, out _)
-                             && otherBi.Equals(certSerialBi))
-                    .ToList();
-
-                // Revocation is per (issuer, serial): mark any Issued sibling records for the same serial as Revoked
-                // while preserving all issuance metadata and never overwriting prior revocation attribution on already-revoked siblings.
-                foreach (IssuedCertificateRecord sibling in siblingSerialRecords)
+                bool targetWasAlreadyRevoked = certRecord.Status == IssuanceStatus.Revoked;
+                DateTimeOffset effectiveRevokedAt = certRecord.RevokedAtUtc ?? DateTimeOffset.UtcNow;
+                certRecord.Status = IssuanceStatus.Revoked;
+                if (!targetWasAlreadyRevoked)
                 {
-                    if (sibling.Status == IssuanceStatus.Issued || sibling.Status == IssuanceStatus.Revoked)
+                    certRecord.RevokedAtUtc = effectiveRevokedAt;
+                    certRecord.RevocationReasonCode = revocationReasonCode;
+                    certRecord.RevokedByUserName = revokedByUserName;
+                }
+                else
+                {
+                    certRecord.RevokedAtUtc ??= effectiveRevokedAt;
+                    certRecord.RevocationReasonCode ??= revocationReasonCode;
+                    certRecord.RevokedByUserName ??= revokedByUserName;
+                }
+
+                if (certRecord.CaAuthorityId.HasValue
+                    && TryNormalizePositiveSerialHex(certRecord.SerialNumberHex, out BigInteger certSerialBi, out string canonicalCertHex, out _))
+                {
+                    List<IssuedCertificateRecord> sameIssuerRecords = await db.IssuedCertificates
+                        .Where(c => c.CaAuthorityId == certRecord.CaAuthorityId.Value && c.Id != certRecord.Id)
+                        .ToListAsync(cancellationToken);
+
+                    List<IssuedCertificateRecord> siblingSerialRecords = sameIssuerRecords
+                        .Where(c => TryNormalizePositiveSerialHex(c.SerialNumberHex, out BigInteger otherBi, out _, out _)
+                                 && otherBi.Equals(certSerialBi))
+                        .ToList();
+
+                    // Revocation is per (issuer, serial): mark any Issued sibling records for the same serial as Revoked
+                    // while preserving all issuance metadata and never overwriting prior revocation attribution on already-revoked siblings.
+                    foreach (IssuedCertificateRecord sibling in siblingSerialRecords)
                     {
-                        sibling.Status = IssuanceStatus.Revoked;
-                        sibling.RevokedAtUtc ??= effectiveRevokedAt;
-                        sibling.RevocationReasonCode ??= revocationReasonCode;
-                        sibling.RevokedByUserName ??= revokedByUserName;
+                        if (sibling.Status == IssuanceStatus.Issued || sibling.Status == IssuanceStatus.Revoked)
+                        {
+                            sibling.Status = IssuanceStatus.Revoked;
+                            sibling.RevokedAtUtc ??= effectiveRevokedAt;
+                            sibling.RevocationReasonCode ??= revocationReasonCode;
+                            sibling.RevokedByUserName ??= revokedByUserName;
+                        }
                     }
+
+                    bool canonicalHexTakenBySibling = sameIssuerRecords.Any(c =>
+                        string.Equals(c.SerialNumberHex, canonicalCertHex, StringComparison.OrdinalIgnoreCase));
+                    if (!canonicalHexTakenBySibling)
+                    {
+                        certRecord.SerialNumberHex = canonicalCertHex;
+                    }
+
+                    int maxMatchingRecordId = siblingSerialRecords
+                        .Select(s => s.Id)
+                        .Append(certRecord.Id)
+                        .Max();
+
+                    db.SerialRevocationEvents.Add(new SerialRevocationEventRecord
+                    {
+                        CaAuthorityId = certRecord.CaAuthorityId.Value,
+                        CanonicalSerialHex = canonicalCertHex,
+                        TargetCertificateRecordId = certRecord.Id,
+                        OperationType = "Revoke",
+                        RevocationReasonCode = revocationReasonCode,
+                        RevokedAtUtc = effectiveRevokedAt,
+                        RevokedByUserName = revokedByUserName,
+                        ReconciledMaxCertificateRecordId = maxMatchingRecordId,
+                        CreatedAtUtc = DateTimeOffset.UtcNow
+                    });
                 }
 
-                bool canonicalHexTakenBySibling = sameIssuerRecords.Any(c =>
-                    string.Equals(c.SerialNumberHex, canonicalCertHex, StringComparison.OrdinalIgnoreCase));
-                if (!canonicalHexTakenBySibling)
-                {
-                    certRecord.SerialNumberHex = canonicalCertHex;
-                }
-
-                int maxMatchingRecordId = siblingSerialRecords
-                    .Select(s => s.Id)
-                    .Append(certRecord.Id)
-                    .Max();
-
-                db.SerialRevocationEvents.Add(new SerialRevocationEventRecord
-                {
-                    CaAuthorityId = certRecord.CaAuthorityId.Value,
-                    CanonicalSerialHex = canonicalCertHex,
-                    TargetCertificateRecordId = certRecord.Id,
-                    OperationType = "Revoke",
-                    RevocationReasonCode = revocationReasonCode,
-                    RevokedAtUtc = effectiveRevokedAt,
-                    RevokedByUserName = revokedByUserName,
-                    ReconciledMaxCertificateRecordId = maxMatchingRecordId,
-                    CreatedAtUtc = DateTimeOffset.UtcNow
-                });
+                await db.SaveChangesAsync(cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                await tx.CommitAsync(CancellationToken.None);
             }
-
-            await db.SaveChangesAsync(cancellationToken);
 
             return await TryPublishRevocationCrlCoreAsync(certRecord, cancellationToken);
         }
@@ -2419,100 +2424,113 @@ public sealed class CertificateAuthorityService
                          && existingBi.Equals(serialBigInt))
                 .ToList();
 
+            List<IssuedCertificateRecord> revocableMatches = matchingRecords
+                .Where(c => c.Status == IssuanceStatus.Issued || c.Status == IssuanceStatus.Revoked)
+                .ToList();
+
             DateTimeOffset effectiveRevokedAt = revokedAtUtc ?? DateTimeOffset.UtcNow;
             IssuedCertificateRecord targetRecord;
 
-            if (matchingRecords.Count > 0)
+            await using (var tx = await db.Database.BeginTransactionAsync(cancellationToken))
             {
-                IssuedCertificateRecord primary = matchingRecords
-                    .FirstOrDefault(c => !string.IsNullOrWhiteSpace(c.CertificatePem))
-                    ?? matchingRecords[0];
-
-                DateTimeOffset unifiedRevokedAt = revokedAtUtc
-                    ?? primary.RevokedAtUtc
-                    ?? matchingRecords.Select(r => r.RevokedAtUtc).FirstOrDefault(t => t.HasValue)
-                    ?? effectiveRevokedAt;
-
-                // Preserve every existing ledger record and its prior revocation attribution (who revoked it and when)
-                // while transitioning any Issued sibling rows to Revoked and recording the authoritative Seed event.
-                foreach (IssuedCertificateRecord record in matchingRecords)
+                if (revocableMatches.Count > 0)
                 {
-                    if (record.Status == IssuanceStatus.Issued || record.Status == IssuanceStatus.Revoked)
+                    IssuedCertificateRecord primary = revocableMatches
+                        .FirstOrDefault(c => !string.IsNullOrWhiteSpace(c.CertificatePem))
+                        ?? revocableMatches[0];
+
+                    DateTimeOffset unifiedRevokedAt = revokedAtUtc
+                        ?? primary.RevokedAtUtc
+                        ?? revocableMatches.Select(r => r.RevokedAtUtc).FirstOrDefault(t => t.HasValue)
+                        ?? effectiveRevokedAt;
+
+                    // Preserve every existing ledger record and its prior revocation attribution (who revoked it and when)
+                    // while transitioning any Issued sibling rows to Revoked and recording the authoritative Seed event.
+                    foreach (IssuedCertificateRecord record in revocableMatches)
                     {
                         record.Status = IssuanceStatus.Revoked;
                         record.RevokedAtUtc ??= unifiedRevokedAt;
                         record.RevocationReasonCode ??= revocationReasonCode;
                         record.RevokedByUserName ??= revokedByUserName;
                     }
+
+                    bool canonicalHexTakenByOther = caCertificates.Any(c =>
+                        c.Id != primary.Id
+                        && string.Equals(c.SerialNumberHex, canonicalHex, StringComparison.OrdinalIgnoreCase));
+                    if (!canonicalHexTakenByOther)
+                    {
+                        primary.SerialNumberHex = canonicalHex;
+                    }
+
+                    int maxMatchingRecordId = matchingRecords.Max(r => r.Id);
+                    db.SerialRevocationEvents.Add(new SerialRevocationEventRecord
+                    {
+                        CaAuthorityId = ca.Id,
+                        CanonicalSerialHex = canonicalHex,
+                        TargetCertificateRecordId = primary.Id,
+                        OperationType = "Seed",
+                        RevocationReasonCode = revocationReasonCode,
+                        RevokedAtUtc = unifiedRevokedAt,
+                        RevokedByUserName = revokedByUserName,
+                        ReconciledMaxCertificateRecordId = maxMatchingRecordId,
+                        CreatedAtUtc = DateTimeOffset.UtcNow
+                    });
+
+                    targetRecord = primary;
+                    await db.SaveChangesAsync(cancellationToken);
+                }
+                else
+                {
+                    string nonCollidingSerialHex = AllocateNonCollidingEquivalentSerialHex(canonicalHex, caCertificates);
+                    IssuedCertificateRecord seeded = new()
+                    {
+                        CaAuthorityId = ca.Id,
+                        SerialNumberHex = nonCollidingSerialHex,
+                        SerialNumberValue = 0,
+                        ProfileId = "legacy-imported",
+                        CommonName = string.IsNullOrWhiteSpace(commonName) ? "legacy-revoked" : commonName.Trim(),
+                        SubjectAlternativeNamesCsv = string.IsNullOrWhiteSpace(commonName) ? "" : commonName.Trim(),
+                        SubjectDistinguishedName = string.IsNullOrWhiteSpace(commonName) ? "" : $"CN={commonName.Trim()}",
+                        IssuerDistinguishedName = string.Empty,
+                        KeyAlgorithm = "LEGACY",
+                        KeySizeBits = 0,
+                        ThumbprintSha256 = "LEGACY-" + canonicalHex,
+                        NotBeforeUtc = ca.NotBeforeUtc,
+                        NotAfterUtc = ca.NotAfterUtc,
+                        RequestedByUserId = "legacy-migration",
+                        RequestedByUserName = revokedByUserName,
+                        Status = IssuanceStatus.Revoked,
+                        CreatedAtUtc = effectiveRevokedAt,
+                        RevokedAtUtc = effectiveRevokedAt,
+                        RevocationReasonCode = revocationReasonCode,
+                        RevokedByUserName = revokedByUserName
+                    };
+                    db.IssuedCertificates.Add(seeded);
+                    await db.SaveChangesAsync(cancellationToken);
+
+                    int maxMatchingRecordId = matchingRecords
+                        .Select(r => r.Id)
+                        .Append(seeded.Id)
+                        .Max();
+
+                    db.SerialRevocationEvents.Add(new SerialRevocationEventRecord
+                    {
+                        CaAuthorityId = ca.Id,
+                        CanonicalSerialHex = canonicalHex,
+                        TargetCertificateRecordId = seeded.Id,
+                        OperationType = "Seed",
+                        RevocationReasonCode = revocationReasonCode,
+                        RevokedAtUtc = effectiveRevokedAt,
+                        RevokedByUserName = revokedByUserName,
+                        ReconciledMaxCertificateRecordId = maxMatchingRecordId,
+                        CreatedAtUtc = DateTimeOffset.UtcNow
+                    });
+                    await db.SaveChangesAsync(cancellationToken);
+                    targetRecord = seeded;
                 }
 
-                bool canonicalHexTakenByOther = caCertificates.Any(c =>
-                    c.Id != primary.Id
-                    && string.Equals(c.SerialNumberHex, canonicalHex, StringComparison.OrdinalIgnoreCase));
-                if (!canonicalHexTakenByOther)
-                {
-                    primary.SerialNumberHex = canonicalHex;
-                }
-
-                int maxMatchingRecordId = matchingRecords.Max(r => r.Id);
-                db.SerialRevocationEvents.Add(new SerialRevocationEventRecord
-                {
-                    CaAuthorityId = ca.Id,
-                    CanonicalSerialHex = canonicalHex,
-                    TargetCertificateRecordId = primary.Id,
-                    OperationType = "Seed",
-                    RevocationReasonCode = revocationReasonCode,
-                    RevokedAtUtc = unifiedRevokedAt,
-                    RevokedByUserName = revokedByUserName,
-                    ReconciledMaxCertificateRecordId = maxMatchingRecordId,
-                    CreatedAtUtc = DateTimeOffset.UtcNow
-                });
-
-                targetRecord = primary;
-                await db.SaveChangesAsync(cancellationToken);
-            }
-            else
-            {
-                IssuedCertificateRecord seeded = new()
-                {
-                    CaAuthorityId = ca.Id,
-                    SerialNumberHex = canonicalHex,
-                    SerialNumberValue = 0,
-                    ProfileId = "legacy-imported",
-                    CommonName = string.IsNullOrWhiteSpace(commonName) ? "legacy-revoked" : commonName.Trim(),
-                    SubjectAlternativeNamesCsv = string.IsNullOrWhiteSpace(commonName) ? "" : commonName.Trim(),
-                    SubjectDistinguishedName = string.IsNullOrWhiteSpace(commonName) ? "" : $"CN={commonName.Trim()}",
-                    IssuerDistinguishedName = string.Empty,
-                    KeyAlgorithm = "LEGACY",
-                    KeySizeBits = 0,
-                    ThumbprintSha256 = "LEGACY-" + canonicalHex,
-                    NotBeforeUtc = ca.NotBeforeUtc,
-                    NotAfterUtc = ca.NotAfterUtc,
-                    RequestedByUserId = "legacy-migration",
-                    RequestedByUserName = revokedByUserName,
-                    Status = IssuanceStatus.Revoked,
-                    CreatedAtUtc = effectiveRevokedAt,
-                    RevokedAtUtc = effectiveRevokedAt,
-                    RevocationReasonCode = revocationReasonCode,
-                    RevokedByUserName = revokedByUserName
-                };
-                db.IssuedCertificates.Add(seeded);
-                await db.SaveChangesAsync(cancellationToken);
-
-                db.SerialRevocationEvents.Add(new SerialRevocationEventRecord
-                {
-                    CaAuthorityId = ca.Id,
-                    CanonicalSerialHex = canonicalHex,
-                    TargetCertificateRecordId = seeded.Id,
-                    OperationType = "Seed",
-                    RevocationReasonCode = revocationReasonCode,
-                    RevokedAtUtc = effectiveRevokedAt,
-                    RevokedByUserName = revokedByUserName,
-                    ReconciledMaxCertificateRecordId = seeded.Id,
-                    CreatedAtUtc = DateTimeOffset.UtcNow
-                });
-                await db.SaveChangesAsync(cancellationToken);
-                targetRecord = seeded;
+                cancellationToken.ThrowIfCancellationRequested();
+                await tx.CommitAsync(CancellationToken.None);
             }
 
             return await TryPublishRevocationCrlCoreAsync(targetRecord, cancellationToken);
@@ -2591,6 +2609,20 @@ public sealed class CertificateAuthorityService
 
             await using var tx = await crlDb.Database.BeginTransactionAsync(cancellationToken);
             PublishedCrlRecord publishedCrl = await GenerateAndPersistCrlInternalAsync(crlDb, ca, passphrase, cancellationToken);
+
+            if (!TryNormalizePositiveSerialHex(certRecord.SerialNumberHex, out BigInteger expectedSerialBi, out _, out _))
+            {
+                throw new InvalidOperationException(
+                    $"Revoked serial '{certRecord.SerialNumberHex}' is not a valid positive integer.");
+            }
+
+            X509Crl verifiedCrl = new X509CrlParser().ReadCrl(publishedCrl.CrlDer);
+            if (verifiedCrl.GetRevokedCertificate(expectedSerialBi) == null)
+            {
+                throw new InvalidOperationException(
+                    $"Generated CRL #{publishedCrl.CrlNumber} did not contain expected revoked serial {certRecord.SerialNumberHex}.");
+            }
+
             await tx.CommitAsync(cancellationToken);
             return new(
                 Succeeded: true,
@@ -3086,6 +3118,42 @@ public sealed class CertificateAuthorityService
         byte[] unsignedBytes = serialBigInt.ToByteArrayUnsigned();
         canonicalHex = Convert.ToHexString(unsignedBytes);
         return true;
+    }
+
+    private static string AllocateNonCollidingEquivalentSerialHex(
+        string canonicalHex,
+        IReadOnlyCollection<IssuedCertificateRecord> existingForIssuer)
+    {
+        HashSet<string> usedHex = existingForIssuer
+            .Select(c => c.SerialNumberHex)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        if (!usedHex.Contains(canonicalHex))
+        {
+            return canonicalHex;
+        }
+
+        string candidate = canonicalHex;
+        while (candidate.Length + 2 <= 64)
+        {
+            candidate = "00" + candidate;
+            if (!usedHex.Contains(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        for (int split = 2; split < canonicalHex.Length && canonicalHex.Length + 1 <= 64; split += 2)
+        {
+            string colonCandidate = canonicalHex[..split] + ":" + canonicalHex[split..];
+            if (!usedHex.Contains(colonCandidate))
+            {
+                return colonCandidate;
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Could not allocate a non-colliding serial representation for '{canonicalHex}'.");
     }
 
     private sealed record CanonicalCrlRevocationEntry(
