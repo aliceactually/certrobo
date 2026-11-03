@@ -1413,8 +1413,67 @@
                     </div>
                     <RadzenButton Text="Download Consistent Backup (.zip)" Click="@DownloadBackupClick" />
                 </div>
+
+                <div class="operation-panel mb-3">
+                    <div class="form-check mb-2">
+                        <input id="backup-include-root-p12"
+                               class="form-check-input"
+                               type="checkbox"
+                               @bind="includeRootCaPkcs12InBackup" />
+                        <label class="form-check-label" for="backup-include-root-p12">
+                            Include portable Root CA PKCS#12 (<code>.p12</code>) protected by a generated 7-word EFF Diceware passphrase
+                        </label>
+                    </div>
+                    @if (includeRootCaPkcs12InBackup)
+                    {
+                        <div class="row g-2 align-items-end mt-1">
+                            <div class="col-md-7">
+                                <label class="form-label small mb-1" for="backup-root-ca-select">Locally Managed Root CA to Include</label>
+                                <select id="backup-root-ca-select" class="form-select form-select-sm" @bind="selectedBackupRootCaId">
+                                    @if (localRootAuthorities.Count == 0)
+                                    {
+                                        <option value="0">-- No locally managed Root CA available --</option>
+                                    }
+                                    else
+                                    {
+                                        @foreach (var rootAuth in localRootAuthorities)
+                                        {
+                                            <option value="@rootAuth.Id">@rootAuth.Name (ID #@rootAuth.Id@(rootAuth.IsActive ? ", Active" : ""))</option>
+                                        }
+                                    }
+                                </select>
+                            </div>
+                            <div class="col-md-5 small text-muted-theme">
+                                Uses <code>PBES2-PBKDF2-HMAC-SHA256</code> + <code>AES-256-CBC</code> + <code>PBMAC1</code> (100,000 iterations). Requires CA key custody to be unlocked.
+                            </div>
+                        </div>
+                    }
+                </div>
+
+                @if (!string.IsNullOrWhiteSpace(generatedBackupPkcs12Passphrase))
+                {
+                    <div class="alert alert-warning mb-3" role="alert">
+                        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-1">
+                            <strong>One-Time Root CA PKCS#12 Passphrase (Store Separately Now)</strong>
+                            <button type="button"
+                                    class="btn btn-sm btn-outline-dark"
+                                    @onclick="() => generatedBackupPkcs12Passphrase = null">
+                                Clear Shown Passphrase
+                            </button>
+                        </div>
+                        <p class="small mb-2">
+                            This 7-word EFF passphrase protects <code>@generatedBackupPkcs12EntryPath</code> in the backup you just downloaded. It is never stored, logged, or included inside the ZIP, and it does <strong>not</strong> replace the CA storage passphrase required to unlock <code>ca/*.p8.enc</code>.
+                        </p>
+                        <input id="generated-root-p12-passphrase"
+                               class="form-control monospace-input"
+                               type="text"
+                               readonly
+                               value="@generatedBackupPkcs12Passphrase" />
+                    </div>
+                }
+
                 <p class="small text-muted-theme mb-0">
-                    Keep the CA unlock passphrase separate from the backup archive. To restore from the CLI:
+                    <strong>Security notice:</strong> The state backup ZIP itself is not encrypted as a whole and contains sensitive application state (the Identity database, Data Protection keys, and encrypted CA keys). Store the archive securely and keep the CA unlock passphrase (and any generated PKCS#12 passphrase) separate from the archive. To restore from the CLI:
                     <code>./CertRobo --restore certrobo-backup.zip</code>.
                 </p>
             </RadzenCard>
@@ -1614,6 +1673,11 @@
     private string certStatusFilterString = "";
 
     // Settings & Maintenance state
+    private bool includeRootCaPkcs12InBackup = false;
+    private int selectedBackupRootCaId = 0;
+    private IReadOnlyList<CaAuthorityRecord> localRootAuthorities = [];
+    private string? generatedBackupPkcs12Passphrase;
+    private string? generatedBackupPkcs12EntryPath;
     private bool showLegacySettingsInspector = false;
     private bool showLegacyRevocationSeeder = false;
     private string legacyWorksheetText = "";
@@ -1720,6 +1784,16 @@
     private async Task ReloadAllAsync()
     {
         activeCa = await CaService.GetActiveAuthorityAsync();
+        IReadOnlyList<CaAuthorityRecord> allAuthorities = await CaService.ListAuthoritiesAsync();
+        localRootAuthorities = allAuthorities.Where(a => !a.IsIntermediate).ToList();
+        if (localRootAuthorities.Count == 0)
+        {
+            selectedBackupRootCaId = 0;
+        }
+        else if (!localRootAuthorities.Any(a => a.Id == selectedBackupRootCaId))
+        {
+            selectedBackupRootCaId = (localRootAuthorities.FirstOrDefault(a => a.IsActive) ?? localRootAuthorities[0]).Id;
+        }
         custodyReport = await CaService.InspectKeyCustodyAsync();
         pendingEnrollment = await CaService.GetActivePendingEnrollmentAsync();
         pendingActivationSummary = CertificateAuthorityService.DeserializeActivationSummary(pendingEnrollment);
@@ -1777,21 +1851,59 @@
     {
         try
         {
+            generatedBackupPkcs12Passphrase = null;
+            generatedBackupPkcs12EntryPath = null;
+
             string appDataDir = Configuration["CertRobo:DataDirectory"]
                 ?? Path.Combine(HostEnvironment.ContentRootPath, "App_Data");
             string sqliteDbPath = Configuration["CertRobo:SqliteFilePath"]
                 ?? Path.Combine(appDataDir, "certrobo.db");
             string dpKeysDir = Path.Combine(appDataDir, "dataprotection-keys");
 
-            byte[] archiveBytes = await BackupService.CreateConsistentBackupArchiveAsync(sqliteDbPath, dpKeysDir);
+            byte[] archiveBytes;
+            if (includeRootCaPkcs12InBackup)
+            {
+                if (selectedBackupRootCaId <= 0)
+                {
+                    Notify(Radzen.NotificationSeverity.Error, "Backup Error", "No locally managed Root CA is available to include as a PKCS#12 artifact.");
+                    return;
+                }
+
+                AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+                string? userId = authState.User.FindFirstValue(ClaimTypes.NameIdentifier);
+                string? securityStamp = authState.User.FindFirstValue("AspNet.Identity.SecurityStamp");
+
+                StateBackupWithRootCaPkcs12Result p12Result = await BackupService.CreateConsistentBackupWithRootCaPkcs12Async(
+                    sqliteDbPath,
+                    dpKeysDir,
+                    userId,
+                    selectedBackupRootCaId,
+                    expectedSecurityStamp: securityStamp);
+
+                archiveBytes = p12Result.ArchiveBytes;
+                generatedBackupPkcs12Passphrase = p12Result.GeneratedPkcs12Passphrase;
+                generatedBackupPkcs12EntryPath = p12Result.Pkcs12EntryPath;
+            }
+            else
+            {
+                archiveBytes = await BackupService.CreateConsistentBackupArchiveAsync(sqliteDbPath, dpKeysDir);
+            }
+
             string fileName = $"certrobo-backup-{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}.zip";
             MemoryStream output = new(archiveBytes);
             using DotNetStreamReference streamRef = new(output, false);
             await JS.InvokeVoidAsync("downloadFileFromStream", fileName, streamRef);
-            Notify(Radzen.NotificationSeverity.Success, "Backup Ready", $"Downloaded {fileName}.");
+            Notify(
+                Radzen.NotificationSeverity.Success,
+                "Backup Ready",
+                includeRootCaPkcs12InBackup
+                    ? $"Downloaded {fileName} including Root CA PKCS#12 '{generatedBackupPkcs12EntryPath}'. Store the displayed 7-word passphrase separately."
+                    : $"Downloaded {fileName}.");
         }
         catch (Exception ex)
         {
+            generatedBackupPkcs12Passphrase = null;
+            generatedBackupPkcs12EntryPath = null;
             Notify(Radzen.NotificationSeverity.Error, "Backup Error", ex.Message);
         }
     }

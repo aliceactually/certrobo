@@ -34,6 +34,13 @@
     <Content Include="static\rootca.p12.example">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
+    <Content Include="Resources\Passphrases\eff_large_wordlist.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Resources\Passphrases\README.md">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <EmbeddedResource Include="Resources\Passphrases\eff_large_wordlist.txt" LogicalName="CertRobo.Resources.Passphrases.eff_large_wordlist.txt" />
   </ItemGroup>
 
   <ItemGroup>

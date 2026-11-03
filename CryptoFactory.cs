@@ -297,34 +297,16 @@ public class PkcsBuilder
                             zipStream.Write(Encoding.ASCII.GetBytes(normalizedKeyPem));
                         }
 
-                        // PKCS #12 leaf
-                        Pkcs12StoreBuilder builder = new();
-                        builder.SetUseDerEncoding(true);
-                        Pkcs12Store store = builder.Build();
-                        store.SetKeyEntry(string.Empty, new AsymmetricKeyEntry(p), [new X509CertificateEntry(cert)]);
-                        byte[] pkcs;
-                        using (MemoryStream stream = new())
-                        {
-                            store.Save(stream, null, new SecureRandom());
-                            pkcs = stream.ToArray();
-                        }
+                        // PKCS #12 leaf (passwordless with empty-password PBKDF2-HMAC-SHA256 integrity MAC for corruption detection;
+                        // does not provide key confidentiality because the empty password is public)
+                        byte[] pkcs = BuildPasswordlessPkcs12WithIntegrityMac(p, cert, []);
                         zipStream.PutNextEntry(new ZipEntry(cn + ".p12"));
                         zipStream.Write(pkcs);
 
-                        // PKCS #12 chained (leaf + all chain certificates in order)
+                        // PKCS #12 chained (leaf + all chain certificates in order, with empty-password integrity MAC)
                         if (chainValid)
                         {
-                            builder = new();
-                            builder.SetUseDerEncoding(true);
-                            store = builder.Build();
-                            List<X509CertificateEntry> certEntries = [new X509CertificateEntry(cert)];
-                            certEntries.AddRange(chainCerts.Select(c => new X509CertificateEntry(c)));
-                            store.SetKeyEntry(string.Empty, new AsymmetricKeyEntry(p), certEntries.ToArray());
-                            using (MemoryStream stream = new())
-                            {
-                                store.Save(stream, null, new SecureRandom());
-                                pkcs = stream.ToArray();
-                            }
+                            pkcs = BuildPasswordlessPkcs12WithIntegrityMac(p, cert, chainCerts);
                             zipStream.PutNextEntry(new ZipEntry(cn + "-chained.p12"));
                             zipStream.Write(pkcs);
                         }
@@ -336,6 +318,30 @@ public class PkcsBuilder
         }
 
         return new Tuple<string, byte[]>(cn + ".zip", output.ToArray());
+    }
+
+    private static byte[] BuildPasswordlessPkcs12WithIntegrityMac(
+        AsymmetricKeyParameter privateKey,
+        X509Certificate leafCert,
+        IEnumerable<X509Certificate> chainCerts)
+    {
+        Pkcs12StoreBuilder builder = new();
+        builder.SetUseDerEncoding(true);
+        builder.SetKeyAlgorithm(
+            Org.BouncyCastle.Asn1.Nist.NistObjectIdentifiers.IdAes256Cbc,
+            PkcsObjectIdentifiers.IdHmacWithSha256);
+        builder.SetCertAlgorithm(
+            Org.BouncyCastle.Asn1.Nist.NistObjectIdentifiers.IdAes256Cbc,
+            PkcsObjectIdentifiers.IdHmacWithSha256);
+
+        Pkcs12Store store = builder.Build();
+        List<X509CertificateEntry> certEntries = [new X509CertificateEntry(leafCert)];
+        certEntries.AddRange(chainCerts.Select(c => new X509CertificateEntry(c)));
+        store.SetKeyEntry(string.Empty, new AsymmetricKeyEntry(privateKey), certEntries.ToArray());
+
+        using MemoryStream stream = new();
+        store.Save(stream, [], new SecureRandom());
+        return stream.ToArray();
     }
 
     public static byte[] BuildPkcs7Der(IEnumerable<X509Certificate> certificates)
