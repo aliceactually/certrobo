@@ -137,6 +137,7 @@ public sealed class CertificateAuthorityService
     private bool _isExplicitlyLocked;
 
     public Action<CaAuthorityRecord>? CrlPublicationFaultInjector { get; set; }
+    public Action<string>? CaPersistenceFaultInjector { get; set; }
 
     public CertificateAuthorityService(
         IDbContextFactory<CertRoboDbContext> dbFactory,
@@ -404,21 +405,26 @@ public sealed class CertificateAuthorityService
                 || string.IsNullOrEmpty(effectivePassphrase)
                 || PassphrasesEqual(effectivePassphrase, configuredPassphrase!));
 
-        HashSet<int> authoritiesWithUnexpiredCerts = (await db.IssuedCertificates
+        List<IssuedCertificateRecord> maintainedCerts = await db.IssuedCertificates
             .Where(c => c.CaAuthorityId.HasValue
                      && (c.Status == IssuanceStatus.Issued || c.Status == IssuanceStatus.Revoked))
-            .ToListAsync(cancellationToken))
+            .ToListAsync(cancellationToken);
+
+        HashSet<int> authoritiesWithUnexpiredCerts = maintainedCerts
             .Where(c => c.NotAfterUtc > now)
             .Select(c => c.CaAuthorityId!.Value)
             .ToHashSet();
 
-        Dictionary<int, int> unexpiredCountsByAuthority = (await db.IssuedCertificates
-            .Where(c => c.CaAuthorityId.HasValue
-                     && (c.Status == IssuanceStatus.Issued || c.Status == IssuanceStatus.Revoked))
-            .ToListAsync(cancellationToken))
+        Dictionary<int, int> unexpiredCountsByAuthority = maintainedCerts
             .Where(c => c.NotAfterUtc > now)
             .GroupBy(c => c.CaAuthorityId!.Value)
             .ToDictionary(g => g.Key, g => g.Count());
+
+        Dictionary<int, List<CaAuthorityRecord>> directSubordinatesByParent = MapDirectLocalSubordinatesByParentId(authorities);
+        HashSet<int> authoritiesWithUnexpiredSubordinates = directSubordinatesByParent
+            .Where(kv => kv.Value.Any(sub => sub.NotAfterUtc > now))
+            .Select(kv => kv.Key)
+            .ToHashSet();
 
         List<CaAuthorityKeyCustodyStatus> authorityStatuses = [];
         bool allAuthoritiesHealthy = true;
@@ -427,8 +433,13 @@ public sealed class CertificateAuthorityService
         foreach (CaAuthorityRecord authority in authorities)
         {
             bool isExpired = authority.NotAfterUtc <= now;
-            int unexpiredCount = unexpiredCountsByAuthority.GetValueOrDefault(authority.Id, 0);
-            bool requiresMaintenance = authority.IsActive || (!isExpired && authoritiesWithUnexpiredCerts.Contains(authority.Id));
+            int unexpiredSubCount = directSubordinatesByParent.TryGetValue(authority.Id, out List<CaAuthorityRecord>? subs)
+                ? subs.Count(s => s.NotAfterUtc > now)
+                : 0;
+            int unexpiredCount = unexpiredCountsByAuthority.GetValueOrDefault(authority.Id, 0) + unexpiredSubCount;
+            bool requiresMaintenance = authority.IsActive
+                || (!isExpired && (authoritiesWithUnexpiredCerts.Contains(authority.Id)
+                                || authoritiesWithUnexpiredSubordinates.Contains(authority.Id)));
             bool fileExists = File.Exists(authority.EncryptedPrivateKeyPath);
 
             string? effectiveErr = null;
@@ -1568,6 +1579,10 @@ public sealed class CertificateAuthorityService
         try
         {
             await ThrowIfUnfinishedPendingEnrollmentExistsAsync(cancellationToken);
+            CaAuthorityRecord? effectiveParent = null;
+            long? allocatedParentSerial = null;
+            byte[]? allocatedParentSerialBytes = null;
+
             await using (CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken))
             {
                 await db.EnsureSchemaUpgradedAsync(cancellationToken);
@@ -1578,11 +1593,28 @@ public sealed class CertificateAuthorityService
                     requireExistingKeyForUnlock: false,
                     cancellationToken);
 
-                if (parentAuthority != null
-                    && !TryVerifyAuthorityKey(parentAuthority, passphrase, out string? parentErr))
+                if (parentAuthority != null)
                 {
-                    throw new InvalidOperationException(
-                        $"Parent CA '{parentAuthority.Name}' (ID #{parentAuthority.Id}) could not be unlocked with the supplied storage passphrase: {parentErr}");
+                    effectiveParent = await db.CaAuthorities
+                        .FirstOrDefaultAsync(c => c.Id == parentAuthority.Id, cancellationToken)
+                        ?? throw new InvalidOperationException(
+                            $"Parent CA '{parentAuthority.Name}' (ID #{parentAuthority.Id}) was not found.");
+
+                    if (!TryVerifyAuthorityKey(effectiveParent, passphrase, out string? parentErr))
+                    {
+                        throw new InvalidOperationException(
+                            $"Parent CA '{effectiveParent.Name}' (ID #{effectiveParent.Id}) could not be unlocked with the supplied storage passphrase: {parentErr}");
+                    }
+
+                    bool parentHasCrl = await db.PublishedCrls.AnyAsync(c => c.CaAuthorityId == effectiveParent.Id, cancellationToken);
+                    if (!parentHasCrl)
+                    {
+                        await GenerateAndPersistCrlInternalAsync(db, effectiveParent, parentPassphrase ?? passphrase, cancellationToken);
+                    }
+
+                    var (nextParentSerial, nextSerialBytes, _) = await AllocateNextIssuerSerialAsync(db, effectiveParent, cancellationToken);
+                    allocatedParentSerial = nextParentSerial;
+                    allocatedParentSerialBytes = nextSerialBytes;
                 }
             }
 
@@ -1593,7 +1625,7 @@ public sealed class CertificateAuthorityService
             CertificateRequest certReq = CreateCertificateRequestForKey(subjectDn, subjectKey);
 
             // CA BasicConstraints (critical)
-            bool isSubordinate = parentAuthority != null;
+            bool isSubordinate = effectiveParent != null;
             bool hasPathLen = pathLengthConstraint.HasValue || isSubordinate;
             int effectivePathLen = pathLengthConstraint ?? 0;
             certReq.CertificateExtensions.Add(
@@ -1620,7 +1652,7 @@ public sealed class CertificateAuthorityService
             X509Certificate2 issuedCaCert;
             string chainPem = string.Empty;
 
-            if (parentAuthority == null)
+            if (effectiveParent == null)
             {
                 certReq.CertificateExtensions.Add(
                     X509AuthorityKeyIdentifierExtension.CreateFromSubjectKeyIdentifier(skiExt));
@@ -1628,10 +1660,15 @@ public sealed class CertificateAuthorityService
             }
             else
             {
-                using X509Certificate2 parentCert = X509Certificate2.CreateFromPem(parentAuthority.IssuerCertificatePem);
+                using X509Certificate2 parentCert = X509Certificate2.CreateFromPem(effectiveParent.IssuerCertificatePem);
                 using AsymmetricAlgorithm parentKey = LoadEncryptedKey(
-                    parentAuthority.EncryptedPrivateKeyPath,
+                    effectiveParent.EncryptedPrivateKeyPath,
                     parentPassphrase ?? passphrase);
+
+                if (notBefore < parentCert.NotBefore.ToUniversalTime())
+                {
+                    notBefore = parentCert.NotBefore.ToUniversalTime();
+                }
 
                 if (notAfter > parentCert.NotAfter.ToUniversalTime())
                 {
@@ -1647,8 +1684,36 @@ public sealed class CertificateAuthorityService
                     certReq.CertificateExtensions.Add(
                         X509AuthorityKeyIdentifierExtension.CreateFromSubjectKeyIdentifier(parentSki));
                 }
+                else
+                {
+                    certReq.CertificateExtensions.Add(
+                        X509AuthorityKeyIdentifierExtension.CreateFromCertificate(
+                            parentCert,
+                            includeKeyIdentifier: true,
+                            includeIssuerAndSerial: false));
+                }
 
-                byte[] serialBytes = AllocatePositiveSerialBytes(parentAuthority.LastAllocatedSerial + 1);
+                var (parentCdpUrl, parentAiaUrl) = ResolveParentPublicationUrls(
+                    effectiveParent,
+                    crlDistributionPointUrl,
+                    authorityIssuerCertUrl);
+
+                if (!string.IsNullOrWhiteSpace(parentCdpUrl))
+                {
+                    certReq.CertificateExtensions.Add(
+                        CertificateRevocationListBuilder.BuildCrlDistributionPointExtension([parentCdpUrl]));
+                }
+
+                if (!string.IsNullOrWhiteSpace(parentAiaUrl))
+                {
+                    certReq.CertificateExtensions.Add(
+                        new X509AuthorityInformationAccessExtension(
+                            ocspUris: null,
+                            caIssuersUris: [parentAiaUrl],
+                            critical: false));
+                }
+
+                byte[] serialBytes = allocatedParentSerialBytes!;
                 X509SignatureGenerator sigGen = CreateSignatureGenerator(parentKey);
                 using X509Certificate2 signedCert = certReq.Create(
                     parentCert.SubjectName,
@@ -1658,9 +1723,9 @@ public sealed class CertificateAuthorityService
                     serialBytes);
 
                 issuedCaCert = CopyWithPrivateKey(signedCert, subjectKey);
-                chainPem = string.IsNullOrWhiteSpace(parentAuthority.ChainCertificatesPem)
-                    ? parentAuthority.IssuerCertificatePem.Trim() + "\n"
-                    : parentAuthority.IssuerCertificatePem.Trim() + "\n" + parentAuthority.ChainCertificatesPem.Trim() + "\n";
+                chainPem = string.IsNullOrWhiteSpace(effectiveParent.ChainCertificatesPem)
+                    ? effectiveParent.IssuerCertificatePem.Trim() + "\n"
+                    : effectiveParent.IssuerCertificatePem.Trim() + "\n" + effectiveParent.ChainCertificatesPem.Trim() + "\n";
             }
 
             using (issuedCaCert)
@@ -1679,6 +1744,19 @@ public sealed class CertificateAuthorityService
                 catch (ArgumentException ex)
                 {
                     throw new InvalidOperationException(ex.Message, ex);
+                }
+
+                if (effectiveParent != null && allocatedParentSerial.HasValue)
+                {
+                    await using CertRoboDbContext parentSerialDb = await _dbFactory.CreateDbContextAsync(cancellationToken);
+                    CaAuthorityRecord trackedParent = await parentSerialDb.CaAuthorities
+                        .FirstAsync(c => c.Id == effectiveParent.Id, cancellationToken);
+                    if (allocatedParentSerial.Value > trackedParent.LastAllocatedSerial)
+                    {
+                        trackedParent.LastAllocatedSerial = allocatedParentSerial.Value;
+                        await parentSerialDb.SaveChangesAsync(cancellationToken);
+                    }
+                    parentAuthority!.LastAllocatedSerial = Math.Max(parentAuthority.LastAllocatedSerial, allocatedParentSerial.Value);
                 }
 
                 string certPem = issuedCaCert.ExportCertificatePem() + "\n";
@@ -2135,16 +2213,9 @@ public sealed class CertificateAuthorityService
                     }
                 }
 
-                // Allocate positive serial monotonically above both CA's LastAllocatedSerial and any existing ledger record
-                long maxLedgerSerial = await db.IssuedCertificates
-                    .Where(c => c.CaAuthorityId == ca.Id)
-                    .Select(c => (long?)c.SerialNumberValue)
-                    .MaxAsync(cancellationToken) ?? 1000L;
-
-                long nextSerial = Math.Max(ca.LastAllocatedSerial, maxLedgerSerial) + 1;
+                // Allocate positive serial monotonically above CA's LastAllocatedSerial, ledger records, and any local subordinate CA serials
+                var (nextSerial, serialBytes, serialHex) = await AllocateNextIssuerSerialAsync(db, ca, cancellationToken);
                 ca.LastAllocatedSerial = nextSerial;
-                byte[] serialBytes = AllocatePositiveSerialBytes(nextSerial);
-                string serialHex = Convert.ToHexString(serialBytes);
 
                 // Reserve pending record before signing so crashes cannot produce untracked serial reuse
                 IssuedCertificateRecord ledgerEntry = new()
@@ -2379,7 +2450,8 @@ public sealed class CertificateAuthorityService
         int revocationReasonCode,
         string revokedByUserName,
         DateTimeOffset? revokedAtUtc = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int? targetCaAuthorityId = null)
     {
         if (!TryNormalizePositiveSerialHex(
                 serialNumberHex,
@@ -2400,9 +2472,11 @@ public sealed class CertificateAuthorityService
         {
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
             await db.EnsureSchemaUpgradedAsync(cancellationToken);
-            CaAuthorityRecord? ca = await db.CaAuthorities
-                .OrderByDescending(c => c.Id)
-                .FirstOrDefaultAsync(c => c.IsActive, cancellationToken);
+            CaAuthorityRecord? ca = targetCaAuthorityId.HasValue
+                ? await db.CaAuthorities.FirstOrDefaultAsync(c => c.Id == targetCaAuthorityId.Value, cancellationToken)
+                : await db.CaAuthorities
+                    .OrderByDescending(c => c.Id)
+                    .FirstOrDefaultAsync(c => c.IsActive, cancellationToken);
 
             if (ca == null)
             {
@@ -2411,7 +2485,9 @@ public sealed class CertificateAuthorityService
                     RevocationAccepted: false,
                     CrlPublished: false,
                     RevocationPublicationStatus.Rejected,
-                    "No active CA is configured.");
+                    targetCaAuthorityId.HasValue
+                        ? $"CA authority #{targetCaAuthorityId.Value} was not found."
+                        : "No active CA is configured.");
             }
 
             List<IssuedCertificateRecord> caCertificates = await db.IssuedCertificates
@@ -2733,6 +2809,11 @@ public sealed class CertificateAuthorityService
                 .Where(c => c.CaAuthorityId.HasValue && c.NotAfterUtc > now)
                 .Select(c => c.CaAuthorityId!.Value)
                 .ToHashSet();
+            Dictionary<int, List<CaAuthorityRecord>> directSubordinatesByParent = MapDirectLocalSubordinatesByParentId(authorities);
+            HashSet<int> authoritiesWithUnexpiredSubordinates = directSubordinatesByParent
+                .Where(kv => kv.Value.Any(sub => sub.NotAfterUtc > now))
+                .Select(kv => kv.Key)
+                .ToHashSet();
             Dictionary<int, List<IssuedCertificateRecord>> revokedByAuthority = maintainedCertificates
                 .Where(c => c.CaAuthorityId.HasValue && c.Status == IssuanceStatus.Revoked)
                 .GroupBy(c => c.CaAuthorityId!.Value)
@@ -2798,6 +2879,7 @@ public sealed class CertificateAuthorityService
 
                     bool shouldMaintain = authority.IsActive
                         || authoritiesWithUnexpiredCertificates.Contains(authority.Id)
+                        || authoritiesWithUnexpiredSubordinates.Contains(authority.Id)
                         || hasUnpublishedRevocations;
                     if (!shouldMaintain)
                     {
@@ -3395,6 +3477,7 @@ public sealed class CertificateAuthorityService
 
         try
         {
+            CaPersistenceFaultInjector?.Invoke(caName);
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
             await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
 
@@ -3717,6 +3800,314 @@ public sealed class CertificateAuthorityService
         }
 
         return configuredUrl;
+    }
+
+    private (string? CdpUrl, string? AiaUrl) ResolveParentPublicationUrls(
+        CaAuthorityRecord parentAuthority,
+        string? childConfiguredCdpUrl,
+        string? childConfiguredAiaUrl)
+    {
+        string cdpCandidate = RewriteActiveAliasToStableIssuerUrl(
+            parentAuthority.CrlDistributionPointUrl ?? string.Empty,
+            ["/ca.crl"],
+            $"/authorities/{parentAuthority.Id}/ca.crl");
+
+        string aiaCandidate = RewriteActiveAliasToStableIssuerUrl(
+            parentAuthority.AuthorityIssuerCertUrl ?? string.Empty,
+            ["/ca.crt", "/rootca.crt"],
+            $"/authorities/{parentAuthority.Id}/issuer.crt");
+
+        string? resolvedCdp = ResolveToHttpUriOrNull(
+            cdpCandidate,
+            $"/authorities/{parentAuthority.Id}/ca.crl",
+            childConfiguredCdpUrl,
+            ["/ca.crl"]);
+
+        string? resolvedAia = ResolveToHttpUriOrNull(
+            aiaCandidate,
+            $"/authorities/{parentAuthority.Id}/issuer.crt",
+            childConfiguredAiaUrl,
+            ["/ca.crt", "/rootca.crt"]);
+
+        return (resolvedCdp, resolvedAia);
+    }
+
+    private string? ResolveToHttpUriOrNull(
+        string candidateUrl,
+        string stableAuthorityPath,
+        string? fallbackChildAliasUrl,
+        IReadOnlyList<string> defaultAliasPaths)
+    {
+        if (string.IsNullOrWhiteSpace(candidateUrl))
+        {
+            return null;
+        }
+
+        if (Uri.TryCreate(candidateUrl, UriKind.Absolute, out Uri? absUri)
+            && (absUri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                || absUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+        {
+            return absUri.AbsoluteUri;
+        }
+
+        if (candidateUrl.StartsWith("/", StringComparison.Ordinal))
+        {
+            if (Uri.TryCreate(_options.PublicBaseUrl, UriKind.Absolute, out Uri? publicBase)
+                && (publicBase.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                    || publicBase.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+            {
+                return new Uri(publicBase, candidateUrl).AbsoluteUri;
+            }
+
+            if (!string.IsNullOrWhiteSpace(fallbackChildAliasUrl)
+                && Uri.TryCreate(fallbackChildAliasUrl, UriKind.Absolute, out Uri? childUri)
+                && (childUri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                    || childUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+                && defaultAliasPaths.Any(alias => childUri.AbsolutePath.Equals(alias, StringComparison.OrdinalIgnoreCase)))
+            {
+                UriBuilder builder = new(childUri)
+                {
+                    Path = stableAuthorityPath,
+                    Query = string.Empty,
+                    Fragment = string.Empty
+                };
+                return builder.Uri.AbsoluteUri;
+            }
+        }
+
+        return null;
+    }
+
+    private async Task<(long SerialValue, byte[] SerialBytes, string SerialHex)> AllocateNextIssuerSerialAsync(
+        CertRoboDbContext db,
+        CaAuthorityRecord trackedIssuer,
+        CancellationToken cancellationToken)
+    {
+        List<IssuedCertificateRecord> existingLedger = await db.IssuedCertificates
+            .AsNoTracking()
+            .Where(c => c.CaAuthorityId == trackedIssuer.Id)
+            .ToListAsync(cancellationToken);
+
+        List<SerialRevocationEventRecord> existingEvents = await db.SerialRevocationEvents
+            .AsNoTracking()
+            .Where(e => e.CaAuthorityId == trackedIssuer.Id)
+            .ToListAsync(cancellationToken);
+
+        List<CaAuthorityRecord> allAuthorities = await db.CaAuthorities
+            .AsNoTracking()
+            .OrderBy(c => c.Id)
+            .ToListAsync(cancellationToken);
+
+        Dictionary<int, List<CaAuthorityRecord>> directSubordinatesByParent = MapDirectLocalSubordinatesByParentId(allAuthorities);
+        IReadOnlyList<CaAuthorityRecord> directSubordinates = directSubordinatesByParent.TryGetValue(
+            trackedIssuer.Id,
+            out List<CaAuthorityRecord>? subs)
+            ? subs
+            : [];
+
+        long maxCounterFloor = Math.Max(1000L, trackedIssuer.LastAllocatedSerial);
+        HashSet<BigInteger> usedSerialValues = [];
+        HashSet<string> usedCanonicalHexes = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (IssuedCertificateRecord rec in existingLedger)
+        {
+            if (rec.SerialNumberValue > maxCounterFloor)
+            {
+                maxCounterFloor = rec.SerialNumberValue;
+            }
+
+            if (TryNormalizePositiveSerialHex(rec.SerialNumberHex, out BigInteger bi, out string canonHex, out _))
+            {
+                usedSerialValues.Add(bi);
+                usedCanonicalHexes.Add(canonHex);
+                if (TryExtractAllocatedCounterFloor(canonHex, bi, out long counterFloor) && counterFloor > maxCounterFloor)
+                {
+                    maxCounterFloor = counterFloor;
+                }
+            }
+        }
+
+        foreach (SerialRevocationEventRecord evt in existingEvents)
+        {
+            if (TryNormalizePositiveSerialHex(evt.CanonicalSerialHex, out BigInteger bi, out string canonHex, out _))
+            {
+                usedSerialValues.Add(bi);
+                usedCanonicalHexes.Add(canonHex);
+                if (TryExtractAllocatedCounterFloor(canonHex, bi, out long counterFloor) && counterFloor > maxCounterFloor)
+                {
+                    maxCounterFloor = counterFloor;
+                }
+            }
+        }
+
+        foreach (CaAuthorityRecord sub in directSubordinates)
+        {
+            try
+            {
+                using X509Certificate2 subCert = X509Certificate2.CreateFromPem(sub.IssuerCertificatePem);
+                string subSerialHex = Convert.ToHexString(subCert.GetSerialNumber().Reverse().ToArray());
+                if (TryNormalizePositiveSerialHex(subSerialHex, out BigInteger bi, out string canonHex, out _))
+                {
+                    usedSerialValues.Add(bi);
+                    usedCanonicalHexes.Add(canonHex);
+                    if (TryExtractAllocatedCounterFloor(canonHex, bi, out long counterFloor) && counterFloor > maxCounterFloor)
+                    {
+                        maxCounterFloor = counterFloor;
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        long nextSerial = checked(maxCounterFloor + 1);
+        while (true)
+        {
+            byte[] serialBytes = AllocatePositiveSerialBytes(nextSerial);
+            string serialHex = Convert.ToHexString(serialBytes);
+            if (TryNormalizePositiveSerialHex(serialHex, out BigInteger candidateBi, out string canonicalHex, out _)
+                && !usedSerialValues.Contains(candidateBi)
+                && !usedCanonicalHexes.Contains(canonicalHex))
+            {
+                return (nextSerial, serialBytes, serialHex);
+            }
+
+            nextSerial = checked(nextSerial + 1);
+        }
+    }
+
+    private static bool TryExtractAllocatedCounterFloor(string canonicalHex, BigInteger serialBigInt, out long counterFloor)
+    {
+        counterFloor = 0;
+
+        if (serialBigInt.CompareTo(BigInteger.One) >= 0
+            && serialBigInt.CompareTo(BigInteger.ValueOf(1_000_000_000L)) <= 0)
+        {
+            counterFloor = serialBigInt.LongValue;
+            return true;
+        }
+
+        try
+        {
+            byte[] bytes = Convert.FromHexString(canonicalHex);
+            if (bytes.Length == 12)
+            {
+                byte[] counterBytes = new byte[8];
+                Buffer.BlockCopy(bytes, 0, counterBytes, 0, 8);
+                if (counterBytes[0] == 0x01 && counterBytes[1] == 0x00)
+                {
+                    counterBytes[0] = 0x00;
+                }
+                if (BitConverter.IsLittleEndian)
+                {
+                    Array.Reverse(counterBytes);
+                }
+                long extracted = BitConverter.ToInt64(counterBytes, 0);
+                if (extracted > 0 && extracted <= 1_000_000_000_000L)
+                {
+                    counterFloor = extracted;
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return false;
+    }
+
+    private static Dictionary<int, List<CaAuthorityRecord>> MapDirectLocalSubordinatesByParentId(
+        IReadOnlyList<CaAuthorityRecord> authorities)
+    {
+        Dictionary<int, List<CaAuthorityRecord>> result = [];
+        if (authorities.Count <= 1)
+        {
+            return result;
+        }
+
+        Dictionary<int, X509Certificate2> parsedByAuthorityId = [];
+        try
+        {
+            foreach (CaAuthorityRecord auth in authorities)
+            {
+                try
+                {
+                    parsedByAuthorityId[auth.Id] = X509Certificate2.CreateFromPem(auth.IssuerCertificatePem);
+                }
+                catch
+                {
+                }
+            }
+
+            foreach (CaAuthorityRecord child in authorities.Where(a => a.IsIntermediate))
+            {
+                if (!parsedByAuthorityId.TryGetValue(child.Id, out X509Certificate2? childCert))
+                {
+                    continue;
+                }
+
+                CaAuthorityRecord? matchedParent = null;
+                foreach (CaAuthorityRecord candidateParent in authorities.OrderByDescending(a => a.Id))
+                {
+                    if (candidateParent.Id == child.Id
+                        || !parsedByAuthorityId.TryGetValue(candidateParent.Id, out X509Certificate2? parentCert))
+                    {
+                        continue;
+                    }
+
+                    if (childCert.RawDataMemory.Span.SequenceEqual(parentCert.RawDataMemory.Span))
+                    {
+                        continue;
+                    }
+
+                    if (!childCert.IssuerName.RawData.SequenceEqual(parentCert.SubjectName.RawData))
+                    {
+                        continue;
+                    }
+
+                    X509AuthorityKeyIdentifierExtension? childAki = childCert.Extensions
+                        .OfType<X509AuthorityKeyIdentifierExtension>()
+                        .FirstOrDefault();
+                    X509SubjectKeyIdentifierExtension? parentSki = parentCert.Extensions
+                        .OfType<X509SubjectKeyIdentifierExtension>()
+                        .FirstOrDefault();
+
+                    if (childAki?.KeyIdentifier is { Length: > 0 } akiBytes
+                        && parentSki?.SubjectKeyIdentifierBytes is { Length: > 0 } skiBytes
+                        && !akiBytes.Span.SequenceEqual(skiBytes.Span))
+                    {
+                        continue;
+                    }
+
+                    if (CaChainAndConstraintValidator.VerifySignatureCryptographically(childCert, parentCert, out _))
+                    {
+                        matchedParent = candidateParent;
+                        break;
+                    }
+                }
+
+                if (matchedParent != null)
+                {
+                    if (!result.TryGetValue(matchedParent.Id, out List<CaAuthorityRecord>? list))
+                    {
+                        list = [];
+                        result[matchedParent.Id] = list;
+                    }
+                    list.Add(child);
+                }
+            }
+
+            return result;
+        }
+        finally
+        {
+            foreach (X509Certificate2 cert in parsedByAuthorityId.Values)
+            {
+                cert.Dispose();
+            }
+        }
     }
 
     private static async Task WritePublicTrustFilesAsync(CaAuthorityRecord ca, CancellationToken cancellationToken)
@@ -4200,10 +4591,17 @@ public sealed class CertificateAuthorityService
             .Select(c => c.CaAuthorityId!.Value)
             .ToHashSet();
 
+        Dictionary<int, List<CaAuthorityRecord>> directSubordinatesByParent = MapDirectLocalSubordinatesByParentId(authorities);
+        HashSet<int> authoritiesWithUnexpiredSubordinates = directSubordinatesByParent
+            .Where(kv => kv.Value.Any(sub => sub.NotAfterUtc > now))
+            .Select(kv => kv.Key)
+            .ToHashSet();
+
         foreach (CaAuthorityRecord authority in authorities)
         {
             bool requiresMaintenance = authority.IsActive
-                || (authority.NotAfterUtc > now && authoritiesWithUnexpiredCerts.Contains(authority.Id));
+                || (authority.NotAfterUtc > now && (authoritiesWithUnexpiredCerts.Contains(authority.Id)
+                                                 || authoritiesWithUnexpiredSubordinates.Contains(authority.Id)));
             bool shouldVerify = requiresMaintenance
                 || authority.NotAfterUtc > now
                 || File.Exists(authority.EncryptedPrivateKeyPath);
