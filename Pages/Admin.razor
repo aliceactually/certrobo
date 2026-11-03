@@ -1255,6 +1255,52 @@
                     </div>
                 </div>
 
+                @if (PendingRevokeTarget != null)
+                {
+                    var revTarget = PendingRevokeTarget;
+                    <div class="operation-panel mb-4 border-danger" role="dialog" aria-labelledby="confirm-revoke-heading">
+                        <h4 id="confirm-revoke-heading" class="h5 text-danger mb-2">Confirm Certificate Revocation</h4>
+                        <p class="small mb-2">
+                            You are about to revoke the following certificate and publish an updated X.509 v2 CRL:
+                        </p>
+                        <ul class="small mb-3">
+                            <li><strong>Common Name:</strong> @revTarget.CommonName</li>
+                            <li><strong>Serial Number:</strong> <code>@revTarget.SerialNumberHex</code></li>
+                            @if (!string.IsNullOrWhiteSpace(revTarget.SubjectAlternativeNamesCsv))
+                            {
+                                <li><strong>SANs:</strong> @revTarget.SubjectAlternativeNamesCsv</li>
+                            }
+                            <li><strong>Requested By:</strong> @revTarget.RequestedByUserName &middot; <strong>Valid Until (UTC):</strong> @revTarget.NotAfterUtc.ToString("yyyy-MM-dd")</li>
+                        </ul>
+                        <div class="row g-3 align-items-end">
+                            <div class="col-md-6">
+                                <label class="form-label" for="revoke-reason-select">Revocation Reason (RFC 5280 CRLReason)</label>
+                                <select id="revoke-reason-select" class="form-select" @bind="pendingRevokeReasonCode">
+                                    <option value="0">0 — Unspecified</option>
+                                    <option value="1">1 — KeyCompromise</option>
+                                    <option value="2">2 — CACompromise</option>
+                                    <option value="3">3 — AffiliationChanged</option>
+                                    <option value="4">4 — Superseded</option>
+                                    <option value="5">5 — CessationOfOperation</option>
+                                    <option value="6">6 — CertificateHold</option>
+                                    <option value="9">9 — PrivilegeWithdrawn</option>
+                                    <option value="10">10 — AACompromise</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6 d-flex flex-wrap justify-content-end gap-2">
+                                <button type="button"
+                                        class="btn btn-outline-secondary"
+                                        @onclick="CancelRevokeCertClick">
+                                    Cancel
+                                </button>
+                                <RadzenButton Text="Confirm Revocation"
+                                              ButtonStyle="ButtonStyle.Danger"
+                                              Click="@ConfirmRevokeCertClick" />
+                            </div>
+                        </div>
+                    </div>
+                }
+
                 <div class="table-responsive">
                     <table class="table table-hover align-middle mb-0">
                         <thead>
@@ -1331,14 +1377,20 @@
                                                 @if (c.Status == IssuanceStatus.Issued)
                                                 {
                                                     <button type="button"
-                                                            class="btn btn-sm btn-danger"
+                                                            class="btn btn-sm @(pendingRevokeCertId == c.Id ? "btn-secondary" : "btn-danger")"
                                                             @onclick="() => RevokeCertClick(c.Id)">
-                                                        Revoke
+                                                        @(pendingRevokeCertId == c.Id ? "Cancel Revoke" : "Revoke...")
                                                     </button>
                                                 }
                                                 else if (c.Status == IssuanceStatus.Revoked && c.RevokedAtUtc.HasValue)
                                                 {
-                                                    <span class="small text-muted-theme align-self-center">Revoked @c.RevokedAtUtc.Value.ToString("yyyy-MM-dd")</span>
+                                                    <span class="small text-muted-theme align-self-center">
+                                                        Revoked @c.RevokedAtUtc.Value.ToString("yyyy-MM-dd")
+                                                        @if (c.RevocationReasonCode.HasValue)
+                                                        {
+                                                            <span>(@CertificateAuthorityService.FormatRevocationReasonLabel(c.RevocationReasonCode.Value))</span>
+                                                        }
+                                                    </span>
                                                 }
                                             </div>
                                         </td>
@@ -1668,9 +1720,16 @@
     private string newUserRole = AppRoles.Issuer;
     private string newUserDomains = "*.contoso.com";
 
-    // Certificates search/filter state
+    // Certificates search/filter & revocation confirmation state
     private string certSearchQuery = "";
     private string certStatusFilterString = "";
+    private int? pendingRevokeCertId;
+    private int pendingRevokeReasonCode = 0;
+
+    private IssuedCertificateRecord? PendingRevokeTarget =>
+        pendingRevokeCertId.HasValue
+            ? certificates.FirstOrDefault(c => c.Id == pendingRevokeCertId.Value && c.Status == IssuanceStatus.Issued)
+            : null;
 
     // Settings & Maintenance state
     private bool includeRootCaPkcs12InBackup = false;
@@ -2214,11 +2273,49 @@
         Notify(Radzen.NotificationSeverity.Info, "Permission Removed", "Domain permission rule removed.");
     }
 
-    private async Task RevokeCertClick(int certId)
+    private Task RevokeCertClick(int certId)
     {
+        if (pendingRevokeCertId == certId)
+        {
+            pendingRevokeCertId = null;
+            pendingRevokeReasonCode = 0;
+        }
+        else
+        {
+            pendingRevokeCertId = certId;
+            pendingRevokeReasonCode = 0;
+        }
+        return Task.CompletedTask;
+    }
+
+    private Task CancelRevokeCertClick()
+    {
+        pendingRevokeCertId = null;
+        pendingRevokeReasonCode = 0;
+        return Task.CompletedTask;
+    }
+
+    private async Task ConfirmRevokeCertClick()
+    {
+        if (!pendingRevokeCertId.HasValue)
+        {
+            return;
+        }
+
         AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        if (authState.User.Identity?.IsAuthenticated != true || !authState.User.IsInRole(AppRoles.Administrator))
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", "Only an authenticated Administrator may revoke certificates.");
+            return;
+        }
+
+        int targetId = pendingRevokeCertId.Value;
+        int reasonCode = pendingRevokeReasonCode;
         string actor = authState.User.Identity?.Name ?? "admin";
-        RevocationOutcome outcome = await CaService.RevokeCertificateAsync(certId, 0, actor);
+
+        RevocationOutcome outcome = await CaService.RevokeCertificateAsync(targetId, reasonCode, actor);
+        pendingRevokeCertId = null;
+        pendingRevokeReasonCode = 0;
         await ReloadAllAsync();
         if (!outcome.RevocationAccepted)
         {
@@ -2233,7 +2330,7 @@
                 outcome.ErrorMessage ?? "Certificate revocation was saved, but the updated CRL has not been published yet.");
             return;
         }
-        Notify(Radzen.NotificationSeverity.Success, "Certificate Revoked", $"Certificate revoked and CRL #{outcome.PublishedCrl?.CrlNumber} published.");
+        Notify(Radzen.NotificationSeverity.Success, "Certificate Revoked", $"Certificate revoked ({CertificateAuthorityService.FormatRevocationReasonLabel(reasonCode)}) and CRL #{outcome.PublishedCrl?.CrlNumber} published.");
     }
 
     private async Task ExportIssuedCertificateBundleClick(IssuedCertificateRecord record)

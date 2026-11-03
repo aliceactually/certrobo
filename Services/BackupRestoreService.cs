@@ -482,6 +482,15 @@ public sealed class BackupRestoreService(
             {
                 if (entry.FullName == "database/certrobo.db")
                 {
+                    foreach (string staleSuffix in new[] { "-wal", "-shm", "-journal" })
+                    {
+                        string staleCompanion = targetSqliteFilePath + staleSuffix;
+                        if (File.Exists(staleCompanion))
+                        {
+                            File.Delete(staleCompanion);
+                        }
+                    }
+
                     entry.ExtractToFile(targetSqliteFilePath, overwrite: true);
                     RestrictFilePermissionsIfUnix(targetSqliteFilePath);
                 }
@@ -521,6 +530,7 @@ public sealed class BackupRestoreService(
 
         RewriteTableKeyPaths(connection, "CaAuthorities");
         RewriteTableKeyPaths(connection, "PendingCaEnrollments");
+        CertRoboDbContext.RestrictSqliteDatabaseFilePermissionsIfUnix(sqliteFilePath);
 
         void RewriteTableKeyPaths(SqliteConnection db, string tableName)
         {

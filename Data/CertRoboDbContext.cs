@@ -434,9 +434,41 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
             .HasIndex(p => p.Status);
     }
 
+    public static void RestrictSqliteDatabaseFilePermissionsIfUnix(string? sqliteFilePath)
+    {
+        if (OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(sqliteFilePath))
+        {
+            return;
+        }
+
+        string[] suffixes = ["", "-wal", "-shm", "-journal"];
+        foreach (string suffix in suffixes)
+        {
+            string candidate = sqliteFilePath + suffix;
+            try
+            {
+                if (File.Exists(candidate))
+                {
+                    File.SetUnixFileMode(candidate, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+
     public async Task EnsureSchemaUpgradedAsync(CancellationToken cancellationToken = default)
     {
         await Database.EnsureCreatedAsync(cancellationToken);
+        try
+        {
+            string? dataSource = Database.GetDbConnection().DataSource;
+            RestrictSqliteDatabaseFilePermissionsIfUnix(dataSource);
+        }
+        catch
+        {
+        }
 
         const string createPendingTableSql = """
             CREATE TABLE IF NOT EXISTS "PendingCaEnrollments" (
@@ -524,5 +556,14 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
                 WHERE "Status" NOT IN (5, 6);
             """,
             cancellationToken);
+
+        try
+        {
+            string? dataSource = Database.GetDbConnection().DataSource;
+            RestrictSqliteDatabaseFilePermissionsIfUnix(dataSource);
+        }
+        catch
+        {
+        }
     }
 }

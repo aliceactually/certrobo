@@ -39,7 +39,9 @@ public sealed record IssuanceOutcome(
     string? ErrorMessage,
     IssuedCertificateRecord? Record,
     string? CertificatePem,
-    string? FullChainPem);
+    string? FullChainPem,
+    string? TlsServerChainPem = null,
+    string? RootTrustAnchorPem = null);
 
 public sealed record CrlRefreshOutcome(
     int CaAuthorityId,
@@ -2300,7 +2302,9 @@ public sealed class CertificateAuthorityService
                     await db.SaveChangesAsync(cancellationToken);
 
                     string fullBundlePem = leafPem + issuerChainPem;
-                    return new(true, null, ledgerEntry, leafPem, fullBundlePem);
+                    string tlsServerChainPem = BuildTlsServerChainPem(leafPem, issuerChainPem);
+                    string rootAnchorPem = ExtractTrustAnchorRootPem(issuerChainPem);
+                    return new(true, null, ledgerEntry, leafPem, fullBundlePem, tlsServerChainPem, rootAnchorPem);
                 }
                 catch (Exception ex)
                 {
@@ -2324,12 +2328,40 @@ public sealed class CertificateAuthorityService
         }
     }
 
+    public static bool IsSupportedRevocationReasonCode(int reasonCode) =>
+        reasonCode is 0 or 1 or 2 or 3 or 4 or 5 or 6 or 8 or 9 or 10;
+
+    public static string FormatRevocationReasonLabel(int reasonCode) => reasonCode switch
+    {
+        0 => "0 — Unspecified",
+        1 => "1 — KeyCompromise",
+        2 => "2 — CACompromise",
+        3 => "3 — AffiliationChanged",
+        4 => "4 — Superseded",
+        5 => "5 — CessationOfOperation",
+        6 => "6 — CertificateHold",
+        8 => "8 — RemoveFromCrl",
+        9 => "9 — PrivilegeWithdrawn",
+        10 => "10 — AACompromise",
+        _ => $"{reasonCode} — Unknown"
+    };
+
     public async Task<RevocationOutcome> RevokeCertificateAsync(
         int certificateId,
         int revocationReasonCode,
         string revokedByUserName,
         CancellationToken cancellationToken = default)
     {
+        if (!IsSupportedRevocationReasonCode(revocationReasonCode))
+        {
+            return new(
+                Succeeded: false,
+                RevocationAccepted: false,
+                CrlPublished: false,
+                RevocationPublicationStatus.Rejected,
+                $"Unsupported X.509 CRL revocation reason code '{revocationReasonCode}'.");
+        }
+
         IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
@@ -2453,6 +2485,16 @@ public sealed class CertificateAuthorityService
         CancellationToken cancellationToken = default,
         int? targetCaAuthorityId = null)
     {
+        if (!IsSupportedRevocationReasonCode(revocationReasonCode))
+        {
+            return new(
+                Succeeded: false,
+                RevocationAccepted: false,
+                CrlPublished: false,
+                RevocationPublicationStatus.Rejected,
+                $"Unsupported X.509 CRL revocation reason code '{revocationReasonCode}'.");
+        }
+
         if (!TryNormalizePositiveSerialHex(
                 serialNumberHex,
                 out BigInteger serialBigInt,
@@ -3752,6 +3794,94 @@ public sealed class CertificateAuthorityService
             sb.AppendLine(ca.ChainCertificatesPem.Trim());
         }
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Builds a TLS server certificate chain PEM containing the leaf certificate plus any intermediate CA
+    /// certificates in order, excluding the self-signed trust anchor root CA.
+    /// </summary>
+    public static string BuildTlsServerChainPem(string leafCertificatePem, string issuerChainPem)
+    {
+        if (string.IsNullOrWhiteSpace(leafCertificatePem))
+        {
+            return string.Empty;
+        }
+
+        StringBuilder sb = new();
+        sb.AppendLine(leafCertificatePem.Trim());
+
+        if (string.IsNullOrWhiteSpace(issuerChainPem))
+        {
+            return sb.ToString();
+        }
+
+        List<X509Certificate2> parsedChain = CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
+            null,
+            issuerChainPem,
+            "issuer certificate chain");
+        try
+        {
+            string leafThumbprint;
+            using (X509Certificate2 leafCert = X509Certificate2.CreateFromPem(leafCertificatePem))
+            {
+                leafThumbprint = leafCert.GetCertHashString(HashAlgorithmName.SHA256);
+            }
+
+            foreach (X509Certificate2 cert in parsedChain)
+            {
+                if (cert.GetCertHashString(HashAlgorithmName.SHA256).Equals(leafThumbprint, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (CaChainAndConstraintValidator.IsSelfSignedCryptographically(cert))
+                {
+                    continue;
+                }
+
+                sb.AppendLine(cert.ExportCertificatePem().Trim());
+            }
+
+            return sb.ToString();
+        }
+        finally
+        {
+            foreach (X509Certificate2 cert in parsedChain)
+            {
+                cert.Dispose();
+            }
+        }
+    }
+
+    public static string ExtractTrustAnchorRootPem(string issuerChainPem)
+    {
+        if (string.IsNullOrWhiteSpace(issuerChainPem))
+        {
+            return string.Empty;
+        }
+
+        List<X509Certificate2> parsedChain = CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
+            null,
+            issuerChainPem,
+            "issuer certificate chain");
+        try
+        {
+            if (parsedChain.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            X509Certificate2 root = parsedChain.LastOrDefault(CaChainAndConstraintValidator.IsSelfSignedCryptographically)
+                ?? parsedChain[^1];
+            return root.ExportCertificatePem().Trim() + "\n";
+        }
+        finally
+        {
+            foreach (X509Certificate2 cert in parsedChain)
+            {
+                cert.Dispose();
+            }
+        }
     }
 
     private void ApplyStableIssuerPublicationUrls(CaAuthorityRecord authority)
