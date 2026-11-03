@@ -6,15 +6,18 @@ It manages local users, roles, and domain issuance policies internally, protects
 
 ## System requirements
 
-* Linux (RHEL / Rocky Linux 10, Debian/Ubuntu, x86_64 or aarch64), macOS, or Windows Server
-* ASP.NET Core 10.0 Runtime (`aspnetcore-runtime-10.0`) and `libicu`
+* Linux (Rocky Linux 10 / RHEL 10 or Ubuntu 26.04 LTS, `x86_64` or `aarch64`), macOS, or Windows Server
+  *(Note: Linux deployment procedures below were live-verified on Rocky Linux 10.2 and Ubuntu 26.04.1 LTS on both `x86_64` and `aarch64`; standalone Debian was not separately validated.)*
+* ASP.NET Core 10.0 Runtime (`aspnetcore-runtime-10.0`) and ICU globalization libraries (`libicu` on Rocky/RHEL; installed automatically as a runtime dependency on Ubuntu 26.04)
 * Reverse proxy such as `nginx` (recommended for Linux production deployments)
 
 ---
 
-## Linux Production Deployment Guide (Rocky Linux 10 / RHEL 10)
+## Linux Production Deployment Guide (Rocky Linux 10 & Ubuntu 26.04 LTS)
 
 ### 1. Install Runtime and Reverse Proxy Dependencies
+
+**Rocky Linux 10 / RHEL 10 (`x86_64` or `aarch64`):**
 
 ```bash
 sudo dnf install -y aspnetcore-runtime-10.0 libicu nginx unzip openssl policycoreutils-python-utils
@@ -22,13 +25,31 @@ sudo dnf install -y aspnetcore-runtime-10.0 libicu nginx unzip openssl policycor
 
 > **Note:** On minimal Enterprise Linux installations, `libicu` is not installed by default and is required by .NET for internationalization and IDN/RegionInfo validation.
 
-### 2. Publish and Stage the Application
-
-On your build machine, publish for your target architecture (`linux-x64` or `linux-arm64`) and package without extended attributes:
+**Ubuntu 26.04 LTS (`x86_64` or `aarch64`):**
 
 ```bash
-dotnet publish CertRobo.csproj -c Release -r linux-arm64 --self-contained false -o ./publish
-COPYFILE_DISABLE=1 tar --no-xattrs -czf certrobo-linux.tar.gz -C ./publish .
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y aspnetcore-runtime-10.0 nginx unzip openssl ca-certificates
+```
+
+> **Note:** On Ubuntu 26.04 LTS, the versioned ICU library package is pulled in automatically as a dependency of `dotnet-runtime-10.0` (there is no unversioned `libicu` apt package).
+
+### 2. Publish, Transfer, and Stage the Application
+
+On your build machine, publish into a clean architecture-specific output directory (`linux-x64` for `x86_64` hosts or `linux-arm64` for `aarch64` hosts), package without macOS/extended attributes, and copy the archive to `/tmp/certrobo-linux.tar.gz` on the target host:
+
+```bash
+# For x86_64 target hosts (uname -m -> x86_64):
+rm -rf ./publish-linux-x64
+dotnet publish CertRobo.csproj -c Release -r linux-x64 --self-contained false -o ./publish-linux-x64
+COPYFILE_DISABLE=1 tar --no-xattrs -czf certrobo-linux-x64.tar.gz -C ./publish-linux-x64 .
+scp certrobo-linux-x64.tar.gz <user>@<target-host>:/tmp/certrobo-linux.tar.gz
+
+# For ARM64 target hosts (uname -m -> aarch64):
+rm -rf ./publish-linux-arm64
+dotnet publish CertRobo.csproj -c Release -r linux-arm64 --self-contained false -o ./publish-linux-arm64
+COPYFILE_DISABLE=1 tar --no-xattrs -czf certrobo-linux-arm64.tar.gz -C ./publish-linux-arm64 .
+scp certrobo-linux-arm64.tar.gz <user>@<target-host>:/tmp/certrobo-linux.tar.gz
 ```
 
 On the target Linux host, create a dedicated unprivileged `certrobo` service user and locked-down directories for binaries (`/opt/certrobo`), persistent state (`/var/lib/certrobo`), and configuration (`/etc/certrobo`):
@@ -57,9 +78,10 @@ sudo chown certrobo:certrobo /etc/certrobo/ca.pass
 sudo chmod 0600 /etc/certrobo/ca.pass
 ```
 
-Create `/etc/certrobo/certrobo.env` (`0640`, `root:certrobo`):
+Create `/etc/certrobo/certrobo.env` and set ownership to `root:certrobo` with mode `0640`:
 
-```ini
+```bash
+sudo tee /etc/certrobo/certrobo.env >/dev/null <<'EOF'
 ASPNETCORE_ENVIRONMENT=Production
 ASPNETCORE_URLS=http://127.0.0.1:5000
 CertRobo__DataDirectory=/var/lib/certrobo
@@ -67,6 +89,9 @@ CertRobo__CaStorageDirectory=/var/lib/certrobo/ca
 CertRobo__CaPassphraseFile=/etc/certrobo/ca.pass
 CertRobo__PublicBaseUrl=http://pki.contoso.com
 CertRobo__CrlValidityHours=168
+EOF
+sudo chown root:certrobo /etc/certrobo/certrobo.env
+sudo chmod 0640 /etc/certrobo/certrobo.env
 ```
 
 > **Custody Model:** CertRobo enforces a single shared at-rest CA storage passphrase across the active issuer, any maintained historical issuers (whose CRLs must continue to be refreshed until expiry), and any pending external-CA request.
@@ -74,9 +99,10 @@ CertRobo__CrlValidityHours=168
 > * When no persistent passphrase is configured (manual-unlock mode), the CA starts **Locked** after every service restart until an administrator unlocks it in `/admin`.
 > * When importing an existing CA from an encrypted PEM key or PKCS#12 (`.pfx`/`.p12`) bundle, the bundle's import decryption password may differ from CertRobo's at-rest CA storage passphrase.
 
-### 4. Configure SELinux (`Enforcing`) and `systemd` Service
+### 4. Configure Platform MAC (SELinux / AppArmor) and `systemd` Service
 
-When SELinux is `Enforcing`, label `/opt/certrobo/CertRobo` as `bin_t` so `systemd` can execute it, and enable `httpd_can_network_connect` so Nginx can proxy to Kestrel on `127.0.0.1:5000`:
+**Rocky Linux 10 / RHEL 10 only (SELinux `Enforcing`):**
+Label `/opt/certrobo/CertRobo` as `bin_t` so `systemd` can execute it, and enable `httpd_can_network_connect` so Nginx can proxy to Kestrel on `127.0.0.1:5000`:
 
 ```bash
 sudo semanage fcontext -a -t bin_t '/opt/certrobo/CertRobo'
@@ -84,7 +110,9 @@ sudo restorecon -Rv /opt/certrobo /var/lib/certrobo /etc/certrobo
 sudo setsebool -P httpd_can_network_connect 1
 ```
 
-Create `/etc/systemd/system/certrobo.service`:
+*(On Ubuntu 26.04 LTS, AppArmor is used instead of SELinux; skip the `semanage`, `restorecon`, and `setsebool` commands above.)*
+
+Create `/etc/systemd/system/certrobo.service` (valid on both Rocky Linux 10 and Ubuntu 26.04 LTS; `UMask=0077` ensures any newly created SQLite database, WAL/SHM, and key files are created with private `0600` permissions):
 
 ```ini
 [Unit]
@@ -98,6 +126,7 @@ User=certrobo
 Group=certrobo
 WorkingDirectory=/opt/certrobo
 EnvironmentFile=/etc/certrobo/certrobo.env
+UMask=0077
 ExecStart=/opt/certrobo/CertRobo
 Restart=on-failure
 RestartSec=5
@@ -204,6 +233,8 @@ Manual completion remains available whenever CES is disabled, unavailable, denie
 
 Per RFC 5280, relying parties fetching AIA (`/issuer.crt` or `/authorities/{id}/issuer.crt`) and CDP (`/ca.crl` or `/authorities/{id}/ca.crl`) must be able to reach those endpoints over plain HTTP (`:80`) without being redirected to HTTPS, while all interactive portal traffic (`/`, `/login`, `/admin`, `/_blazor`) is served over HTTPS (`:443`) with WebSocket upgrade support.
 
+Issue the Nginx TLS server certificate and TLS server chain (`--issue-csr <user> <csrPath> <outCertPath> [<outTlsServerChainPath>]` writes the leaf plus intermediate CA(s) without the self-signed Root CA to `<outTlsServerChainPath>`; pass `--root-out <path>` or `--fullchain-out <path>` if you also want the Root CA or complete chain written out, or use `--export-issued <serialHex> <outCertPath> [<outTlsServerChainPath>]` to recover outputs for an already-issued certificate):
+
 ```bash
 sudo mkdir -p /etc/pki/nginx/private
 sudo chmod 0700 /etc/pki/nginx/private
@@ -216,19 +247,40 @@ sudo openssl req -new -key /etc/pki/nginx/private/server.key \
   -out /tmp/host-tls.csr
 sudo chmod 0644 /tmp/host-tls.csr
 
-sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --issue-csr admin /tmp/host-tls.csr /tmp/host-leaf.crt /tmp/host-fullchain.crt'
-sudo cp /tmp/host-fullchain.crt /etc/pki/nginx/server.crt
+sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --issue-csr admin /tmp/host-tls.csr /tmp/host-leaf.crt /tmp/host-tlschain.crt --root-out /tmp/host-rootca.crt'
+sudo cp /tmp/host-tlschain.crt /etc/pki/nginx/server.crt
 sudo chmod 0644 /etc/pki/nginx/server.crt
-sudo rm -f /tmp/host-tls.csr /tmp/host-leaf.crt /tmp/host-fullchain.crt
-
-# Optional: add the CA chain to local system trust
-sudo cp /opt/certrobo/static/rootca.crt /etc/pki/ca-trust/source/anchors/certrobo-ca-chain.crt
-sudo update-ca-trust
+sudo rm -f /tmp/host-tls.csr /tmp/host-leaf.crt /tmp/host-tlschain.crt
 ```
 
-Create `/etc/nginx/conf.d/certrobo.conf` (and ensure any default `server` block on port 80 in `/etc/nginx/nginx.conf` is removed, with `map $http_upgrade $connection_upgrade { default upgrade; '' close; }` inside `http {}`):
+Optional: add the Root CA trust anchor to the local host trust store:
+
+```bash
+# Rocky Linux 10 / RHEL 10:
+sudo cp /tmp/host-rootca.crt /etc/pki/ca-trust/source/anchors/certrobo-rootca.crt
+sudo update-ca-trust
+sudo rm -f /tmp/host-rootca.crt
+
+# Ubuntu 26.04 LTS:
+sudo cp /tmp/host-rootca.crt /usr/local/share/ca-certificates/certrobo-rootca.crt
+sudo update-ca-certificates
+sudo rm -f /tmp/host-rootca.crt
+```
+
+#### Resolve Default Port 80 `default_server` Conflicts Before Adding `certrobo.conf`
+
+Nginx allows only one `default_server` listener per IP/port pair:
+* **On Rocky Linux 10 / RHEL 10:** `/etc/nginx/nginx.conf` ships with a built-in `server { listen 80; listen [::]:80; ... }` block inside `http {}`. Comment out or remove that built-in `server { ... }` block in `/etc/nginx/nginx.conf` so `/etc/nginx/conf.d/certrobo.conf` can bind `listen 80 default_server;`.
+* **On Ubuntu 26.04 LTS:** `/etc/nginx/nginx.conf` includes both `/etc/nginx/conf.d/*.conf` and `/etc/nginx/sites-enabled/*`. On a dedicated CertRobo host, remove the stock `/etc/nginx/sites-enabled/default` symlink (`sudo rm -f /etc/nginx/sites-enabled/default`)—or, if the host serves other virtual hosts, remove `default_server` from the competing site configuration—before testing Nginx.
+
+Create `/etc/nginx/conf.d/certrobo.conf` (compatible with both Rocky Linux 10 and Ubuntu 26.04 LTS OpenSSL builds):
 
 ```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -261,8 +313,8 @@ server {
     ssl_session_cache   shared:SSL:10m;
     ssl_session_timeout 10m;
     ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         PROFILE=SYSTEM;
-    ssl_prefer_server_ciphers on;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
 
     location / {
         proxy_pass http://127.0.0.1:5000;
@@ -280,12 +332,16 @@ server {
 }
 ```
 
-Test and start Nginx:
+Test and start/reload Nginx:
 
 ```bash
+# Rocky Linux 10 / RHEL 10 only (relabel TLS certificate files for SELinux):
 sudo restorecon -Rv /etc/pki/nginx /etc/nginx
+
+# Both Rocky Linux 10 and Ubuntu 26.04 LTS:
 sudo nginx -t
 sudo systemctl enable --now nginx.service
+sudo systemctl reload nginx.service
 ```
 
 ---
