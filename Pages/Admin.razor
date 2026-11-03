@@ -226,6 +226,12 @@
                                 <p class="text-muted-theme small mb-2">
                                     Sign and publish a fresh X.509 v2 CRL immediately. Requires the active CA signing key to be unlocked.
                                 </p>
+                                @if (unpublishedRevocationCertIds.Count > 0)
+                                {
+                                    <div class="alert alert-warning py-1 px-2 small mb-2" role="status">
+                                        <strong>Pending CRL Publication:</strong> @unpublishedRevocationCertIds.Count revoked certificate(s) have not yet been published to a signed CRL.
+                                    </div>
+                                }
                                 <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3">
                                     <span class="small text-muted-theme">Current published sequence: <strong>CRL #@activeCa.LastCrlNumber</strong></span>
                                     <RadzenButton Text="Refresh CRL Now" Click="@RefreshCrlClick" Disabled="@(!IsCaUnlocked)" />
@@ -1294,6 +1300,10 @@
                                                     break;
                                                 case IssuanceStatus.Revoked:
                                                     <span class="badge bg-danger">Revoked</span>
+                                                    @if (unpublishedRevocationCertIds.Contains(c.Id))
+                                                    {
+                                                        <span class="badge bg-warning text-dark ms-1">Pending CRL Publication</span>
+                                                    }
                                                     break;
                                                 case IssuanceStatus.Denied:
                                                     <span class="badge bg-warning text-dark">Denied</span>
@@ -1534,6 +1544,7 @@
     private AdCsCesConnectorConfig cesConfig = new();
     private IReadOnlyList<UserSummaryDto> users = [];
     private IReadOnlyList<IssuedCertificateRecord> certificates = [];
+    private IReadOnlySet<int> unpublishedRevocationCertIds = new HashSet<int>();
     private SubjectDefaultsConfig subjectDefaults = new();
 
     private string? statusBannerMessage;
@@ -1610,9 +1621,21 @@
     private string seedCommonName = "";
     private int seedReasonCode = 0;
 
-    private bool IsCaUnlocked =>
-        !string.IsNullOrEmpty(CaService.ResolveEffectivePassphrase())
-        && (activeCa == null || custodyReport?.ActiveAuthorityDecryptable != false);
+    private bool IsCaUnlocked
+    {
+        get
+        {
+            try
+            {
+                return !string.IsNullOrEmpty(CaService.ResolveEffectivePassphrase())
+                    && (activeCa == null || custodyReport?.ActiveAuthorityDecryptable != false);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
 
     private UserSummaryDto? SelectedUser =>
         users.FirstOrDefault(u => u.Id == selectedUserId) ?? users.FirstOrDefault();
@@ -1726,6 +1749,7 @@
             statusFilter = parsed;
         }
         certificates = await CaService.SearchCertificatesAsync(certSearchQuery, statusFilter);
+        unpublishedRevocationCertIds = await CaService.GetCertificateIdsWithUnpublishedRevocationsAsync();
     }
 
     private async Task ClearCertificateSearchAsync()
@@ -1825,7 +1849,17 @@
         try
         {
             var crl = await CaService.RefreshActiveCrlAsync();
+            IReadOnlyList<CrlRefreshOutcome> dueOutcomes = await CaService.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
             await ReloadAllAsync();
+            var failed = dueOutcomes.Where(o => !o.Succeeded).ToList();
+            if (failed.Count > 0)
+            {
+                Notify(
+                    Radzen.NotificationSeverity.Warning,
+                    "CRL Refresh Incomplete",
+                    string.Join(" ", failed.Select(f => f.ErrorMessage)));
+                return;
+            }
             Notify(Radzen.NotificationSeverity.Success, "CRL Refreshed", $"Published CRL #{crl?.CrlNumber}.");
         }
         catch (Exception ex)
@@ -1917,22 +1951,31 @@
     {
         AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
         string actor = authState.User.Identity?.Name ?? "admin";
-        var (ok, err) = await CaService.SeedRevokedSerialAsync(
+        RevocationOutcome outcome = await CaService.SeedRevokedSerialAsync(
             seedSerialHex,
             seedCommonName,
             seedReasonCode,
             actor);
 
-        if (!ok)
+        if (!outcome.RevocationAccepted)
         {
-            Notify(Radzen.NotificationSeverity.Error, "Seed Error", err ?? "Failed to seed revoked serial.");
+            Notify(Radzen.NotificationSeverity.Error, "Seed Error", outcome.ErrorMessage ?? "Failed to seed revoked serial.");
             return;
         }
 
         seedSerialHex = "";
         seedCommonName = "";
         await ReloadAllAsync();
-        Notify(Radzen.NotificationSeverity.Success, "Serial Seeded", "Revoked serial recorded and CRL updated.");
+        if (!outcome.CrlPublished)
+        {
+            Notify(
+                Radzen.NotificationSeverity.Warning,
+                "Serial Seeded — CRL Publication Pending",
+                outcome.ErrorMessage ?? "Revoked serial was recorded, but the updated CRL has not been published yet.");
+            return;
+        }
+
+        Notify(Radzen.NotificationSeverity.Success, "Serial Seeded", $"Revoked serial recorded and CRL #{outcome.PublishedCrl?.CrlNumber} published.");
     }
 
     private async Task SaveDefaultsClick()
@@ -2063,14 +2106,22 @@
     {
         AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
         string actor = authState.User.Identity?.Name ?? "admin";
-        var (ok, err) = await CaService.RevokeCertificateAsync(certId, 0, actor);
-        if (!ok)
+        RevocationOutcome outcome = await CaService.RevokeCertificateAsync(certId, 0, actor);
+        await ReloadAllAsync();
+        if (!outcome.RevocationAccepted)
         {
-            Notify(Radzen.NotificationSeverity.Error, "Revocation Error", err ?? "Revocation failed.");
+            Notify(Radzen.NotificationSeverity.Error, "Revocation Error", outcome.ErrorMessage ?? "Revocation failed.");
             return;
         }
-        await ReloadAllAsync();
-        Notify(Radzen.NotificationSeverity.Success, "Certificate Revoked", "Certificate revoked and CRL updated.");
+        if (!outcome.CrlPublished)
+        {
+            Notify(
+                Radzen.NotificationSeverity.Warning,
+                "Revocation Recorded — CRL Publication Pending",
+                outcome.ErrorMessage ?? "Certificate revocation was saved, but the updated CRL has not been published yet.");
+            return;
+        }
+        Notify(Radzen.NotificationSeverity.Success, "Certificate Revoked", $"Certificate revoked and CRL #{outcome.PublishedCrl?.CrlNumber} published.");
     }
 
     private async Task ExportIssuedCertificateBundleClick(IssuedCertificateRecord record)

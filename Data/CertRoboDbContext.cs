@@ -366,6 +366,36 @@ public class PublishedCrlRecord
     public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
 }
 
+public class SerialRevocationEventRecord
+{
+    [Key]
+    public int Id { get; set; }
+
+    public int CaAuthorityId { get; set; }
+
+    [Required]
+    [MaxLength(64)]
+    public string CanonicalSerialHex { get; set; } = string.Empty;
+
+    public int? TargetCertificateRecordId { get; set; }
+
+    [Required]
+    [MaxLength(32)]
+    public string OperationType { get; set; } = string.Empty;
+
+    public int RevocationReasonCode { get; set; }
+
+    public DateTimeOffset RevokedAtUtc { get; set; }
+
+    [Required]
+    [MaxLength(256)]
+    public string RevokedByUserName { get; set; } = string.Empty;
+
+    public int ReconciledMaxCertificateRecordId { get; set; }
+
+    public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
     : IdentityDbContext<ApplicationUser, IdentityRole, string>(options)
 {
@@ -376,6 +406,7 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
     public DbSet<AdCsCesConnectorConfig> AdCsCesConfigs => Set<AdCsCesConnectorConfig>();
     public DbSet<IssuedCertificateRecord> IssuedCertificates => Set<IssuedCertificateRecord>();
     public DbSet<PublishedCrlRecord> PublishedCrls => Set<PublishedCrlRecord>();
+    public DbSet<SerialRevocationEventRecord> SerialRevocationEvents => Set<SerialRevocationEventRecord>();
 
     protected override void OnModelCreating(ModelBuilder builder)
     {
@@ -395,6 +426,9 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
         builder.Entity<PublishedCrlRecord>()
             .HasIndex(c => new { c.CaAuthorityId, c.CrlNumber })
             .IsUnique();
+
+        builder.Entity<SerialRevocationEventRecord>()
+            .HasIndex(e => new { e.CaAuthorityId, e.CanonicalSerialHex });
 
         builder.Entity<PendingCaEnrollmentRecord>()
             .HasIndex(p => p.Status);
@@ -461,8 +495,26 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
             );
             """;
 
+        const string createRevocationEventsTableSql = """
+            CREATE TABLE IF NOT EXISTS "SerialRevocationEvents" (
+                "Id" INTEGER NOT NULL CONSTRAINT "PK_SerialRevocationEvents" PRIMARY KEY AUTOINCREMENT,
+                "CaAuthorityId" INTEGER NOT NULL,
+                "CanonicalSerialHex" TEXT NOT NULL,
+                "TargetCertificateRecordId" INTEGER NULL,
+                "OperationType" TEXT NOT NULL,
+                "RevocationReasonCode" INTEGER NOT NULL,
+                "RevokedAtUtc" TEXT NOT NULL,
+                "RevokedByUserName" TEXT NOT NULL,
+                "ReconciledMaxCertificateRecordId" INTEGER NOT NULL,
+                "CreatedAtUtc" TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS "IX_SerialRevocationEvents_CaAuthorityId_CanonicalSerialHex"
+                ON "SerialRevocationEvents" ("CaAuthorityId", "CanonicalSerialHex");
+            """;
+
         await Database.ExecuteSqlRawAsync(createPendingTableSql, cancellationToken);
         await Database.ExecuteSqlRawAsync(createCesConfigTableSql, cancellationToken);
+        await Database.ExecuteSqlRawAsync(createRevocationEventsTableSql, cancellationToken);
         await Database.ExecuteSqlRawAsync(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS "IX_CaAuthorities_SingleActive"
