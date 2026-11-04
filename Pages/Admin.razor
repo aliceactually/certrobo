@@ -1426,6 +1426,18 @@
                     </div>
                     @if (includeRootCaPkcs12InBackup)
                     {
+                        @if (localRootAuthorities.Count == 0)
+                        {
+                            <div class="alert alert-warning small py-2 mb-2" role="alert">
+                                <strong>Unavailable:</strong> No locally held Root CA private key is present on this instance (only an externally signed Intermediate CA or no Root CA is configured). Uncheck this option to download an ordinary state backup.
+                            </div>
+                        }
+                        else if (custodyReport is { HasEffectivePassphrase: false })
+                        {
+                            <div class="alert alert-warning small py-2 mb-2" role="alert">
+                                <strong>CA Key Custody Locked:</strong> The Root CA private key cannot be exported into a PKCS#12 while CA key custody is locked. Unlock the CA signing key first, or uncheck this option to download an ordinary state backup.
+                            </div>
+                        }
                         <div class="row g-2 align-items-end mt-1">
                             <div class="col-md-7">
                                 <label class="form-label small mb-1" for="backup-root-ca-select">Locally Managed Root CA to Include</label>
@@ -1444,7 +1456,7 @@
                                 </select>
                             </div>
                             <div class="col-md-5 small text-muted-theme">
-                                Uses <code>PBES2-PBKDF2-HMAC-SHA256</code> + <code>AES-256-CBC</code> + <code>PBMAC1</code> (100,000 iterations). Requires CA key custody to be unlocked.
+                                Uses <code>PBES2-PBKDF2-HMAC-SHA256</code> + <code>AES-256-CBC</code> + <code>HMAC-SHA256</code> PKCS#12 MAC (100,000 iterations). Requires CA key custody to be unlocked.
                             </div>
                         </div>
                     }
@@ -1785,7 +1797,9 @@
     {
         activeCa = await CaService.GetActiveAuthorityAsync();
         IReadOnlyList<CaAuthorityRecord> allAuthorities = await CaService.ListAuthoritiesAsync();
-        localRootAuthorities = allAuthorities.Where(a => !a.IsIntermediate).ToList();
+        localRootAuthorities = allAuthorities
+            .Where(a => !a.IsIntermediate && !string.IsNullOrWhiteSpace(a.EncryptedPrivateKeyPath) && File.Exists(a.EncryptedPrivateKeyPath))
+            .ToList();
         if (localRootAuthorities.Count == 0)
         {
             selectedBackupRootCaId = 0;
