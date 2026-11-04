@@ -36,20 +36,20 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y aspnetcore-runtime-10.0 n
 
 ### 2. Publish, Transfer, and Stage the Application
 
-On your build machine, publish into a clean architecture-specific output directory (`linux-x64` for `x86_64` hosts or `linux-arm64` for `aarch64` hosts), package without macOS/extended attributes, and copy the archive to `/tmp/certrobo-linux.tar.gz` on the target host:
+On your build machine, publish outside the source tree into a clean architecture-specific output directory (`linux-x64` for `x86_64` hosts or `linux-arm64` for `aarch64` hosts), package without macOS/extended attributes, and copy the archive to `/tmp/certrobo-linux.tar.gz` on the target host. Keeping build outputs outside the source tree prevents a later publish from bundling the other architecture's output as application content:
 
 ```bash
 # For x86_64 target hosts (uname -m -> x86_64):
-rm -rf ./publish-linux-x64
-dotnet publish CertRobo.csproj -c Release -r linux-x64 --self-contained false -o ./publish-linux-x64
-COPYFILE_DISABLE=1 tar --no-xattrs -czf certrobo-linux-x64.tar.gz -C ./publish-linux-x64 .
-scp certrobo-linux-x64.tar.gz <user>@<target-host>:/tmp/certrobo-linux.tar.gz
+rm -rf ../certrobo-publish/linux-x64
+dotnet publish CertRobo.csproj -c Release -r linux-x64 --self-contained false -o ../certrobo-publish/linux-x64
+COPYFILE_DISABLE=1 tar --no-xattrs -czf ../certrobo-publish/certrobo-linux-x64.tar.gz -C ../certrobo-publish/linux-x64 .
+scp ../certrobo-publish/certrobo-linux-x64.tar.gz <user>@<target-host>:/tmp/certrobo-linux.tar.gz
 
 # For ARM64 target hosts (uname -m -> aarch64):
-rm -rf ./publish-linux-arm64
-dotnet publish CertRobo.csproj -c Release -r linux-arm64 --self-contained false -o ./publish-linux-arm64
-COPYFILE_DISABLE=1 tar --no-xattrs -czf certrobo-linux-arm64.tar.gz -C ./publish-linux-arm64 .
-scp certrobo-linux-arm64.tar.gz <user>@<target-host>:/tmp/certrobo-linux.tar.gz
+rm -rf ../certrobo-publish/linux-arm64
+dotnet publish CertRobo.csproj -c Release -r linux-arm64 --self-contained false -o ../certrobo-publish/linux-arm64
+COPYFILE_DISABLE=1 tar --no-xattrs -czf ../certrobo-publish/certrobo-linux-arm64.tar.gz -C ../certrobo-publish/linux-arm64 .
+scp ../certrobo-publish/certrobo-linux-arm64.tar.gz <user>@<target-host>:/tmp/certrobo-linux.tar.gz
 ```
 
 On the target Linux host, create a dedicated unprivileged `certrobo` service user and locked-down directories for binaries (`/opt/certrobo`), persistent state (`/var/lib/certrobo`), and configuration (`/etc/certrobo`):
