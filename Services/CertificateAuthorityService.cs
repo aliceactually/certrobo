@@ -1606,12 +1606,6 @@ public sealed class CertificateAuthorityService
                             $"Parent CA '{effectiveParent.Name}' (ID #{effectiveParent.Id}) could not be unlocked with the supplied storage passphrase: {parentErr}");
                     }
 
-                    bool parentHasCrl = await db.PublishedCrls.AnyAsync(c => c.CaAuthorityId == effectiveParent.Id, cancellationToken);
-                    if (!parentHasCrl)
-                    {
-                        await GenerateAndPersistCrlInternalAsync(db, effectiveParent, parentPassphrase ?? passphrase, cancellationToken);
-                    }
-
                     var (nextParentSerial, nextSerialBytes, _) = await AllocateNextIssuerSerialAsync(db, effectiveParent, cancellationToken);
                     allocatedParentSerial = nextParentSerial;
                     allocatedParentSerialBytes = nextSerialBytes;
@@ -1751,6 +1745,11 @@ public sealed class CertificateAuthorityService
                     await using CertRoboDbContext parentSerialDb = await _dbFactory.CreateDbContextAsync(cancellationToken);
                     CaAuthorityRecord trackedParent = await parentSerialDb.CaAuthorities
                         .FirstAsync(c => c.Id == effectiveParent.Id, cancellationToken);
+                    bool parentHasCrl = await parentSerialDb.PublishedCrls.AnyAsync(c => c.CaAuthorityId == trackedParent.Id, cancellationToken);
+                    if (!parentHasCrl)
+                    {
+                        await GenerateAndPersistCrlInternalAsync(parentSerialDb, trackedParent, parentPassphrase ?? passphrase, cancellationToken);
+                    }
                     if (allocatedParentSerial.Value > trackedParent.LastAllocatedSerial)
                     {
                         trackedParent.LastAllocatedSerial = allocatedParentSerial.Value;
@@ -2557,22 +2556,53 @@ public sealed class CertificateAuthorityService
                 }
                 else
                 {
+                    List<CaAuthorityRecord> allAuthorities = await db.CaAuthorities
+                        .AsNoTracking()
+                        .OrderBy(c => c.Id)
+                        .ToListAsync(cancellationToken);
+                    Dictionary<int, List<CaAuthorityRecord>> directSubsByParent = MapDirectLocalSubordinatesByParentId(allAuthorities);
+                    CaAuthorityRecord? matchedLocalSubordinate = null;
+                    if (directSubsByParent.TryGetValue(ca.Id, out List<CaAuthorityRecord>? directSubs))
+                    {
+                        foreach (CaAuthorityRecord sub in directSubs)
+                        {
+                            try
+                            {
+                                using X509Certificate2 subCert = X509Certificate2.CreateFromPem(sub.IssuerCertificatePem);
+                                string subSerialHex = Convert.ToHexString(subCert.GetSerialNumber().Reverse().ToArray());
+                                if (TryNormalizePositiveSerialHex(subSerialHex, out BigInteger subBi, out _, out _)
+                                    && subBi.Equals(serialBigInt))
+                                {
+                                    matchedLocalSubordinate = sub;
+                                    break;
+                                }
+                            }
+                            catch
+                            {
+                            }
+                        }
+                    }
+
+                    string effectiveCommonName = !string.IsNullOrWhiteSpace(commonName)
+                        ? commonName.Trim()
+                        : (matchedLocalSubordinate?.Name ?? "legacy-revoked");
+
                     string nonCollidingSerialHex = AllocateNonCollidingEquivalentSerialHex(canonicalHex, caCertificates);
                     IssuedCertificateRecord seeded = new()
                     {
                         CaAuthorityId = ca.Id,
                         SerialNumberHex = nonCollidingSerialHex,
                         SerialNumberValue = 0,
-                        ProfileId = "legacy-imported",
-                        CommonName = string.IsNullOrWhiteSpace(commonName) ? "legacy-revoked" : commonName.Trim(),
-                        SubjectAlternativeNamesCsv = string.IsNullOrWhiteSpace(commonName) ? "" : commonName.Trim(),
-                        SubjectDistinguishedName = string.IsNullOrWhiteSpace(commonName) ? "" : $"CN={commonName.Trim()}",
+                        ProfileId = matchedLocalSubordinate != null ? "local-subordinate-ca" : "legacy-imported",
+                        CommonName = effectiveCommonName,
+                        SubjectAlternativeNamesCsv = !string.IsNullOrWhiteSpace(commonName) ? commonName.Trim() : string.Empty,
+                        SubjectDistinguishedName = $"CN={effectiveCommonName}",
                         IssuerDistinguishedName = string.Empty,
                         KeyAlgorithm = "LEGACY",
                         KeySizeBits = 0,
-                        ThumbprintSha256 = "LEGACY-" + canonicalHex,
-                        NotBeforeUtc = ca.NotBeforeUtc,
-                        NotAfterUtc = ca.NotAfterUtc,
+                        ThumbprintSha256 = matchedLocalSubordinate?.ThumbprintOrSerialHex ?? ("LEGACY-" + canonicalHex),
+                        NotBeforeUtc = matchedLocalSubordinate?.NotBeforeUtc ?? ca.NotBeforeUtc,
+                        NotAfterUtc = matchedLocalSubordinate?.NotAfterUtc ?? ca.NotAfterUtc,
                         RequestedByUserId = "legacy-migration",
                         RequestedByUserName = revokedByUserName,
                         Status = IssuanceStatus.Revoked,
