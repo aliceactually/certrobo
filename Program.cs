@@ -215,7 +215,7 @@ using (IServiceScope scope = app.Services.CreateScope())
             {
                 Directory.CreateDirectory(parentDir);
             }
-            await File.WriteAllBytesAsync(outputZipPath, archiveBytes);
+            await BackupRestoreService.WritePrivateFileBytesAsync(outputZipPath, archiveBytes);
             Console.WriteLine($"Consistent backup written to '{outputZipPath}' ({archiveBytes.Length} bytes).");
             return;
         }
@@ -263,7 +263,9 @@ using (IServiceScope scope = app.Services.CreateScope())
         }
         string adminUser = args[bootstrapIdx + 1];
         string adminPass = args[bootstrapIdx + 2];
-        string pattern = bootstrapIdx + 3 < args.Length ? args[bootstrapIdx + 3] : "*";
+        string pattern = bootstrapIdx + 3 < args.Length && !args[bootstrapIdx + 3].StartsWith("--", StringComparison.Ordinal)
+            ? args[bootstrapIdx + 3]
+            : "*";
         var (ok, err, _) = await accountService.BootstrapFirstAdminAsync(adminUser, adminPass, null, pattern);
         if (!ok)
         {
@@ -627,8 +629,16 @@ using (IServiceScope scope = app.Services.CreateScope())
         string? outChainPath = issueIdx + 4 < args.Length && !args[issueIdx + 4].StartsWith("--", StringComparison.Ordinal)
             ? args[issueIdx + 4]
             : null;
-        string? outRootPath = TryGetOptionValue(args, "--root-out");
-        string? outFullChainPath = TryGetOptionValue(args, "--fullchain-out");
+        string? outFullChainPath = null;
+        string? fullChainOptErr = null;
+        if (!TryExtractOptionValue(args, "--root-out", out string? outRootPath, out string? rootOptErr)
+            || !TryExtractOptionValue(args, "--fullchain-out", out outFullChainPath, out fullChainOptErr))
+        {
+            Console.Error.WriteLine(rootOptErr ?? fullChainOptErr);
+            Environment.ExitCode = 1;
+            return;
+        }
+        bool forceReissue = args.Contains("--force-reissue", StringComparer.OrdinalIgnoreCase);
 
         UserManager<ApplicationUser> userMgr = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
         ApplicationUser? user = await userMgr.FindByNameAsync(reqUser);
@@ -676,7 +686,9 @@ using (IServiceScope scope = app.Services.CreateScope())
         // 1. Check whether an unexpired Issued certificate for the exact same CSR public key and identities already exists
         //    so retrying a failed output write recovers the existing certificate without silent duplicate issuance.
         CertificateAuthorityService caService = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
-        IssuanceOutcome? recoveredExisting = await TryRecoverExistingIssuedCertificateForCsrAsync(db, caService, user, csrPem);
+        IssuanceOutcome? recoveredExisting = !forceReissue
+            ? await TryRecoverExistingIssuedCertificateForCsrAsync(db, caService, user, csrPem)
+            : null;
         if (recoveredExisting != null)
         {
             if (!TryPreflightDestinationPaths(destinationPaths, out string? recoveryPreflightErr))
@@ -711,7 +723,10 @@ using (IServiceScope scope = app.Services.CreateScope())
             return;
         }
 
-        IssuanceOutcome outcome = await caService.IssueCertificateFromCsrAsync(user.Id, csrPem);
+        IssuanceOutcome outcome = await caService.IssueCertificateFromCsrAsync(
+            user.Id,
+            csrPem,
+            recoverExistingForSameCsr: !forceReissue);
         if (!outcome.Succeeded)
         {
             Console.Error.WriteLine($"Issuance failed: {outcome.ErrorMessage}");
@@ -730,7 +745,14 @@ using (IServiceScope scope = app.Services.CreateScope())
             return;
         }
 
-        Console.WriteLine($"Issued certificate serial {outcome.Record!.SerialNumberHex} for '{outcome.Record.CommonName}' -> {outCertPath}");
+        if (outcome.WasRecoveredExisting)
+        {
+            Console.WriteLine($"Recovered already-issued certificate serial {outcome.Record!.SerialNumberHex} for '{outcome.Record.CommonName}' -> {outCertPath}");
+        }
+        else
+        {
+            Console.WriteLine($"Issued certificate serial {outcome.Record!.SerialNumberHex} for '{outcome.Record.CommonName}' -> {outCertPath}");
+        }
         return;
     }
 
@@ -751,8 +773,15 @@ using (IServiceScope scope = app.Services.CreateScope())
         string? outChainPath = exportIssuedIdx + 3 < args.Length && !args[exportIssuedIdx + 3].StartsWith("--", StringComparison.Ordinal)
             ? args[exportIssuedIdx + 3]
             : null;
-        string? outRootPath = TryGetOptionValue(args, "--root-out");
-        string? outFullChainPath = TryGetOptionValue(args, "--fullchain-out");
+        string? outFullChainPath = null;
+        string? fullChainOptErr = null;
+        if (!TryExtractOptionValue(args, "--root-out", out string? outRootPath, out string? rootOptErr)
+            || !TryExtractOptionValue(args, "--fullchain-out", out outFullChainPath, out fullChainOptErr))
+        {
+            Console.Error.WriteLine(rootOptErr ?? fullChainOptErr);
+            Environment.ExitCode = 1;
+            return;
+        }
 
         IssuedCertificateRecord? record = null;
         if (CertificateAuthorityService.TryNormalizePositiveSerialHex(selector, out var targetBi, out string canonicalHex, out _))
@@ -844,19 +873,30 @@ app.MapBlazorHub();
 app.MapFallbackToPage("/_Host");
 app.Run();
 
-static string? TryGetOptionValue(string[] cliArgs, string flagName)
+static bool TryExtractOptionValue(string[] cliArgs, string flagName, out string? optionValue, out string? errorMessage)
 {
+    optionValue = null;
+    errorMessage = null;
     int idx = Array.FindIndex(cliArgs, a => string.Equals(a, flagName, StringComparison.OrdinalIgnoreCase));
-    if (idx >= 0 && idx + 1 < cliArgs.Length && !cliArgs[idx + 1].StartsWith("--", StringComparison.Ordinal))
+    if (idx < 0)
     {
-        return cliArgs[idx + 1];
+        return true;
     }
-    return null;
+
+    if (idx + 1 >= cliArgs.Length || cliArgs[idx + 1].StartsWith("--", StringComparison.Ordinal) || string.IsNullOrWhiteSpace(cliArgs[idx + 1]))
+    {
+        errorMessage = $"Option '{flagName}' requires a file path argument.";
+        return false;
+    }
+
+    optionValue = cliArgs[idx + 1];
+    return true;
 }
 
 static bool TryPreflightDestinationPaths(IReadOnlyList<string> paths, out string? errorMessage)
 {
     errorMessage = null;
+    HashSet<string> seenFullPaths = new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
     foreach (string rawPath in paths)
     {
         if (string.IsNullOrWhiteSpace(rawPath))
@@ -868,6 +908,12 @@ static bool TryPreflightDestinationPaths(IReadOnlyList<string> paths, out string
         try
         {
             string fullPath = Path.GetFullPath(rawPath);
+            if (!seenFullPaths.Add(fullPath))
+            {
+                errorMessage = $"Duplicate output file path '{rawPath}' is not allowed; each requested output must use a distinct path.";
+                return false;
+            }
+
             if (Directory.Exists(fullPath))
             {
                 errorMessage = $"Destination path '{rawPath}' is an existing directory, not a file.";

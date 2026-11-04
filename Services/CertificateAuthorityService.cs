@@ -13,6 +13,7 @@ using Org.BouncyCastle.Pkcs;
 using Org.BouncyCastle.Security;
 using Org.BouncyCastle.X509;
 using Org.BouncyCastle.X509.Extension;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -41,7 +42,8 @@ public sealed record IssuanceOutcome(
     string? CertificatePem,
     string? FullChainPem,
     string? TlsServerChainPem = null,
-    string? RootTrustAnchorPem = null);
+    string? RootTrustAnchorPem = null,
+    bool WasRecoveredExisting = false);
 
 public sealed record CrlRefreshOutcome(
     int CaAuthorityId,
@@ -128,7 +130,16 @@ public sealed class CertificateAuthorityService
 {
     public const string CrossProcessLockFileName = ".ca-lifecycle.lock";
 
-    private static readonly SemaphoreSlim SigningAndSerialLock = new(1, 1);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> InProcessLifecycleLocksByDirectory =
+        new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+    private static SemaphoreSlim GetInProcessLifecycleLock(string? storageDirectory)
+    {
+        string key = string.IsNullOrWhiteSpace(storageDirectory)
+            ? "__default__"
+            : Path.GetFullPath(storageDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return InProcessLifecycleLocksByDirectory.GetOrAdd(key, static _ => new SemaphoreSlim(1, 1));
+    }
 
     private readonly IDbContextFactory<CertRoboDbContext> _dbFactory;
     private readonly IServiceScopeFactory _scopeFactory;
@@ -217,8 +228,9 @@ public sealed class CertificateAuthorityService
     {
         TimeSpan effectiveTimeout = timeout ?? TimeSpan.FromSeconds(30);
         Stopwatch sw = Stopwatch.StartNew();
+        SemaphoreSlim inProcessLock = GetInProcessLifecycleLock(storageDirectory);
 
-        if (!await SigningAndSerialLock.WaitAsync(effectiveTimeout, cancellationToken))
+        if (!await inProcessLock.WaitAsync(effectiveTimeout, cancellationToken))
         {
             throw new TimeoutException("Timed out waiting for in-process CA lifecycle lock.");
         }
@@ -236,11 +248,18 @@ public sealed class CertificateAuthorityService
                     cancellationToken.ThrowIfCancellationRequested();
                     try
                     {
-                        lockStream = new FileStream(
-                            lockFilePath,
-                            FileMode.OpenOrCreate,
-                            FileAccess.ReadWrite,
-                            FileShare.None);
+                        FileStreamOptions lockStreamOptions = new()
+                        {
+                            Mode = FileMode.OpenOrCreate,
+                            Access = FileAccess.ReadWrite,
+                            Share = FileShare.None
+                        };
+                        if (!OperatingSystem.IsWindows())
+                        {
+                            lockStreamOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                        }
+
+                        lockStream = File.Open(lockFilePath, lockStreamOptions);
                         RestrictFilePermissionsIfUnix(lockFilePath);
                         break;
                     }
@@ -260,17 +279,17 @@ public sealed class CertificateAuthorityService
                 }
             }
 
-            return new LifecycleLockHandle(lockStream);
+            return new LifecycleLockHandle(inProcessLock, lockStream);
         }
         catch
         {
             lockStream?.Dispose();
-            SigningAndSerialLock.Release();
+            inProcessLock.Release();
             throw;
         }
     }
 
-    private sealed class LifecycleLockHandle(FileStream? lockStream) : IAsyncDisposable, IDisposable
+    private sealed class LifecycleLockHandle(SemaphoreSlim inProcessLock, FileStream? lockStream) : IAsyncDisposable, IDisposable
     {
         private int _disposed;
 
@@ -287,7 +306,7 @@ public sealed class CertificateAuthorityService
             }
             finally
             {
-                SigningAndSerialLock.Release();
+                inProcessLock.Release();
             }
         }
 
@@ -691,8 +710,10 @@ public sealed class CertificateAuthorityService
                     // Preserve a non-overwritten backup copy in recovery-backups while also leaving the original .p8.enc file untouched
                     string backupFileName = $"{Path.GetFileName(authority.EncryptedPrivateKeyPath)}.bak-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}"[..Math.Min(96, Path.GetFileName(authority.EncryptedPrivateKeyPath).Length + 28)];
                     string backupFilePath = Path.Combine(backupDir, backupFileName);
-                    File.Copy(authority.EncryptedPrivateKeyPath, backupFilePath, overwrite: false);
-                    RestrictFilePermissionsIfUnix(backupFilePath);
+                    await BackupRestoreService.WritePrivateFileBytesAsync(
+                        backupFilePath,
+                        await File.ReadAllBytesAsync(authority.EncryptedPrivateKeyPath, cancellationToken),
+                        cancellationToken);
                     createdBackupPaths.Add(backupFilePath);
 
                     using AsymmetricAlgorithm key = LoadEncryptedKey(authority.EncryptedPrivateKeyPath, srcPass);
@@ -709,8 +730,7 @@ public sealed class CertificateAuthorityService
                         throw new IOException("Refusing to overwrite an existing encrypted CA key file.");
                     }
 
-                    await File.WriteAllBytesAsync(newKeyFilePath, reencryptedPkcs8, cancellationToken);
-                    RestrictFilePermissionsIfUnix(newKeyFilePath);
+                    await BackupRestoreService.WritePrivateFileBytesAsync(newKeyFilePath, reencryptedPkcs8, cancellationToken);
                     createdKeyPaths.Add(newKeyFilePath);
 
                     // Verify newly written key file on disk before updating database record
@@ -729,8 +749,10 @@ public sealed class CertificateAuthorityService
                 {
                     string backupFileName = $"{Path.GetFileName(pending.EncryptedPrivateKeyPath)}.bak-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}"[..Math.Min(96, Path.GetFileName(pending.EncryptedPrivateKeyPath).Length + 28)];
                     string backupFilePath = Path.Combine(backupDir, backupFileName);
-                    File.Copy(pending.EncryptedPrivateKeyPath, backupFilePath, overwrite: false);
-                    RestrictFilePermissionsIfUnix(backupFilePath);
+                    await BackupRestoreService.WritePrivateFileBytesAsync(
+                        backupFilePath,
+                        await File.ReadAllBytesAsync(pending.EncryptedPrivateKeyPath, cancellationToken),
+                        cancellationToken);
                     createdBackupPaths.Add(backupFilePath);
 
                     using AsymmetricAlgorithm key = LoadEncryptedKey(pending.EncryptedPrivateKeyPath, srcPass);
@@ -747,8 +769,7 @@ public sealed class CertificateAuthorityService
                         throw new IOException("Refusing to overwrite an existing encrypted pending CA key file.");
                     }
 
-                    await File.WriteAllBytesAsync(newKeyFilePath, reencryptedPkcs8, cancellationToken);
-                    RestrictFilePermissionsIfUnix(newKeyFilePath);
+                    await BackupRestoreService.WritePrivateFileBytesAsync(newKeyFilePath, reencryptedPkcs8, cancellationToken);
                     createdKeyPaths.Add(newKeyFilePath);
 
                     using AsymmetricAlgorithm verifiedKey = LoadEncryptedKey(newKeyFilePath, targetStoragePassphrase);
@@ -1009,8 +1030,7 @@ public sealed class CertificateAuthorityService
             Directory.CreateDirectory(_options.StorageDirectory);
             string keyFileName = $"ca-pending-key-{Guid.NewGuid():N}.p8.enc";
             string keyFilePath = Path.Combine(_options.StorageDirectory, keyFileName);
-            await File.WriteAllBytesAsync(keyFilePath, encryptedPkcs8, cancellationToken);
-            RestrictFilePermissionsIfUnix(keyFilePath);
+            await BackupRestoreService.WritePrivateFileBytesAsync(keyFilePath, encryptedPkcs8, cancellationToken);
 
             PendingCaEnrollmentRecord record = new()
             {
@@ -1608,12 +1628,6 @@ public sealed class CertificateAuthorityService
                             $"Parent CA '{effectiveParent.Name}' (ID #{effectiveParent.Id}) could not be unlocked with the supplied storage passphrase: {parentErr}");
                     }
 
-                    bool parentHasCrl = await db.PublishedCrls.AnyAsync(c => c.CaAuthorityId == effectiveParent.Id, cancellationToken);
-                    if (!parentHasCrl)
-                    {
-                        await GenerateAndPersistCrlInternalAsync(db, effectiveParent, parentPassphrase ?? passphrase, cancellationToken);
-                    }
-
                     var (nextParentSerial, nextSerialBytes, _) = await AllocateNextIssuerSerialAsync(db, effectiveParent, cancellationToken);
                     allocatedParentSerial = nextParentSerial;
                     allocatedParentSerialBytes = nextSerialBytes;
@@ -1753,6 +1767,11 @@ public sealed class CertificateAuthorityService
                     await using CertRoboDbContext parentSerialDb = await _dbFactory.CreateDbContextAsync(cancellationToken);
                     CaAuthorityRecord trackedParent = await parentSerialDb.CaAuthorities
                         .FirstAsync(c => c.Id == effectiveParent.Id, cancellationToken);
+                    bool parentHasCrl = await parentSerialDb.PublishedCrls.AnyAsync(c => c.CaAuthorityId == trackedParent.Id, cancellationToken);
+                    if (!parentHasCrl)
+                    {
+                        await GenerateAndPersistCrlInternalAsync(parentSerialDb, trackedParent, parentPassphrase ?? passphrase, cancellationToken);
+                    }
                     if (allocatedParentSerial.Value > trackedParent.LastAllocatedSerial)
                     {
                         trackedParent.LastAllocatedSerial = allocatedParentSerial.Value;
@@ -2060,7 +2079,8 @@ public sealed class CertificateAuthorityService
         string? explicitProfileId = null,
         int? requestedValidityDays = null,
         string? expectedSecurityStamp = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool recoverExistingForSameCsr = false)
     {
         PolicyEvaluationResult eval;
         await using (AsyncServiceScope policyScope = _scopeFactory.CreateAsyncScope())
@@ -2212,6 +2232,55 @@ public sealed class CertificateAuthorityService
                             null,
                             null,
                             null);
+                    }
+                }
+
+                if (recoverExistingForSameCsr)
+                {
+                    byte[] csrSpkiDer = SubjectPublicKeyInfoFactory
+                        .CreateSubjectPublicKeyInfo(req.PublicKey)
+                        .GetDerEncoded();
+                    string requestedSansCsv = string.Join(",", req.CanonicalDnsIdentities);
+
+                    List<IssuedCertificateRecord> existingCandidates = await db.IssuedCertificates
+                        .AsNoTracking()
+                        .Where(c => c.CaAuthorityId == ca.Id
+                                 && c.RequestedByUserId == user.Id
+                                 && c.Status == IssuanceStatus.Issued
+                                 && c.CommonName == req.CommonName
+                                 && c.SubjectAlternativeNamesCsv == requestedSansCsv)
+                        .OrderByDescending(c => c.Id)
+                        .ToListAsync(cancellationToken);
+
+                    foreach (IssuedCertificateRecord candidate in existingCandidates)
+                    {
+                        if (candidate.NotAfterUtc <= now || string.IsNullOrWhiteSpace(candidate.CertificatePem))
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            using X509Certificate2 existingCert = X509Certificate2.CreateFromPem(candidate.CertificatePem);
+                            if (existingCert.PublicKey.ExportSubjectPublicKeyInfo().SequenceEqual(csrSpkiDer))
+                            {
+                                string existingIssuerChainPem = !string.IsNullOrWhiteSpace(candidate.ChainPem)
+                                    ? candidate.ChainPem
+                                    : BuildOrderedCertificateChainPem(ca);
+                                return new(
+                                    true,
+                                    null,
+                                    candidate,
+                                    candidate.CertificatePem,
+                                    candidate.CertificatePem + existingIssuerChainPem,
+                                    BuildTlsServerChainPem(candidate.CertificatePem, existingIssuerChainPem),
+                                    ExtractTrustAnchorRootPem(existingIssuerChainPem),
+                                    WasRecoveredExisting: true);
+                            }
+                        }
+                        catch
+                        {
+                        }
                     }
                 }
 
@@ -2599,22 +2668,53 @@ public sealed class CertificateAuthorityService
                 }
                 else
                 {
+                    List<CaAuthorityRecord> allAuthorities = await db.CaAuthorities
+                        .AsNoTracking()
+                        .OrderBy(c => c.Id)
+                        .ToListAsync(cancellationToken);
+                    Dictionary<int, List<CaAuthorityRecord>> directSubsByParent = MapDirectLocalSubordinatesByParentId(allAuthorities);
+                    CaAuthorityRecord? matchedLocalSubordinate = null;
+                    if (directSubsByParent.TryGetValue(ca.Id, out List<CaAuthorityRecord>? directSubs))
+                    {
+                        foreach (CaAuthorityRecord sub in directSubs)
+                        {
+                            try
+                            {
+                                using X509Certificate2 subCert = X509Certificate2.CreateFromPem(sub.IssuerCertificatePem);
+                                string subSerialHex = Convert.ToHexString(subCert.GetSerialNumber().Reverse().ToArray());
+                                if (TryNormalizePositiveSerialHex(subSerialHex, out BigInteger subBi, out _, out _)
+                                    && subBi.Equals(serialBigInt))
+                                {
+                                    matchedLocalSubordinate = sub;
+                                    break;
+                                }
+                            }
+                            catch
+                            {
+                            }
+                        }
+                    }
+
+                    string effectiveCommonName = !string.IsNullOrWhiteSpace(commonName)
+                        ? commonName.Trim()
+                        : (matchedLocalSubordinate?.Name ?? "legacy-revoked");
+
                     string nonCollidingSerialHex = AllocateNonCollidingEquivalentSerialHex(canonicalHex, caCertificates);
                     IssuedCertificateRecord seeded = new()
                     {
                         CaAuthorityId = ca.Id,
                         SerialNumberHex = nonCollidingSerialHex,
                         SerialNumberValue = 0,
-                        ProfileId = "legacy-imported",
-                        CommonName = string.IsNullOrWhiteSpace(commonName) ? "legacy-revoked" : commonName.Trim(),
-                        SubjectAlternativeNamesCsv = string.IsNullOrWhiteSpace(commonName) ? "" : commonName.Trim(),
-                        SubjectDistinguishedName = string.IsNullOrWhiteSpace(commonName) ? "" : $"CN={commonName.Trim()}",
+                        ProfileId = matchedLocalSubordinate != null ? "local-subordinate-ca" : "legacy-imported",
+                        CommonName = effectiveCommonName,
+                        SubjectAlternativeNamesCsv = !string.IsNullOrWhiteSpace(commonName) ? commonName.Trim() : string.Empty,
+                        SubjectDistinguishedName = $"CN={effectiveCommonName}",
                         IssuerDistinguishedName = string.Empty,
                         KeyAlgorithm = "LEGACY",
                         KeySizeBits = 0,
-                        ThumbprintSha256 = "LEGACY-" + canonicalHex,
-                        NotBeforeUtc = ca.NotBeforeUtc,
-                        NotAfterUtc = ca.NotAfterUtc,
+                        ThumbprintSha256 = matchedLocalSubordinate?.ThumbprintOrSerialHex ?? ("LEGACY-" + canonicalHex),
+                        NotBeforeUtc = matchedLocalSubordinate?.NotBeforeUtc ?? ca.NotBeforeUtc,
+                        NotAfterUtc = matchedLocalSubordinate?.NotAfterUtc ?? ca.NotAfterUtc,
                         RequestedByUserId = "legacy-migration",
                         RequestedByUserName = revokedByUserName,
                         Status = IssuanceStatus.Revoked,
@@ -3510,8 +3610,7 @@ public sealed class CertificateAuthorityService
         Directory.CreateDirectory(_options.StorageDirectory);
         string keyFileName = $"ca-key-{Guid.NewGuid():N}.p8.enc";
         string keyFilePath = Path.Combine(_options.StorageDirectory, keyFileName);
-        await File.WriteAllBytesAsync(keyFilePath, encryptedPkcs8Bytes, cancellationToken);
-        RestrictFilePermissionsIfUnix(keyFilePath);
+        await BackupRestoreService.WritePrivateFileBytesAsync(keyFilePath, encryptedPkcs8Bytes, cancellationToken);
 
         using X509Certificate2 cert = X509Certificate2.CreateFromPem(issuerCertPem);
         string skiHex = cert.Extensions.OfType<X509SubjectKeyIdentifierExtension>().FirstOrDefault()?.SubjectKeyIdentifier

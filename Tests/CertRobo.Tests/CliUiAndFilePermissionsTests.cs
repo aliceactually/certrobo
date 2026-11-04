@@ -131,6 +131,32 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
             IReadOnlyList<IssuedCertificateRecord> issuedRecords = await caService.SearchCertificatesAsync("leaf1.contoso.com", IssuanceStatus.Issued);
             Assert.Single(issuedRecords);
             Assert.Equal(1001L, (await caService.GetActiveAuthorityAsync())!.LastAllocatedSerial);
+
+            // 2d. Concurrent retry/issuance race for a fresh CSR (leaf-concurrent.contoso.com):
+            //     Multiple concurrent --issue-csr / recoverExistingForSameCsr calls for the same CSR must serialize
+            //     under the lifecycle lock and produce only ONE issued certificate (serial 1002), never duplicates.
+            UserManager<ApplicationUser> userMgr = checkSp.GetRequiredService<UserManager<ApplicationUser>>();
+            ApplicationUser admin = (await userMgr.FindByNameAsync("admin"))!;
+            KeyPair concurrentKp = _crypto.KeyGen(256);
+            string concurrentCsr = _crypto.CSRGen(
+                concurrentKp,
+                "leaf-concurrent.contoso.com",
+                ["leaf-concurrent.contoso.com"],
+                "US", "WA", "Redmond", "Contoso", "IT", "");
+
+            Task<IssuanceOutcome>[] concurrentTasks = Enumerable.Range(0, 4)
+                .Select(_ => caService.IssueCertificateFromCsrAsync(
+                    admin.Id,
+                    concurrentCsr,
+                    recoverExistingForSameCsr: true))
+                .ToArray();
+            IssuanceOutcome[] concurrentOutcomes = await Task.WhenAll(concurrentTasks);
+            Assert.All(concurrentOutcomes, o => Assert.True(o.Succeeded, o.ErrorMessage));
+            Assert.Single(concurrentOutcomes.Select(o => o.Record!.SerialNumberHex).Distinct(StringComparer.OrdinalIgnoreCase));
+            Assert.Equal(1, concurrentOutcomes.Count(o => !o.WasRecoveredExisting));
+            Assert.Equal(3, concurrentOutcomes.Count(o => o.WasRecoveredExisting));
+            Assert.Single(await caService.SearchCertificatesAsync("leaf-concurrent.contoso.com", IssuanceStatus.Issued));
+            Assert.Equal(1002L, (await caService.GetActiveAuthorityAsync())!.LastAllocatedSerial);
         }
 
         // 3. Verify #22 TLS server-chain vs root vs fullchain semantics under the Intermediate CA:
@@ -270,12 +296,19 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
         Assert.Null(GetField<int?>(adminPage, "pendingRevokeCertId"));
         Assert.Equal(IssuanceStatus.Issued, (await caService.SearchCertificatesAsync("cert1.contoso.com", null)).Single().Status);
 
-        // 3. Non-admin principal attempting ConfirmRevokeCertClick is rejected without revoking
+        // 3. Non-admin principal or disabled admin attempting ConfirmRevokeCertClick is rejected without revoking
         await InvokeMethodAsync(adminPage, "RevokeCertClick", issued1.Record.Id);
         authProvider.SetPrincipal("issuer-id", "alice-issuer", AppRoles.Issuer);
         await InvokeMethodAsync(adminPage, "ConfirmRevokeCertClick");
         Assert.Equal(IssuanceStatus.Issued, (await caService.SearchCertificatesAsync("cert1.contoso.com", null)).Single().Status);
         Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage"));
+
+        authProvider.SetPrincipal(adminUser.Id, "admin", AppRoles.Administrator);
+        await acct.SetUserDisabledAsync(adminUser.Id, true);
+        await InvokeMethodAsync(adminPage, "ConfirmRevokeCertClick");
+        Assert.Equal(IssuanceStatus.Issued, (await caService.SearchCertificatesAsync("cert1.contoso.com", null)).Single().Status);
+        Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage"));
+        await acct.SetUserDisabledAsync(adminUser.Id, false);
 
         // 4. Restore Administrator principal, select reason 4 (Superseded), and confirm revocation
         authProvider.SetPrincipal(adminUser.Id, "admin", AppRoles.Administrator);
@@ -327,12 +360,24 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
 
         UnixFileMode expectedPrivateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
         Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(dbPath));
-        foreach (string suffix in new[] { "-wal", "-shm" })
+
+        // 1b. While an active WAL connection/transaction is open, verify -wal and -shm actively exist and have 0600 permissions
+        using (ServiceProvider openSp = BuildServiceProvider(dbPath, caDir, passFile))
+        using (IServiceScope openScope = openSp.CreateScope())
         {
-            if (File.Exists(dbPath + suffix))
-            {
-                Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(dbPath + suffix));
-            }
+            CertRoboDbContext openDb = openScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            await openDb.Database.OpenConnectionAsync();
+            await openDb.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
+            await using var tx = await openDb.Database.BeginTransactionAsync();
+            await openDb.Database.ExecuteSqlRawAsync("UPDATE \"SubjectDefaults\" SET \"Country\" = 'US';");
+            CertRoboDbContext.RestrictSqliteDatabaseFilePermissionsIfUnix(dbPath);
+
+            Assert.True(File.Exists(dbPath + "-wal"));
+            Assert.True(File.Exists(dbPath + "-shm"));
+            Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(dbPath));
+            Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(dbPath + "-wal"));
+            Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(dbPath + "-shm"));
+            await tx.RollbackAsync();
         }
 
         // 2. Loosen mode to 0644 to simulate a pre-existing database, then restart/run CLI and verify EnsureSchemaUpgradedAsync tightens it back to 0600
@@ -348,6 +393,261 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
         var (resExit, _, _) = await RunCliAsync(restoredDbPath, restoredCaDir, passFile, ["--restore", backupZipPath]);
         Assert.Equal(0, resExit);
         Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(restoredDbPath));
+        Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(backupZipPath));
+    }
+
+    [Fact]
+    public async Task BackupAndRestore_CreateSnapshotDatabase_KeyFiles_AndDataProtectionXml_PrivatelyBeforeWritingContents()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        UnixFileMode expectedFileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        UnixFileMode expectedDirMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        UnixFileMode forbiddenGroupOtherMask =
+            UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute |
+            UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute;
+
+        string sourceDir = Path.Combine(_tempRoot, "privacy-probe-source");
+        string sourceDbPath = Path.Combine(sourceDir, "certrobo.db");
+        string sourceCaDir = Path.Combine(sourceDir, "ca");
+        string sourceDpDir = Path.Combine(sourceDir, "dp");
+        string passFile = Path.Combine(sourceDir, "ca.pass");
+        Directory.CreateDirectory(sourceDir);
+        Directory.CreateDirectory(sourceCaDir);
+        Directory.CreateDirectory(sourceDpDir);
+        await File.WriteAllTextAsync(passFile, "ProbeSecret!2026\n");
+
+        byte[] sampleKeyBytes = System.Security.Cryptography.RandomNumberGenerator.GetBytes(4096);
+        byte[] sampleDpBytes = System.Text.Encoding.UTF8.GetBytes("<key id=\"probe\">" + new string('X', 65536) + "</key>");
+        await BackupRestoreService.WritePrivateFileBytesAsync(Path.Combine(sourceCaDir, "ca-key-probe.p8.enc"), sampleKeyBytes);
+        await BackupRestoreService.WritePrivateFileBytesAsync(Path.Combine(sourceDpDir, "key-probe.xml"), sampleDpBytes);
+
+        using ServiceProvider sp = BuildServiceProvider(sourceDbPath, sourceCaDir, passFile);
+        using (IServiceScope scope = sp.CreateScope())
+        {
+            CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            await db.EnsureSchemaUpgradedAsync();
+        }
+
+        // Populate a ~64 MiB SQLite database with incompressible random pages so VACUUM INTO and restore stream writes
+        // are observable in-flight.
+        await using (SqliteConnection conn = new($"Data Source={sourceDbPath}"))
+        {
+            await conn.OpenAsync();
+            await using (SqliteCommand createCmd = conn.CreateCommand())
+            {
+                createCmd.CommandText = "CREATE TABLE IF NOT EXISTS BulkProbePayload (Id INTEGER PRIMARY KEY, Payload BLOB NOT NULL);";
+                await createCmd.ExecuteNonQueryAsync();
+            }
+
+            await using var tx = await conn.BeginTransactionAsync();
+            await using SqliteCommand insertCmd = conn.CreateCommand();
+            insertCmd.Transaction = (SqliteTransaction)tx;
+            insertCmd.CommandText = "INSERT INTO BulkProbePayload (Payload) VALUES ($blob);";
+            SqliteParameter blobParam = insertCmd.Parameters.Add("$blob", SqliteType.Blob);
+            for (int i = 0; i < 64; i++)
+            {
+                blobParam.Value = System.Security.Cryptography.RandomNumberGenerator.GetBytes(1024 * 1024);
+                await insertCmd.ExecuteNonQueryAsync();
+            }
+            await tx.CommitAsync();
+        }
+
+        BackupRestoreService backupService = new(
+            sp.GetRequiredService<IDbContextFactory<CertRoboDbContext>>(),
+            sp.GetRequiredService<CaKeyCustodyOptions>());
+
+        // 0. Verify CreatePrivateStagingDirectory creates a 0700 directory
+        var createStagingDirMethod = typeof(BackupRestoreService).GetMethod(
+            "CreatePrivateStagingDirectory",
+            BindingFlags.Static | BindingFlags.NonPublic)!;
+        string testStagingDir = (string)createStagingDirMethod.Invoke(null, null)!;
+        try
+        {
+            Assert.Equal(expectedDirMode, File.GetUnixFileMode(testStagingDir));
+        }
+        finally
+        {
+            if (Directory.Exists(testStagingDir))
+            {
+                Directory.Delete(testStagingDir, recursive: true);
+            }
+        }
+
+        // 1. Backup probe: invoke CreateBackupZipCoreAsync with a controlled snapshot path
+        //    and sample its UnixFileMode from the moment of creation while VACUUM INTO is actively running.
+        string controlledSnapshotDir = Path.Combine(_tempRoot, "controlled-backup-probe");
+        Directory.CreateDirectory(controlledSnapshotDir);
+        string controlledSnapshotPath = Path.Combine(controlledSnapshotDir, "snapshot.db");
+
+        // Also verify EnsureEmptyPrivateFileCreated replaces a pre-existing permissive (0644) file with a 0600 empty file
+        string preExistingPermissiveSnapshot = Path.Combine(controlledSnapshotDir, "preexisting-permissive.db");
+        await File.WriteAllTextAsync(preExistingPermissiveSnapshot, "stale");
+        File.SetUnixFileMode(
+            preExistingPermissiveSnapshot,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+        BackupRestoreService.EnsureEmptyPrivateFileCreated(preExistingPermissiveSnapshot);
+        Assert.Equal(expectedFileMode, File.GetUnixFileMode(preExistingPermissiveSnapshot));
+        Assert.Equal(0L, new FileInfo(preExistingPermissiveSnapshot).Length);
+
+        var createBackupZipCoreMethod = typeof(BackupRestoreService).GetMethod(
+            "CreateBackupZipCoreAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        List<UnixFileMode> observedBackupModes = [];
+        bool observedBackupInFlight = false;
+        using CancellationTokenSource backupObserverCts = new();
+
+        Task<byte[]> backupTask = Task.Run(async () =>
+        {
+            Task<byte[]> inner = (Task<byte[]>)createBackupZipCoreMethod.Invoke(
+                backupService,
+                [sourceDbPath, sourceDpDir, controlledSnapshotPath, null, CancellationToken.None])!;
+            return await inner;
+        });
+
+        Task backupObserver = Task.Run(() =>
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                return;
+            }
+
+            while (!backupTask.IsCompleted && !backupObserverCts.IsCancellationRequested)
+            {
+                try
+                {
+                    if (File.Exists(controlledSnapshotPath))
+                    {
+                        UnixFileMode mode = File.GetUnixFileMode(controlledSnapshotPath);
+                        long len = new FileInfo(controlledSnapshotPath).Length;
+                        if (len < 60L * 1024 * 1024)
+                        {
+                            observedBackupInFlight = true;
+                        }
+                        observedBackupModes.Add(mode);
+                    }
+                }
+                catch
+                {
+                }
+            }
+        });
+
+        byte[] archiveBytes = await backupTask;
+        backupObserverCts.Cancel();
+        await backupObserver;
+
+        Assert.True(File.Exists(controlledSnapshotPath));
+        observedBackupModes.Add(File.GetUnixFileMode(controlledSnapshotPath));
+        Assert.True(observedBackupInFlight, "Expected backup probe to observe snapshot.db while VACUUM INTO was in flight.");
+        Assert.All(observedBackupModes, m => Assert.Equal(UnixFileMode.None, m & forbiddenGroupOtherMask));
+        Assert.Equal(expectedFileMode, File.GetUnixFileMode(controlledSnapshotPath));
+
+        // 2. Fresh restore probe: invoke RestoreBackupArchive into a fresh directory and sample modes while streaming
+        string freshRestoreDir = Path.Combine(_tempRoot, "fresh-restore-probe");
+        string freshRestoreDb = Path.Combine(freshRestoreDir, "certrobo.db");
+        string freshRestoreCa = Path.Combine(freshRestoreDir, "ca");
+        string freshRestoreDp = Path.Combine(freshRestoreDir, "dp");
+
+        List<UnixFileMode> observedRestoreModes = [];
+        bool observedRestoreInFlight = false;
+        using CancellationTokenSource restoreObserverCts = new();
+
+        Task restoreTask = Task.Run(() =>
+            BackupRestoreService.RestoreBackupArchive(archiveBytes, freshRestoreDb, freshRestoreCa, freshRestoreDp));
+
+        Task restoreObserver = Task.Run(() =>
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                return;
+            }
+
+            while (!restoreTask.IsCompleted && !restoreObserverCts.IsCancellationRequested)
+            {
+                try
+                {
+                    if (File.Exists(freshRestoreDb))
+                    {
+                        UnixFileMode mode = File.GetUnixFileMode(freshRestoreDb);
+                        long len = new FileInfo(freshRestoreDb).Length;
+                        if (len < 60L * 1024 * 1024)
+                        {
+                            observedRestoreInFlight = true;
+                        }
+                        observedRestoreModes.Add(mode);
+                    }
+
+                    string caKeyFile = Path.Combine(freshRestoreCa, "ca-key-probe.p8.enc");
+                    if (File.Exists(caKeyFile))
+                    {
+                        observedRestoreModes.Add(File.GetUnixFileMode(caKeyFile));
+                    }
+
+                    string dpXmlFile = Path.Combine(freshRestoreDp, "key-probe.xml");
+                    if (File.Exists(dpXmlFile))
+                    {
+                        observedRestoreModes.Add(File.GetUnixFileMode(dpXmlFile));
+                    }
+                }
+                catch
+                {
+                }
+            }
+        });
+
+        await restoreTask;
+        restoreObserverCts.Cancel();
+        await restoreObserver;
+
+        observedRestoreModes.Add(File.GetUnixFileMode(freshRestoreDb));
+        observedRestoreModes.Add(File.GetUnixFileMode(Path.Combine(freshRestoreCa, "ca-key-probe.p8.enc")));
+        observedRestoreModes.Add(File.GetUnixFileMode(Path.Combine(freshRestoreDp, "key-probe.xml")));
+
+        Assert.True(observedRestoreInFlight, "Expected restore probe to observe certrobo.db while extraction was in flight.");
+        Assert.All(observedRestoreModes, m => Assert.Equal(UnixFileMode.None, m & forbiddenGroupOtherMask));
+        Assert.Equal(expectedFileMode, File.GetUnixFileMode(freshRestoreDb));
+        Assert.Equal(expectedFileMode, File.GetUnixFileMode(Path.Combine(freshRestoreCa, "ca-key-probe.p8.enc")));
+        Assert.Equal(expectedFileMode, File.GetUnixFileMode(Path.Combine(freshRestoreDp, "key-probe.xml")));
+
+        // 3. Existing permissive target probe: pre-populate 0644 files and hold an open read handle to the old DB inode.
+        //    RestoreBackupArchive must unlink the old permissive inodes before creating new 0600 files so neither
+        //    the path nor the pre-existing file descriptor can read the newly restored contents.
+        string permissiveDir = Path.Combine(_tempRoot, "permissive-restore-probe");
+        string permissiveDb = Path.Combine(permissiveDir, "certrobo.db");
+        string permissiveCa = Path.Combine(permissiveDir, "ca");
+        string permissiveDp = Path.Combine(permissiveDir, "dp");
+        Directory.CreateDirectory(permissiveDir);
+        Directory.CreateDirectory(permissiveCa);
+        Directory.CreateDirectory(permissiveDp);
+
+        string permissiveKey = Path.Combine(permissiveCa, "ca-key-probe.p8.enc");
+        string permissiveXml = Path.Combine(permissiveDp, "key-probe.xml");
+        await File.WriteAllBytesAsync(permissiveDb, "OLD_PERMISSIVE_DB"u8.ToArray());
+        await File.WriteAllBytesAsync(permissiveKey, "OLD_PERMISSIVE_KEY"u8.ToArray());
+        await File.WriteAllBytesAsync(permissiveXml, "OLD_PERMISSIVE_XML"u8.ToArray());
+
+        UnixFileMode worldReadableMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead;
+        File.SetUnixFileMode(permissiveDb, worldReadableMode);
+        File.SetUnixFileMode(permissiveKey, worldReadableMode);
+        File.SetUnixFileMode(permissiveXml, worldReadableMode);
+
+        await using FileStream preOpenedOldDbHandle = new(permissiveDb, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        BackupRestoreService.RestoreBackupArchive(archiveBytes, permissiveDb, permissiveCa, permissiveDp);
+
+        Assert.Equal(expectedFileMode, File.GetUnixFileMode(permissiveDb));
+        Assert.Equal(expectedFileMode, File.GetUnixFileMode(permissiveKey));
+        Assert.Equal(expectedFileMode, File.GetUnixFileMode(permissiveXml));
+
+        preOpenedOldDbHandle.Position = 0;
+        using StreamReader oldReader = new(preOpenedOldDbHandle, leaveOpen: true);
+        string oldInodeContents = await oldReader.ReadToEndAsync();
+        Assert.Equal("OLD_PERMISSIVE_DB", oldInodeContents);
+        Assert.True(new FileInfo(permissiveDb).Length > 60L * 1024 * 1024);
     }
 
     private sealed class TestAuthStateProvider : AuthenticationStateProvider
