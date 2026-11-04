@@ -131,6 +131,32 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
             IReadOnlyList<IssuedCertificateRecord> issuedRecords = await caService.SearchCertificatesAsync("leaf1.contoso.com", IssuanceStatus.Issued);
             Assert.Single(issuedRecords);
             Assert.Equal(1001L, (await caService.GetActiveAuthorityAsync())!.LastAllocatedSerial);
+
+            // 2d. Concurrent retry/issuance race for a fresh CSR (leaf-concurrent.contoso.com):
+            //     Multiple concurrent --issue-csr / recoverExistingForSameCsr calls for the same CSR must serialize
+            //     under the lifecycle lock and produce only ONE issued certificate (serial 1002), never duplicates.
+            UserManager<ApplicationUser> userMgr = checkSp.GetRequiredService<UserManager<ApplicationUser>>();
+            ApplicationUser admin = (await userMgr.FindByNameAsync("admin"))!;
+            KeyPair concurrentKp = _crypto.KeyGen(256);
+            string concurrentCsr = _crypto.CSRGen(
+                concurrentKp,
+                "leaf-concurrent.contoso.com",
+                ["leaf-concurrent.contoso.com"],
+                "US", "WA", "Redmond", "Contoso", "IT", "");
+
+            Task<IssuanceOutcome>[] concurrentTasks = Enumerable.Range(0, 4)
+                .Select(_ => caService.IssueCertificateFromCsrAsync(
+                    admin.Id,
+                    concurrentCsr,
+                    recoverExistingForSameCsr: true))
+                .ToArray();
+            IssuanceOutcome[] concurrentOutcomes = await Task.WhenAll(concurrentTasks);
+            Assert.All(concurrentOutcomes, o => Assert.True(o.Succeeded, o.ErrorMessage));
+            Assert.Single(concurrentOutcomes.Select(o => o.Record!.SerialNumberHex).Distinct(StringComparer.OrdinalIgnoreCase));
+            Assert.Equal(1, concurrentOutcomes.Count(o => !o.WasRecoveredExisting));
+            Assert.Equal(3, concurrentOutcomes.Count(o => o.WasRecoveredExisting));
+            Assert.Single(await caService.SearchCertificatesAsync("leaf-concurrent.contoso.com", IssuanceStatus.Issued));
+            Assert.Equal(1002L, (await caService.GetActiveAuthorityAsync())!.LastAllocatedSerial);
         }
 
         // 3. Verify #22 TLS server-chain vs root vs fullchain semantics under the Intermediate CA:
@@ -270,12 +296,19 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
         Assert.Null(GetField<int?>(adminPage, "pendingRevokeCertId"));
         Assert.Equal(IssuanceStatus.Issued, (await caService.SearchCertificatesAsync("cert1.contoso.com", null)).Single().Status);
 
-        // 3. Non-admin principal attempting ConfirmRevokeCertClick is rejected without revoking
+        // 3. Non-admin principal or disabled admin attempting ConfirmRevokeCertClick is rejected without revoking
         await InvokeMethodAsync(adminPage, "RevokeCertClick", issued1.Record.Id);
         authProvider.SetPrincipal("issuer-id", "alice-issuer", AppRoles.Issuer);
         await InvokeMethodAsync(adminPage, "ConfirmRevokeCertClick");
         Assert.Equal(IssuanceStatus.Issued, (await caService.SearchCertificatesAsync("cert1.contoso.com", null)).Single().Status);
         Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage"));
+
+        authProvider.SetPrincipal(adminUser.Id, "admin", AppRoles.Administrator);
+        await acct.SetUserDisabledAsync(adminUser.Id, true);
+        await InvokeMethodAsync(adminPage, "ConfirmRevokeCertClick");
+        Assert.Equal(IssuanceStatus.Issued, (await caService.SearchCertificatesAsync("cert1.contoso.com", null)).Single().Status);
+        Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage"));
+        await acct.SetUserDisabledAsync(adminUser.Id, false);
 
         // 4. Restore Administrator principal, select reason 4 (Superseded), and confirm revocation
         authProvider.SetPrincipal(adminUser.Id, "admin", AppRoles.Administrator);
@@ -327,12 +360,24 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
 
         UnixFileMode expectedPrivateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
         Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(dbPath));
-        foreach (string suffix in new[] { "-wal", "-shm" })
+
+        // 1b. While an active WAL connection/transaction is open, verify -wal and -shm actively exist and have 0600 permissions
+        using (ServiceProvider openSp = BuildServiceProvider(dbPath, caDir, passFile))
+        using (IServiceScope openScope = openSp.CreateScope())
         {
-            if (File.Exists(dbPath + suffix))
-            {
-                Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(dbPath + suffix));
-            }
+            CertRoboDbContext openDb = openScope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+            await openDb.Database.OpenConnectionAsync();
+            await openDb.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
+            await using var tx = await openDb.Database.BeginTransactionAsync();
+            await openDb.Database.ExecuteSqlRawAsync("UPDATE \"SubjectDefaults\" SET \"Country\" = 'US';");
+            CertRoboDbContext.RestrictSqliteDatabaseFilePermissionsIfUnix(dbPath);
+
+            Assert.True(File.Exists(dbPath + "-wal"));
+            Assert.True(File.Exists(dbPath + "-shm"));
+            Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(dbPath));
+            Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(dbPath + "-wal"));
+            Assert.Equal(expectedPrivateMode, File.GetUnixFileMode(dbPath + "-shm"));
+            await tx.RollbackAsync();
         }
 
         // 2. Loosen mode to 0644 to simulate a pre-existing database, then restart/run CLI and verify EnsureSchemaUpgradedAsync tightens it back to 0600

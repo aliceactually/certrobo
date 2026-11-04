@@ -2323,6 +2323,18 @@
             return;
         }
 
+        string? currentUserId = authState.User.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (!string.IsNullOrWhiteSpace(currentUserId) && AccountService != null)
+        {
+            IReadOnlyList<UserSummaryDto> currentUsers = await AccountService.ListUsersAsync();
+            UserSummaryDto? activeAdmin = currentUsers.FirstOrDefault(u => u.Id == currentUserId);
+            if (activeAdmin == null || activeAdmin.IsDisabled || !activeAdmin.Roles.Contains(AppRoles.Administrator))
+            {
+                Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", "Only an active authenticated Administrator may revoke certificates.");
+                return;
+            }
+        }
+
         int targetId = pendingRevokeCertId.Value;
         int reasonCode = pendingRevokeReasonCode;
         string actor = authState.User.Identity?.Name ?? "admin";

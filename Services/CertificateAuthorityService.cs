@@ -41,7 +41,8 @@ public sealed record IssuanceOutcome(
     string? CertificatePem,
     string? FullChainPem,
     string? TlsServerChainPem = null,
-    string? RootTrustAnchorPem = null);
+    string? RootTrustAnchorPem = null,
+    bool WasRecoveredExisting = false);
 
 public sealed record CrlRefreshOutcome(
     int CaAuthorityId,
@@ -2059,7 +2060,8 @@ public sealed class CertificateAuthorityService
         string? explicitProfileId = null,
         int? requestedValidityDays = null,
         string? expectedSecurityStamp = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool recoverExistingForSameCsr = false)
     {
         PolicyEvaluationResult eval;
         await using (AsyncServiceScope policyScope = _scopeFactory.CreateAsyncScope())
@@ -2211,6 +2213,55 @@ public sealed class CertificateAuthorityService
                             null,
                             null,
                             null);
+                    }
+                }
+
+                if (recoverExistingForSameCsr)
+                {
+                    byte[] csrSpkiDer = SubjectPublicKeyInfoFactory
+                        .CreateSubjectPublicKeyInfo(req.PublicKey)
+                        .GetDerEncoded();
+                    string requestedSansCsv = string.Join(",", req.CanonicalDnsIdentities);
+
+                    List<IssuedCertificateRecord> existingCandidates = await db.IssuedCertificates
+                        .AsNoTracking()
+                        .Where(c => c.CaAuthorityId == ca.Id
+                                 && c.RequestedByUserId == user.Id
+                                 && c.Status == IssuanceStatus.Issued
+                                 && c.CommonName == req.CommonName
+                                 && c.SubjectAlternativeNamesCsv == requestedSansCsv)
+                        .OrderByDescending(c => c.Id)
+                        .ToListAsync(cancellationToken);
+
+                    foreach (IssuedCertificateRecord candidate in existingCandidates)
+                    {
+                        if (candidate.NotAfterUtc <= now || string.IsNullOrWhiteSpace(candidate.CertificatePem))
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            using X509Certificate2 existingCert = X509Certificate2.CreateFromPem(candidate.CertificatePem);
+                            if (existingCert.PublicKey.ExportSubjectPublicKeyInfo().SequenceEqual(csrSpkiDer))
+                            {
+                                string existingIssuerChainPem = !string.IsNullOrWhiteSpace(candidate.ChainPem)
+                                    ? candidate.ChainPem
+                                    : BuildOrderedCertificateChainPem(ca);
+                                return new(
+                                    true,
+                                    null,
+                                    candidate,
+                                    candidate.CertificatePem,
+                                    candidate.CertificatePem + existingIssuerChainPem,
+                                    BuildTlsServerChainPem(candidate.CertificatePem, existingIssuerChainPem),
+                                    ExtractTrustAnchorRootPem(existingIssuerChainPem),
+                                    WasRecoveredExisting: true);
+                            }
+                        }
+                        catch
+                        {
+                        }
                     }
                 }
 
