@@ -215,7 +215,7 @@ using (IServiceScope scope = app.Services.CreateScope())
             {
                 Directory.CreateDirectory(parentDir);
             }
-            await File.WriteAllBytesAsync(outputZipPath, archiveBytes);
+            await BackupRestoreService.WritePrivateFileBytesAsync(outputZipPath, archiveBytes);
             Console.WriteLine($"Consistent backup written to '{outputZipPath}' ({archiveBytes.Length} bytes).");
             return;
         }

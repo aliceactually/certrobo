@@ -13,6 +13,7 @@ using Org.BouncyCastle.Pkcs;
 using Org.BouncyCastle.Security;
 using Org.BouncyCastle.X509;
 using Org.BouncyCastle.X509.Extension;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -129,7 +130,16 @@ public sealed class CertificateAuthorityService
 {
     public const string CrossProcessLockFileName = ".ca-lifecycle.lock";
 
-    private static readonly SemaphoreSlim SigningAndSerialLock = new(1, 1);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> InProcessLifecycleLocksByDirectory =
+        new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+    private static SemaphoreSlim GetInProcessLifecycleLock(string? storageDirectory)
+    {
+        string key = string.IsNullOrWhiteSpace(storageDirectory)
+            ? "__default__"
+            : Path.GetFullPath(storageDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return InProcessLifecycleLocksByDirectory.GetOrAdd(key, static _ => new SemaphoreSlim(1, 1));
+    }
 
     private readonly IDbContextFactory<CertRoboDbContext> _dbFactory;
     private readonly IServiceScopeFactory _scopeFactory;
@@ -218,8 +228,9 @@ public sealed class CertificateAuthorityService
     {
         TimeSpan effectiveTimeout = timeout ?? TimeSpan.FromSeconds(30);
         Stopwatch sw = Stopwatch.StartNew();
+        SemaphoreSlim inProcessLock = GetInProcessLifecycleLock(storageDirectory);
 
-        if (!await SigningAndSerialLock.WaitAsync(effectiveTimeout, cancellationToken))
+        if (!await inProcessLock.WaitAsync(effectiveTimeout, cancellationToken))
         {
             throw new TimeoutException("Timed out waiting for in-process CA lifecycle lock.");
         }
@@ -237,11 +248,18 @@ public sealed class CertificateAuthorityService
                     cancellationToken.ThrowIfCancellationRequested();
                     try
                     {
-                        lockStream = new FileStream(
-                            lockFilePath,
-                            FileMode.OpenOrCreate,
-                            FileAccess.ReadWrite,
-                            FileShare.None);
+                        FileStreamOptions lockStreamOptions = new()
+                        {
+                            Mode = FileMode.OpenOrCreate,
+                            Access = FileAccess.ReadWrite,
+                            Share = FileShare.None
+                        };
+                        if (!OperatingSystem.IsWindows())
+                        {
+                            lockStreamOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                        }
+
+                        lockStream = File.Open(lockFilePath, lockStreamOptions);
                         RestrictFilePermissionsIfUnix(lockFilePath);
                         break;
                     }
@@ -261,17 +279,17 @@ public sealed class CertificateAuthorityService
                 }
             }
 
-            return new LifecycleLockHandle(lockStream);
+            return new LifecycleLockHandle(inProcessLock, lockStream);
         }
         catch
         {
             lockStream?.Dispose();
-            SigningAndSerialLock.Release();
+            inProcessLock.Release();
             throw;
         }
     }
 
-    private sealed class LifecycleLockHandle(FileStream? lockStream) : IAsyncDisposable, IDisposable
+    private sealed class LifecycleLockHandle(SemaphoreSlim inProcessLock, FileStream? lockStream) : IAsyncDisposable, IDisposable
     {
         private int _disposed;
 
@@ -288,7 +306,7 @@ public sealed class CertificateAuthorityService
             }
             finally
             {
-                SigningAndSerialLock.Release();
+                inProcessLock.Release();
             }
         }
 
@@ -692,8 +710,10 @@ public sealed class CertificateAuthorityService
                     // Preserve a non-overwritten backup copy in recovery-backups while also leaving the original .p8.enc file untouched
                     string backupFileName = $"{Path.GetFileName(authority.EncryptedPrivateKeyPath)}.bak-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}"[..Math.Min(96, Path.GetFileName(authority.EncryptedPrivateKeyPath).Length + 28)];
                     string backupFilePath = Path.Combine(backupDir, backupFileName);
-                    File.Copy(authority.EncryptedPrivateKeyPath, backupFilePath, overwrite: false);
-                    RestrictFilePermissionsIfUnix(backupFilePath);
+                    await BackupRestoreService.WritePrivateFileBytesAsync(
+                        backupFilePath,
+                        await File.ReadAllBytesAsync(authority.EncryptedPrivateKeyPath, cancellationToken),
+                        cancellationToken);
                     createdBackupPaths.Add(backupFilePath);
 
                     using AsymmetricAlgorithm key = LoadEncryptedKey(authority.EncryptedPrivateKeyPath, srcPass);
@@ -710,8 +730,7 @@ public sealed class CertificateAuthorityService
                         throw new IOException("Refusing to overwrite an existing encrypted CA key file.");
                     }
 
-                    await File.WriteAllBytesAsync(newKeyFilePath, reencryptedPkcs8, cancellationToken);
-                    RestrictFilePermissionsIfUnix(newKeyFilePath);
+                    await BackupRestoreService.WritePrivateFileBytesAsync(newKeyFilePath, reencryptedPkcs8, cancellationToken);
                     createdKeyPaths.Add(newKeyFilePath);
 
                     // Verify newly written key file on disk before updating database record
@@ -730,8 +749,10 @@ public sealed class CertificateAuthorityService
                 {
                     string backupFileName = $"{Path.GetFileName(pending.EncryptedPrivateKeyPath)}.bak-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}"[..Math.Min(96, Path.GetFileName(pending.EncryptedPrivateKeyPath).Length + 28)];
                     string backupFilePath = Path.Combine(backupDir, backupFileName);
-                    File.Copy(pending.EncryptedPrivateKeyPath, backupFilePath, overwrite: false);
-                    RestrictFilePermissionsIfUnix(backupFilePath);
+                    await BackupRestoreService.WritePrivateFileBytesAsync(
+                        backupFilePath,
+                        await File.ReadAllBytesAsync(pending.EncryptedPrivateKeyPath, cancellationToken),
+                        cancellationToken);
                     createdBackupPaths.Add(backupFilePath);
 
                     using AsymmetricAlgorithm key = LoadEncryptedKey(pending.EncryptedPrivateKeyPath, srcPass);
@@ -748,8 +769,7 @@ public sealed class CertificateAuthorityService
                         throw new IOException("Refusing to overwrite an existing encrypted pending CA key file.");
                     }
 
-                    await File.WriteAllBytesAsync(newKeyFilePath, reencryptedPkcs8, cancellationToken);
-                    RestrictFilePermissionsIfUnix(newKeyFilePath);
+                    await BackupRestoreService.WritePrivateFileBytesAsync(newKeyFilePath, reencryptedPkcs8, cancellationToken);
                     createdKeyPaths.Add(newKeyFilePath);
 
                     using AsymmetricAlgorithm verifiedKey = LoadEncryptedKey(newKeyFilePath, targetStoragePassphrase);
@@ -1010,8 +1030,7 @@ public sealed class CertificateAuthorityService
             Directory.CreateDirectory(_options.StorageDirectory);
             string keyFileName = $"ca-pending-key-{Guid.NewGuid():N}.p8.enc";
             string keyFilePath = Path.Combine(_options.StorageDirectory, keyFileName);
-            await File.WriteAllBytesAsync(keyFilePath, encryptedPkcs8, cancellationToken);
-            RestrictFilePermissionsIfUnix(keyFilePath);
+            await BackupRestoreService.WritePrivateFileBytesAsync(keyFilePath, encryptedPkcs8, cancellationToken);
 
             PendingCaEnrollmentRecord record = new()
             {
@@ -3591,8 +3610,7 @@ public sealed class CertificateAuthorityService
         Directory.CreateDirectory(_options.StorageDirectory);
         string keyFileName = $"ca-key-{Guid.NewGuid():N}.p8.enc";
         string keyFilePath = Path.Combine(_options.StorageDirectory, keyFileName);
-        await File.WriteAllBytesAsync(keyFilePath, encryptedPkcs8Bytes, cancellationToken);
-        RestrictFilePermissionsIfUnix(keyFilePath);
+        await BackupRestoreService.WritePrivateFileBytesAsync(keyFilePath, encryptedPkcs8Bytes, cancellationToken);
 
         using X509Certificate2 cert = X509Certificate2.CreateFromPem(issuerCertPem);
         string skiHex = cert.Extensions.OfType<X509SubjectKeyIdentifierExtension>().FirstOrDefault()?.SubjectKeyIdentifier

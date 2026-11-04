@@ -459,6 +459,11 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
         {
             string fullPath = Path.GetFullPath(sqliteFilePath);
             string? dir = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
             if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir) && !File.Exists(fullPath))
             {
                 using (File.Open(
