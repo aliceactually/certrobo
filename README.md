@@ -270,7 +270,7 @@ sudo rm -f /tmp/host-rootca.crt
 #### Resolve Default Port 80 `default_server` Conflicts Before Adding `certrobo.conf`
 
 Nginx allows only one `default_server` listener per IP/port pair:
-* **On Rocky Linux 10 / RHEL 10:** `/etc/nginx/nginx.conf` ships with a built-in `server { listen 80; listen [::]:80; ... }` block inside `http {}`. Comment out or remove that built-in `server { ... }` block in `/etc/nginx/nginx.conf` so `/etc/nginx/conf.d/certrobo.conf` can bind `listen 80 default_server;`.
+* **On Rocky Linux 10 / RHEL 10:** `/etc/nginx/nginx.conf` ships with a built-in `server { listen 80; listen [::]:80; ... }` block inside `http {}`. On a dedicated CertRobo host, comment out or remove that built-in `server { ... }` block (`sudo sed -i '/^    server {/,/^    }/s/^/#/' /etc/nginx/nginx.conf`) so `/etc/nginx/conf.d/certrobo.conf` can bind `listen 80 default_server;`.
 * **On Ubuntu 26.04 LTS:** `/etc/nginx/nginx.conf` includes both `/etc/nginx/conf.d/*.conf` and `/etc/nginx/sites-enabled/*`. On a dedicated CertRobo host, remove the stock `/etc/nginx/sites-enabled/default` symlink (`sudo rm -f /etc/nginx/sites-enabled/default`)—or, if the host serves other virtual hosts, remove `default_server` from the competing site configuration—before testing Nginx.
 
 Create `/etc/nginx/conf.d/certrobo.conf` (compatible with both Rocky Linux 10 and Ubuntu 26.04 LTS OpenSSL builds):
