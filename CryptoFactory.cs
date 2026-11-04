@@ -297,7 +297,7 @@ public class PkcsBuilder
                             zipStream.Write(Encoding.ASCII.GetBytes(normalizedKeyPem));
                         }
 
-                        // PKCS #12 leaf (passwordless with empty-password PBKDF2-HMAC-SHA256 integrity MAC for corruption detection;
+                        // PKCS #12 leaf (passwordless with empty-password PKCS#12 integrity MAC for corruption detection;
                         // does not provide key confidentiality because the empty password is public)
                         byte[] pkcs = BuildPasswordlessPkcs12WithIntegrityMac(p, cert, []);
                         zipStream.PutNextEntry(new ZipEntry(cn + ".p12"));

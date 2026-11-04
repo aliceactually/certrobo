@@ -321,7 +321,8 @@ public sealed class Pkcs12AndBackupCustodyTests : IDisposable
         Assert.Contains("PBES2", okOsslOut, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("PBKDF2", okOsslOut, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("aes-256-cbc", okOsslOut, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("MAC:", okOsslOut, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Iteration 100000", okOsslOut, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("MAC: sha256, Iteration 100000", okOsslOut, StringComparison.OrdinalIgnoreCase);
 
         // 7. Verify restoring the archive works normally and preserves local users, roles, and encrypted .p8.enc keys
         //    (which still require storageSecret, NOT the generated PKCS#12 passphrase)

@@ -305,13 +305,25 @@ public sealed class LocalSubordinateHierarchyRegressionTests : IDisposable
             PublishedCrlRecord tier1Crl = (await caService.GetLatestCrlAsync(caAuthorityId: tier1Id))!;
             PublishedCrlRecord tier2Crl = (await caService.GetLatestCrlAsync(caAuthorityId: tier2Id))!;
 
-            // 3. Verify complete 3-tier chain with OpenSSL `verify -crl_check_all`
+            // 3. Verify complete 3-tier chain with OpenSSL `verify -crl_check_all` (including controlled `-attime` checks)
             await VerifyFullChainWithOpenSslCrlCheckAllAsync(
                 rootPem,
                 [tier2Pem, tier1Pem],
                 [rootCrl.CrlPem, tier1Crl.CrlPem, tier2Crl.CrlPem],
                 leafPem,
-                expectSuccess: true);
+                expectSuccess: true,
+                atTimeUtc: DateTimeOffset.UtcNow.AddHours(1));
+
+            // If evaluated at a timestamp after the parent/tier CRLs' nextUpdate (e.g., +10 days when CRL validity is 7 days),
+            // OpenSSL `-crl_check_all -attime` must reject the chain with "CRL has expired"
+            await VerifyFullChainWithOpenSslCrlCheckAllAsync(
+                rootPem,
+                [tier2Pem, tier1Pem],
+                [rootCrl.CrlPem, tier1Crl.CrlPem, tier2Crl.CrlPem],
+                leafPem,
+                expectSuccess: false,
+                expectedFailureSubstring: "CRL has expired",
+                atTimeUtc: DateTimeOffset.UtcNow.AddDays(10));
 
             // 4. Revoke Tier 2 subordinate CA on Tier 1 parent CA and verify OpenSSL `-crl_check_all` rejects the chain
             RevocationOutcome subRevoke = await caService.SeedRevokedSerialAsync(
@@ -519,6 +531,26 @@ public sealed class LocalSubordinateHierarchyRegressionTests : IDisposable
         var (relSubCdp, relSubAia) = ExtractCdpAndAiaUrls(relSub.IssuerCertificatePem);
         Assert.Empty(relSubCdp);
         Assert.Empty(relSubAia);
+
+        // 4. Verify custom external parent CDP/AIA URLs are preserved on the subordinate certificate
+        //    while the child authority's own publication configuration uses the child's stable URLs.
+        CaAuthorityRecord customExtRoot = await relativeCaService.CreateSelfSignedOrIntermediateCaAsync(
+            "Custom External URL Root", "custom-root.contoso.com", "US", "WA", "Redmond", "Contoso", "PKI",
+            CertificateKeyFamily.Ecdsa, 256, 365, secret,
+            crlDistributionPointUrl: "http://external-cdp.contoso.com/custom-root.crl",
+            authorityIssuerCertUrl: "http://external-aia.contoso.com/custom-root.cer");
+        CaAuthorityRecord customChildSub = await relativeCaService.CreateSelfSignedOrIntermediateCaAsync(
+            "Custom Child Sub", "custom-sub.contoso.com", "US", "WA", "Redmond", "Contoso", "PKI",
+            CertificateKeyFamily.Ecdsa, 256, 180, secret,
+            crlDistributionPointUrl: "http://pki.contoso.com/ca.crl",
+            authorityIssuerCertUrl: "http://pki.contoso.com/ca.crt",
+            parentAuthority: customExtRoot,
+            parentPassphrase: secret);
+        var (customSubCdp, customSubAia) = ExtractCdpAndAiaUrls(customChildSub.IssuerCertificatePem);
+        Assert.Equal(["http://external-cdp.contoso.com/custom-root.crl"], customSubCdp);
+        Assert.Equal(["http://external-aia.contoso.com/custom-root.cer"], customSubAia);
+        Assert.Equal($"http://pki.contoso.com/authorities/{customChildSub.Id}/ca.crl", customChildSub.CrlDistributionPointUrl);
+        Assert.Equal($"http://pki.contoso.com/authorities/{customChildSub.Id}/issuer.crt", customChildSub.AuthorityIssuerCertUrl);
     }
 
     private static (IReadOnlyList<string> CdpUrls, IReadOnlyList<string> AiaUrls) ExtractCdpAndAiaUrls(string certPem)
@@ -660,7 +692,9 @@ public sealed class LocalSubordinateHierarchyRegressionTests : IDisposable
         IReadOnlyList<string> untrustedIntermediatesPem,
         IReadOnlyList<string> crlsPem,
         string leafPem,
-        bool expectSuccess)
+        bool expectSuccess,
+        string expectedFailureSubstring = "certificate revoked",
+        DateTimeOffset? atTimeUtc = null)
     {
         string dir = Path.Combine(_tempRoot, $"ossl-all-{Guid.NewGuid():N}");
         Directory.CreateDirectory(dir);
@@ -682,6 +716,11 @@ public sealed class LocalSubordinateHierarchyRegressionTests : IDisposable
         };
         psi.ArgumentList.Add("verify");
         psi.ArgumentList.Add("-crl_check_all");
+        if (atTimeUtc.HasValue)
+        {
+            psi.ArgumentList.Add("-attime");
+            psi.ArgumentList.Add(atTimeUtc.Value.ToUnixTimeSeconds().ToString());
+        }
         psi.ArgumentList.Add("-CAfile");
         psi.ArgumentList.Add(rootFile);
         psi.ArgumentList.Add("-untrusted");
@@ -704,7 +743,7 @@ public sealed class LocalSubordinateHierarchyRegressionTests : IDisposable
         else
         {
             Assert.NotEqual(0, proc.ExitCode);
-            Assert.Contains("certificate revoked", combined, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains(expectedFailureSubstring, combined, StringComparison.OrdinalIgnoreCase);
         }
     }
 

@@ -2,12 +2,6 @@ using CertRobo.Data;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
-using Org.BouncyCastle.Asn1.Nist;
-using Org.BouncyCastle.Asn1.Pkcs;
-using Org.BouncyCastle.Crypto;
-using Org.BouncyCastle.Pkcs;
-using Org.BouncyCastle.Security;
-using Org.BouncyCastle.X509;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -71,7 +65,7 @@ public sealed class BackupRestoreService(
 
     /// <summary>
     /// Creates a consistent state backup archive that also includes an explicitly opt-in, password-protected
-    /// PKCS#12 bundle (`PBES2-PBKDF2-HMAC-SHA256` + `AES-256-CBC` + `PBMAC1`/HMAC-SHA256, 100,000 iterations)
+    /// PKCS#12 bundle (`PBES2-PBKDF2-HMAC-SHA256` + `AES-256-CBC` + PKCS#12 `HMAC-SHA256` MAC, 100,000 iterations)
     /// for a selected locally managed Root CA. Requires an active Administrator account and unlocked CA key custody.
     /// Never logs, persists, or writes the generated 7-word EFF Diceware passphrase into the backup archive.
     /// </summary>
@@ -277,8 +271,7 @@ public sealed class BackupRestoreService(
         }
 
         byte[] encryptedKeyBytes = await File.ReadAllBytesAsync(authority.EncryptedPrivateKeyPath, cancellationToken);
-        AsymmetricKeyParameter bcPrivateKey;
-        byte[] exportedPkcs8 = [];
+        X509Certificate2 rootCertWithPrivateKey;
         try
         {
             if (rootCert.GetRSAPublicKey() != null)
@@ -289,7 +282,7 @@ public sealed class BackupRestoreService(
                 {
                     throw new CryptographicException($"Decrypted private key for CA '{authority.Name}' does not match its certificate public key.");
                 }
-                exportedPkcs8 = rsa.ExportPkcs8PrivateKey();
+                rootCertWithPrivateKey = rootCert.CopyWithPrivateKey(rsa);
             }
             else if (rootCert.GetECDsaPublicKey() != null)
             {
@@ -299,14 +292,12 @@ public sealed class BackupRestoreService(
                 {
                     throw new CryptographicException($"Decrypted private key for CA '{authority.Name}' does not match its certificate public key.");
                 }
-                exportedPkcs8 = ecdsa.ExportPkcs8PrivateKey();
+                rootCertWithPrivateKey = rootCert.CopyWithPrivateKey(ecdsa);
             }
             else
             {
                 throw new NotSupportedException($"Unsupported public key algorithm on CA '{authority.Name}'.");
             }
-
-            bcPrivateKey = PrivateKeyFactory.CreateKey(exportedPkcs8);
         }
         catch (CryptographicException ex)
         {
@@ -314,91 +305,73 @@ public sealed class BackupRestoreService(
                 $"Cannot create Root CA PKCS#12 for '{authority.Name}' (ID #{authority.Id}): failed to unlock or verify its encrypted private key.",
                 ex);
         }
-        finally
-        {
-            if (exportedPkcs8.Length > 0)
-            {
-                CryptographicOperations.ZeroMemory(exportedPkcs8);
-            }
-        }
 
-        X509CertificateParser bcParser = new();
-        Org.BouncyCastle.X509.X509Certificate bcRootCert = bcParser.ReadCertificate(rootCert.RawData);
-        List<X509CertificateEntry> chainEntries = [new X509CertificateEntry(bcRootCert)];
-
-        if (!string.IsNullOrWhiteSpace(authority.ChainCertificatesPem))
-        {
-            List<X509Certificate2> extraChain = CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
-                null,
-                authority.ChainCertificatesPem,
-                "root CA chain");
-            try
-            {
-                string rootThumbprint = rootCert.GetCertHashString(HashAlgorithmName.SHA256);
-                foreach (X509Certificate2 extra in extraChain)
-                {
-                    if (!extra.GetCertHashString(HashAlgorithmName.SHA256).Equals(rootThumbprint, StringComparison.OrdinalIgnoreCase))
-                    {
-                        chainEntries.Add(new X509CertificateEntry(bcParser.ReadCertificate(extra.RawData)));
-                    }
-                }
-            }
-            finally
-            {
-                foreach (X509Certificate2 extra in extraChain)
-                {
-                    extra.Dispose();
-                }
-            }
-        }
-
-        // Modern interoperable PKCS#12 profile: PBES2 + PBKDF2-HMAC-SHA256 + AES-256-CBC for key & cert bags,
-        // and PBMAC1 / PBKDF2-HMAC-SHA256 integrity MAC.
-        Pkcs12StoreBuilder storeBuilder = new();
-        storeBuilder.SetUseDerEncoding(true);
-        storeBuilder.SetKeyAlgorithm(
-            NistObjectIdentifiers.IdAes256Cbc,
-            PkcsObjectIdentifiers.IdHmacWithSha256);
-        storeBuilder.SetCertAlgorithm(
-            NistObjectIdentifiers.IdAes256Cbc,
-            PkcsObjectIdentifiers.IdHmacWithSha256);
-
-        Pkcs12Store store = storeBuilder.Build();
-        string friendlyAlias = string.IsNullOrWhiteSpace(authority.Name) ? "CertRobo Root CA" : authority.Name.Trim();
-        store.SetKeyEntry(friendlyAlias, new AsymmetricKeyEntry(bcPrivateKey), chainEntries.ToArray());
-
-        byte[] p12Bytes;
-        using (MemoryStream ms = new())
-        {
-            store.Save(ms, pkcs12Passphrase.ToCharArray(), new SecureRandom());
-            p12Bytes = ms.ToArray();
-        }
-
-        // Immediately verify round-trip decryption, MAC check, and key correspondence via .NET X509CertificateLoader
-        X509Certificate2Collection loadedCollection = X509CertificateLoader.LoadPkcs12Collection(
-            p12Bytes,
-            pkcs12Passphrase,
-            X509KeyStorageFlags.Exportable);
+        List<X509Certificate2> extraChain = [];
         try
         {
-            X509Certificate2? loadedWithKey = loadedCollection.FirstOrDefault(c => c.HasPrivateKey);
-            if (loadedWithKey == null
-                || !loadedWithKey.GetCertHashString(HashAlgorithmName.SHA256).Equals(
-                    rootCert.GetCertHashString(HashAlgorithmName.SHA256),
-                    StringComparison.OrdinalIgnoreCase))
+            using (rootCertWithPrivateKey)
             {
-                throw new InvalidOperationException("Generated Root CA PKCS#12 failed post-creation verification.");
+                X509Certificate2Collection exportCollection = [rootCertWithPrivateKey];
+
+                if (!string.IsNullOrWhiteSpace(authority.ChainCertificatesPem))
+                {
+                    extraChain = CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
+                        null,
+                        authority.ChainCertificatesPem,
+                        "root CA chain");
+                    string rootThumbprint = rootCert.GetCertHashString(HashAlgorithmName.SHA256);
+                    foreach (X509Certificate2 extra in extraChain)
+                    {
+                        if (!extra.GetCertHashString(HashAlgorithmName.SHA256).Equals(rootThumbprint, StringComparison.OrdinalIgnoreCase))
+                        {
+                            exportCollection.Add(extra);
+                        }
+                    }
+                }
+
+                // Modern interoperable PKCS#12 profile: PBES2 + PBKDF2-HMAC-SHA256 + AES-256-CBC (100,000 iterations)
+                // for key & cert bags, and PKCS#12 HMAC-SHA256 integrity MAC (100,000 iterations).
+                PbeParameters pbeParameters = new(
+                    PbeEncryptionAlgorithm.Aes256Cbc,
+                    HashAlgorithmName.SHA256,
+                    RootCaPkcs12IterationCount);
+
+                byte[] p12Bytes = exportCollection.ExportPkcs12(pbeParameters, pkcs12Passphrase);
+
+                // Immediately verify round-trip decryption, MAC check, and key correspondence via .NET X509CertificateLoader
+                X509Certificate2Collection loadedCollection = X509CertificateLoader.LoadPkcs12Collection(
+                    p12Bytes,
+                    pkcs12Passphrase,
+                    X509KeyStorageFlags.Exportable);
+                try
+                {
+                    X509Certificate2? loadedWithKey = loadedCollection.FirstOrDefault(c => c.HasPrivateKey);
+                    if (loadedWithKey == null
+                        || !loadedWithKey.GetCertHashString(HashAlgorithmName.SHA256).Equals(
+                            rootCert.GetCertHashString(HashAlgorithmName.SHA256),
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException("Generated Root CA PKCS#12 failed post-creation verification.");
+                    }
+                }
+                finally
+                {
+                    foreach (X509Certificate2 c in loadedCollection)
+                    {
+                        c.Dispose();
+                    }
+                }
+
+                return p12Bytes;
             }
         }
         finally
         {
-            foreach (X509Certificate2 c in loadedCollection)
+            foreach (X509Certificate2 extra in extraChain)
             {
-                c.Dispose();
+                extra.Dispose();
             }
         }
-
-        return p12Bytes;
     }
 
     private async Task<byte[]> CreateBackupZipCoreAsync(
