@@ -33,7 +33,8 @@ public sealed class BackupRestoreService(
         string dataProtectionKeysDir,
         CancellationToken cancellationToken = default)
     {
-        string tempSnapshotDb = Path.Combine(Path.GetTempPath(), $"certrobo-backup-{Guid.NewGuid():N}.db");
+        string tempStagingDir = CreatePrivateStagingDirectory();
+        string tempSnapshotDb = Path.Combine(tempStagingDir, "certrobo.db");
         IAsyncDisposable lifecycleLock = await CertificateAuthorityService.AcquireLifecycleLockAsync(
             caOptions.StorageDirectory,
             cancellationToken,
@@ -51,10 +52,7 @@ public sealed class BackupRestoreService(
         {
             try
             {
-                if (File.Exists(tempSnapshotDb))
-                {
-                    File.Delete(tempSnapshotDb);
-                }
+                DeleteStagingDirectoryBestEffort(tempStagingDir, tempSnapshotDb);
             }
             finally
             {
@@ -85,7 +83,8 @@ public sealed class BackupRestoreService(
 
         await VerifyAdministratorAuthorizationAsync(requestingUserId, expectedSecurityStamp, cancellationToken);
 
-        string tempSnapshotDb = Path.Combine(Path.GetTempPath(), $"certrobo-backup-{Guid.NewGuid():N}.db");
+        string tempStagingDir = CreatePrivateStagingDirectory();
+        string tempSnapshotDb = Path.Combine(tempStagingDir, "certrobo.db");
         IAsyncDisposable lifecycleLock = await CertificateAuthorityService.AcquireLifecycleLockAsync(
             caOptions.StorageDirectory,
             cancellationToken,
@@ -157,10 +156,7 @@ public sealed class BackupRestoreService(
         {
             try
             {
-                if (File.Exists(tempSnapshotDb))
-                {
-                    File.Delete(tempSnapshotDb);
-                }
+                DeleteStagingDirectoryBestEffort(tempStagingDir, tempSnapshotDb);
             }
             finally
             {
@@ -381,6 +377,8 @@ public sealed class BackupRestoreService(
         (string EntryPath, byte[] Content)? optionalExtraEntry,
         CancellationToken cancellationToken)
     {
+        EnsureEmptyPrivateFileCreated(tempSnapshotDb);
+
         await using (CertRoboDbContext db = await dbFactory.CreateDbContextAsync(cancellationToken))
         {
             string vacuumSql = "VACUUM INTO '" + tempSnapshotDb.Replace("'", "''") + "';";
@@ -389,7 +387,7 @@ public sealed class BackupRestoreService(
 #pragma warning restore EF1002
         }
 
-        RestrictFilePermissionsIfUnix(tempSnapshotDb);
+        CertRoboDbContext.RestrictSqliteDatabaseFilePermissionsIfUnix(tempSnapshotDb);
 
         using MemoryStream ms = new();
         using (ZipArchive zip = new(ms, ZipArchiveMode.Create, leaveOpen: true))
@@ -444,9 +442,9 @@ public sealed class BackupRestoreService(
         {
             SqliteConnection.ClearAllPools();
 
-            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(targetSqliteFilePath))!);
-            Directory.CreateDirectory(targetCaStorageDir);
-            Directory.CreateDirectory(targetDataProtectionKeysDir);
+            EnsurePrivateDirectoryExists(Path.GetDirectoryName(Path.GetFullPath(targetSqliteFilePath))!);
+            EnsurePrivateDirectoryExists(targetCaStorageDir);
+            EnsurePrivateDirectoryExists(targetDataProtectionKeysDir);
 
             using MemoryStream ms = new(archiveBytes);
             using ZipArchive zip = new(ms, ZipArchiveMode.Read);
@@ -455,22 +453,30 @@ public sealed class BackupRestoreService(
             {
                 if (entry.FullName == "database/certrobo.db")
                 {
-                    entry.ExtractToFile(targetSqliteFilePath, overwrite: true);
-                    RestrictFilePermissionsIfUnix(targetSqliteFilePath);
+                    foreach (string staleSuffix in new[] { "-wal", "-shm", "-journal" })
+                    {
+                        string staleCompanion = targetSqliteFilePath + staleSuffix;
+                        if (File.Exists(staleCompanion))
+                        {
+                            RestrictFilePermissionsIfUnix(staleCompanion);
+                            File.Delete(staleCompanion);
+                        }
+                    }
+
+                    ExtractZipEntryToPrivateFile(entry, targetSqliteFilePath);
+                    CertRoboDbContext.RestrictSqliteDatabaseFilePermissionsIfUnix(targetSqliteFilePath);
                 }
                 else if (entry.FullName.StartsWith("ca/", StringComparison.Ordinal) && entry.FullName.EndsWith(".p8.enc", StringComparison.Ordinal))
                 {
                     string fileName = Path.GetFileName(entry.FullName);
                     string destPath = Path.Combine(targetCaStorageDir, fileName);
-                    entry.ExtractToFile(destPath, overwrite: true);
-                    RestrictFilePermissionsIfUnix(destPath);
+                    ExtractZipEntryToPrivateFile(entry, destPath);
                 }
                 else if (entry.FullName.StartsWith("dataprotection/", StringComparison.Ordinal) && entry.FullName.EndsWith(".xml", StringComparison.Ordinal))
                 {
                     string fileName = Path.GetFileName(entry.FullName);
                     string destPath = Path.Combine(targetDataProtectionKeysDir, fileName);
-                    entry.ExtractToFile(destPath, overwrite: true);
-                    RestrictFilePermissionsIfUnix(destPath);
+                    ExtractZipEntryToPrivateFile(entry, destPath);
                 }
             }
 
@@ -494,6 +500,7 @@ public sealed class BackupRestoreService(
 
         RewriteTableKeyPaths(connection, "CaAuthorities");
         RewriteTableKeyPaths(connection, "PendingCaEnrollments");
+        CertRoboDbContext.RestrictSqliteDatabaseFilePermissionsIfUnix(sqliteFilePath);
 
         void RewriteTableKeyPaths(SqliteConnection db, string tableName)
         {
@@ -525,6 +532,197 @@ public sealed class BackupRestoreService(
                 update.Parameters.AddWithValue("$id", id);
                 update.ExecuteNonQuery();
             }
+        }
+    }
+
+    public static async Task WritePrivateFileBytesAsync(
+        string filePath,
+        byte[] content,
+        CancellationToken cancellationToken = default)
+    {
+        string fullPath = Path.GetFullPath(filePath);
+        string? parentDir = Path.GetDirectoryName(fullPath);
+        if (!string.IsNullOrEmpty(parentDir))
+        {
+            Directory.CreateDirectory(parentDir);
+        }
+
+        if (File.Exists(fullPath))
+        {
+            RestrictFilePermissionsIfUnix(fullPath);
+            File.Delete(fullPath);
+        }
+
+        FileStreamOptions streamOptions = new()
+        {
+            Mode = FileMode.CreateNew,
+            Access = FileAccess.Write,
+            Share = FileShare.None
+        };
+        if (!OperatingSystem.IsWindows())
+        {
+            streamOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        }
+
+        await using (FileStream outputStream = File.Open(fullPath, streamOptions))
+        {
+            RestrictFilePermissionsIfUnix(fullPath);
+            await outputStream.WriteAsync(content, cancellationToken);
+            await outputStream.FlushAsync(cancellationToken);
+        }
+
+        RestrictFilePermissionsIfUnix(fullPath);
+    }
+
+    public static void EnsureEmptyPrivateFileCreated(string filePath)
+    {
+        string fullPath = Path.GetFullPath(filePath);
+        string? parentDir = Path.GetDirectoryName(fullPath);
+        if (!string.IsNullOrEmpty(parentDir))
+        {
+            Directory.CreateDirectory(parentDir);
+        }
+
+        foreach (string suffix in new[] { "", "-wal", "-shm", "-journal" })
+        {
+            string candidate = fullPath + suffix;
+            if (File.Exists(candidate))
+            {
+                RestrictFilePermissionsIfUnix(candidate);
+                File.Delete(candidate);
+            }
+        }
+
+        FileStreamOptions streamOptions = new()
+        {
+            Mode = FileMode.CreateNew,
+            Access = FileAccess.ReadWrite,
+            Share = FileShare.ReadWrite
+        };
+        if (!OperatingSystem.IsWindows())
+        {
+            streamOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        }
+
+        using (File.Open(fullPath, streamOptions))
+        {
+        }
+
+        RestrictFilePermissionsIfUnix(fullPath);
+    }
+
+    private static void ExtractZipEntryToPrivateFile(ZipArchiveEntry entry, string destinationPath)
+    {
+        string fullPath = Path.GetFullPath(destinationPath);
+        string? parentDir = Path.GetDirectoryName(fullPath);
+        if (!string.IsNullOrEmpty(parentDir))
+        {
+            Directory.CreateDirectory(parentDir);
+        }
+
+        if (File.Exists(fullPath))
+        {
+            RestrictFilePermissionsIfUnix(fullPath);
+            File.Delete(fullPath);
+        }
+
+        FileStreamOptions streamOptions = new()
+        {
+            Mode = FileMode.CreateNew,
+            Access = FileAccess.Write,
+            Share = FileShare.None
+        };
+        if (!OperatingSystem.IsWindows())
+        {
+            streamOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        }
+
+        try
+        {
+            using FileStream outputStream = File.Open(fullPath, streamOptions);
+            RestrictFilePermissionsIfUnix(fullPath);
+            using Stream entryStream = entry.Open();
+            entryStream.CopyTo(outputStream);
+            outputStream.Flush();
+        }
+        catch
+        {
+            try
+            {
+                if (File.Exists(fullPath))
+                {
+                    File.Delete(fullPath);
+                }
+            }
+            catch
+            {
+            }
+            throw;
+        }
+
+        RestrictFilePermissionsIfUnix(fullPath);
+    }
+
+    private static string CreatePrivateStagingDirectory()
+    {
+        string stagingDir = Path.Combine(Path.GetTempPath(), $"certrobo-backup-{Guid.NewGuid():N}");
+        EnsurePrivateDirectoryExists(stagingDir);
+        return stagingDir;
+    }
+
+    private static void EnsurePrivateDirectoryExists(string directoryPath)
+    {
+        if (string.IsNullOrWhiteSpace(directoryPath))
+        {
+            return;
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            Directory.CreateDirectory(directoryPath);
+            return;
+        }
+
+        bool existed = Directory.Exists(directoryPath);
+        Directory.CreateDirectory(
+            directoryPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        if (!existed)
+        {
+            try
+            {
+                File.SetUnixFileMode(
+                    directoryPath,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static void DeleteStagingDirectoryBestEffort(string stagingDir, string snapshotFilePath)
+    {
+        try
+        {
+            if (File.Exists(snapshotFilePath))
+            {
+                File.Delete(snapshotFilePath);
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            if (Directory.Exists(stagingDir))
+            {
+                Directory.Delete(stagingDir, recursive: true);
+            }
+        }
+        catch
+        {
         }
     }
 

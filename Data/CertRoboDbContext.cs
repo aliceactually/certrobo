@@ -1,7 +1,9 @@
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using System.ComponentModel.DataAnnotations;
+using System.Data.Common;
 
 namespace CertRobo.Data;
 
@@ -434,9 +436,169 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
             .HasIndex(p => p.Status);
     }
 
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+    {
+        base.OnConfiguring(optionsBuilder);
+        if (!OperatingSystem.IsWindows())
+        {
+            optionsBuilder.AddInterceptors(SqliteUnixFileModeInterceptor.Instance);
+        }
+    }
+
+    public static void EnsureSqliteDatabasePreCreatedWithPrivatePermissionsIfUnix(string? sqliteFilePath)
+    {
+        if (OperatingSystem.IsWindows()
+            || string.IsNullOrWhiteSpace(sqliteFilePath)
+            || sqliteFilePath.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
+            || sqliteFilePath.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        try
+        {
+            string fullPath = Path.GetFullPath(sqliteFilePath);
+            string? dir = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir) && !File.Exists(fullPath))
+            {
+                using (File.Open(
+                    fullPath,
+                    new FileStreamOptions
+                    {
+                        Mode = FileMode.OpenOrCreate,
+                        Access = FileAccess.ReadWrite,
+                        Share = FileShare.ReadWrite,
+                        UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite
+                    }))
+                {
+                }
+            }
+
+            RestrictSqliteDatabaseFilePermissionsIfUnix(fullPath);
+        }
+        catch
+        {
+        }
+    }
+
+    public static void RestrictSqliteDatabaseFilePermissionsIfUnix(string? sqliteFilePath)
+    {
+        if (OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(sqliteFilePath))
+        {
+            return;
+        }
+
+        string[] suffixes = ["", "-wal", "-shm", "-journal"];
+        foreach (string suffix in suffixes)
+        {
+            string candidate = sqliteFilePath + suffix;
+            try
+            {
+                if (File.Exists(candidate))
+                {
+                    File.SetUnixFileMode(candidate, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private sealed class SqliteUnixFileModeInterceptor : DbConnectionInterceptor, ISaveChangesInterceptor
+    {
+        public static readonly SqliteUnixFileModeInterceptor Instance = new();
+
+        public override InterceptionResult ConnectionOpening(
+            DbConnection connection,
+            ConnectionEventData eventData,
+            InterceptionResult result)
+        {
+            EnsureSqliteDatabasePreCreatedWithPrivatePermissionsIfUnix(connection.DataSource);
+            return base.ConnectionOpening(connection, eventData, result);
+        }
+
+        public override ValueTask<InterceptionResult> ConnectionOpeningAsync(
+            DbConnection connection,
+            ConnectionEventData eventData,
+            InterceptionResult result,
+            CancellationToken cancellationToken = default)
+        {
+            EnsureSqliteDatabasePreCreatedWithPrivatePermissionsIfUnix(connection.DataSource);
+            return base.ConnectionOpeningAsync(connection, eventData, result, cancellationToken);
+        }
+
+        public override void ConnectionOpened(DbConnection connection, ConnectionEndEventData eventData)
+        {
+            RestrictSqliteDatabaseFilePermissionsIfUnix(connection.DataSource);
+            base.ConnectionOpened(connection, eventData);
+        }
+
+        public override Task ConnectionOpenedAsync(
+            DbConnection connection,
+            ConnectionEndEventData eventData,
+            CancellationToken cancellationToken = default)
+        {
+            RestrictSqliteDatabaseFilePermissionsIfUnix(connection.DataSource);
+            return base.ConnectionOpenedAsync(connection, eventData, cancellationToken);
+        }
+
+        public int SavedChanges(SaveChangesCompletedEventData eventData, int result)
+        {
+            TryRestrictContextDatabase(eventData.Context);
+            return result;
+        }
+
+        public ValueTask<int> SavedChangesAsync(
+            SaveChangesCompletedEventData eventData,
+            int result,
+            CancellationToken cancellationToken = default)
+        {
+            TryRestrictContextDatabase(eventData.Context);
+            return new ValueTask<int>(result);
+        }
+
+        private static void TryRestrictContextDatabase(DbContext? context)
+        {
+            if (context == null)
+            {
+                return;
+            }
+
+            try
+            {
+                RestrictSqliteDatabaseFilePermissionsIfUnix(context.Database.GetDbConnection().DataSource);
+            }
+            catch
+            {
+            }
+        }
+    }
+
     public async Task EnsureSchemaUpgradedAsync(CancellationToken cancellationToken = default)
     {
+        try
+        {
+            EnsureSqliteDatabasePreCreatedWithPrivatePermissionsIfUnix(Database.GetDbConnection().DataSource);
+        }
+        catch
+        {
+        }
+
         await Database.EnsureCreatedAsync(cancellationToken);
+        try
+        {
+            string? dataSource = Database.GetDbConnection().DataSource;
+            RestrictSqliteDatabaseFilePermissionsIfUnix(dataSource);
+        }
+        catch
+        {
+        }
 
         const string createPendingTableSql = """
             CREATE TABLE IF NOT EXISTS "PendingCaEnrollments" (
@@ -524,5 +686,14 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
                 WHERE "Status" NOT IN (5, 6);
             """,
             cancellationToken);
+
+        try
+        {
+            string? dataSource = Database.GetDbConnection().DataSource;
+            RestrictSqliteDatabaseFilePermissionsIfUnix(dataSource);
+        }
+        catch
+        {
+        }
     }
 }

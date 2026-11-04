@@ -12,6 +12,41 @@ using Radzen;
 
 var builder = WebApplication.CreateBuilder(args);
 
+string[] cliCommandFlags =
+[
+    "--restore",
+    "--reset-admin-password",
+    "--backup",
+    "--inspect-legacy-settings",
+    "--bootstrap-admin",
+    "--init-ca",
+    "--request-external-ca",
+    "--complete-external-ca",
+    "--verify-ca-custody",
+    "--reprotect-ca-keys",
+    "--refresh-crls",
+    "--issue-csr",
+    "--export-issued"
+];
+bool isCliCommandMode = args.Any(a => cliCommandFlags.Contains(a, StringComparer.OrdinalIgnoreCase));
+bool verboseDiagnostics = args.Contains("--verbose", StringComparer.OrdinalIgnoreCase)
+    || string.Equals(Environment.GetEnvironmentVariable("CERTROBO_CLI_VERBOSE"), "1", StringComparison.OrdinalIgnoreCase)
+    || string.Equals(
+        builder.Configuration["Logging:LogLevel:Microsoft.EntityFrameworkCore.Database.Command"],
+        "Information",
+        StringComparison.OrdinalIgnoreCase);
+
+if (isCliCommandMode && !verboseDiagnostics)
+{
+    builder.Logging.AddFilter("Microsoft.EntityFrameworkCore.Database.Command", LogLevel.Warning);
+    builder.Logging.AddFilter("Microsoft.EntityFrameworkCore", LogLevel.Warning);
+    builder.Logging.AddFilter("Microsoft.AspNetCore.DataProtection", LogLevel.Warning);
+}
+else if (verboseDiagnostics)
+{
+    builder.Logging.AddFilter("Microsoft.EntityFrameworkCore.Database.Command", LogLevel.Information);
+}
+
 string appDataDir = builder.Configuration["CertRobo:DataDirectory"]
     ?? Path.Combine(builder.Environment.ContentRootPath, "App_Data");
 Directory.CreateDirectory(appDataDir);
@@ -180,7 +215,7 @@ using (IServiceScope scope = app.Services.CreateScope())
             {
                 Directory.CreateDirectory(parentDir);
             }
-            await File.WriteAllBytesAsync(outputZipPath, archiveBytes);
+            await BackupRestoreService.WritePrivateFileBytesAsync(outputZipPath, archiveBytes);
             Console.WriteLine($"Consistent backup written to '{outputZipPath}' ({archiveBytes.Length} bytes).");
             return;
         }
@@ -228,7 +263,9 @@ using (IServiceScope scope = app.Services.CreateScope())
         }
         string adminUser = args[bootstrapIdx + 1];
         string adminPass = args[bootstrapIdx + 2];
-        string pattern = bootstrapIdx + 3 < args.Length ? args[bootstrapIdx + 3] : "*";
+        string pattern = bootstrapIdx + 3 < args.Length && !args[bootstrapIdx + 3].StartsWith("--", StringComparison.Ordinal)
+            ? args[bootstrapIdx + 3]
+            : "*";
         var (ok, err, _) = await accountService.BootstrapFirstAdminAsync(adminUser, adminPass, null, pattern);
         if (!ok)
         {
@@ -576,20 +613,32 @@ using (IServiceScope scope = app.Services.CreateScope())
     }
 
     // Handle CLI CSR issuance:
-    // dotnet run -- --issue-csr <username> <csrPath> <outCertPath> [<outChainPath>]
+    // dotnet run -- --issue-csr <username> <csrPath> <outCertPath> [<outTlsServerChainPath>] [--root-out <outRootCertPath>] [--fullchain-out <outFullChainPath>]
     int issueIdx = Array.IndexOf(args, "--issue-csr");
     if (issueIdx >= 0)
     {
         if (issueIdx + 3 >= args.Length)
         {
-            Console.Error.WriteLine("Usage: --issue-csr <username> <csrPath> <outCertPath> [<outChainPath>]");
+            Console.Error.WriteLine("Usage: --issue-csr <username> <csrPath> <outCertPath> [<outTlsServerChainPath>] [--root-out <outRootCertPath>] [--fullchain-out <outFullChainPath>]");
             Environment.ExitCode = 1;
             return;
         }
         string reqUser = args[issueIdx + 1];
         string csrPath = args[issueIdx + 2];
         string outCertPath = args[issueIdx + 3];
-        string? outChainPath = issueIdx + 4 < args.Length ? args[issueIdx + 4] : null;
+        string? outChainPath = issueIdx + 4 < args.Length && !args[issueIdx + 4].StartsWith("--", StringComparison.Ordinal)
+            ? args[issueIdx + 4]
+            : null;
+        string? outFullChainPath = null;
+        string? fullChainOptErr = null;
+        if (!TryExtractOptionValue(args, "--root-out", out string? outRootPath, out string? rootOptErr)
+            || !TryExtractOptionValue(args, "--fullchain-out", out outFullChainPath, out fullChainOptErr))
+        {
+            Console.Error.WriteLine(rootOptErr ?? fullChainOptErr);
+            Environment.ExitCode = 1;
+            return;
+        }
+        bool forceReissue = args.Contains("--force-reissue", StringComparer.OrdinalIgnoreCase);
 
         UserManager<ApplicationUser> userMgr = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
         ApplicationUser? user = await userMgr.FindByNameAsync(reqUser);
@@ -600,17 +649,84 @@ using (IServiceScope scope = app.Services.CreateScope())
             return;
         }
 
-        System.IO.FileInfo csrInfo = new(csrPath);
-        if (!csrInfo.Exists || csrInfo.Length > IssuancePolicyService.MaxCsrPemLength)
+        string csrPem;
+        try
         {
-            Console.Error.WriteLine($"Issuance failed: CSR file '{csrPath}' does not exist or exceeds the maximum permitted size ({IssuancePolicyService.MaxCsrPemLength} bytes).");
+            System.IO.FileInfo csrInfo = new(csrPath);
+            if (!csrInfo.Exists || csrInfo.Length > IssuancePolicyService.MaxCsrPemLength)
+            {
+                Console.Error.WriteLine($"Issuance failed: CSR file '{csrPath}' does not exist or exceeds the maximum permitted size ({IssuancePolicyService.MaxCsrPemLength} bytes).");
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            csrPem = await File.ReadAllTextAsync(csrPath);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Issuance failed: could not read CSR file '{csrPath}': {ex.Message}");
             Environment.ExitCode = 1;
             return;
         }
 
-        string csrPem = await File.ReadAllTextAsync(csrPath);
+        List<string> destinationPaths = [outCertPath];
+        if (!string.IsNullOrWhiteSpace(outChainPath))
+        {
+            destinationPaths.Add(outChainPath);
+        }
+        if (!string.IsNullOrWhiteSpace(outRootPath))
+        {
+            destinationPaths.Add(outRootPath);
+        }
+        if (!string.IsNullOrWhiteSpace(outFullChainPath))
+        {
+            destinationPaths.Add(outFullChainPath);
+        }
+
+        // 1. Check whether an unexpired Issued certificate for the exact same CSR public key and identities already exists
+        //    so retrying a failed output write recovers the existing certificate without silent duplicate issuance.
         CertificateAuthorityService caService = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
-        IssuanceOutcome outcome = await caService.IssueCertificateFromCsrAsync(user.Id, csrPem);
+        IssuanceOutcome? recoveredExisting = !forceReissue
+            ? await TryRecoverExistingIssuedCertificateForCsrAsync(db, caService, user, csrPem)
+            : null;
+        if (recoveredExisting != null)
+        {
+            if (!TryPreflightDestinationPaths(destinationPaths, out string? recoveryPreflightErr))
+            {
+                Console.Error.WriteLine(
+                    $"Output write failed for already-issued certificate serial {recoveredExisting.Record!.SerialNumberHex} ('{recoveredExisting.Record.CommonName}'): {recoveryPreflightErr} " +
+                    $"Re-run with a writable output path or run '--export-issued {recoveredExisting.Record.SerialNumberHex} <outCertPath> [<outTlsServerChainPath>]' to write the existing certificate without re-issuing.");
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            if (!await TryWriteIssuedCertificateOutputsAsync(
+                    recoveredExisting,
+                    outCertPath,
+                    outChainPath,
+                    outRootPath,
+                    outFullChainPath))
+            {
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            Console.WriteLine($"Recovered already-issued certificate serial {recoveredExisting.Record!.SerialNumberHex} for '{recoveredExisting.Record.CommonName}' -> {outCertPath}");
+            return;
+        }
+
+        // 2. Preflight destination writability before allocating a serial or signing a new certificate
+        if (!TryPreflightDestinationPaths(destinationPaths, out string? preflightErr))
+        {
+            Console.Error.WriteLine($"Issuance aborted before signing: {preflightErr}");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        IssuanceOutcome outcome = await caService.IssueCertificateFromCsrAsync(
+            user.Id,
+            csrPem,
+            recoverExistingForSameCsr: !forceReissue);
         if (!outcome.Succeeded)
         {
             Console.Error.WriteLine($"Issuance failed: {outcome.ErrorMessage}");
@@ -618,12 +734,121 @@ using (IServiceScope scope = app.Services.CreateScope())
             return;
         }
 
-        await File.WriteAllTextAsync(outCertPath, outcome.CertificatePem);
-        if (!string.IsNullOrEmpty(outChainPath))
+        if (!await TryWriteIssuedCertificateOutputsAsync(
+                outcome,
+                outCertPath,
+                outChainPath,
+                outRootPath,
+                outFullChainPath))
         {
-            await File.WriteAllTextAsync(outChainPath, outcome.FullChainPem);
+            Environment.ExitCode = 1;
+            return;
         }
-        Console.WriteLine($"Issued certificate serial {outcome.Record!.SerialNumberHex} for '{outcome.Record.CommonName}' -> {outCertPath}");
+
+        if (outcome.WasRecoveredExisting)
+        {
+            Console.WriteLine($"Recovered already-issued certificate serial {outcome.Record!.SerialNumberHex} for '{outcome.Record.CommonName}' -> {outCertPath}");
+        }
+        else
+        {
+            Console.WriteLine($"Issued certificate serial {outcome.Record!.SerialNumberHex} for '{outcome.Record.CommonName}' -> {outCertPath}");
+        }
+        return;
+    }
+
+    // Handle CLI recovery/export of an already-issued certificate by serial number (hex) or record ID:
+    // dotnet run -- --export-issued <serialHexOrId> <outCertPath> [<outTlsServerChainPath>] [--root-out <outRootCertPath>] [--fullchain-out <outFullChainPath>]
+    int exportIssuedIdx = Array.IndexOf(args, "--export-issued");
+    if (exportIssuedIdx >= 0)
+    {
+        if (exportIssuedIdx + 2 >= args.Length)
+        {
+            Console.Error.WriteLine("Usage: --export-issued <serialHexOrRecordId> <outCertPath> [<outTlsServerChainPath>] [--root-out <outRootCertPath>] [--fullchain-out <outFullChainPath>]");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        string selector = args[exportIssuedIdx + 1].Trim();
+        string outCertPath = args[exportIssuedIdx + 2];
+        string? outChainPath = exportIssuedIdx + 3 < args.Length && !args[exportIssuedIdx + 3].StartsWith("--", StringComparison.Ordinal)
+            ? args[exportIssuedIdx + 3]
+            : null;
+        string? outFullChainPath = null;
+        string? fullChainOptErr = null;
+        if (!TryExtractOptionValue(args, "--root-out", out string? outRootPath, out string? rootOptErr)
+            || !TryExtractOptionValue(args, "--fullchain-out", out outFullChainPath, out fullChainOptErr))
+        {
+            Console.Error.WriteLine(rootOptErr ?? fullChainOptErr);
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        IssuedCertificateRecord? record = null;
+        if (CertificateAuthorityService.TryNormalizePositiveSerialHex(selector, out var targetBi, out string canonicalHex, out _))
+        {
+            List<IssuedCertificateRecord> candidates = await db.IssuedCertificates
+                .AsNoTracking()
+                .Where(c => c.Status == IssuanceStatus.Issued || c.Status == IssuanceStatus.Revoked)
+                .OrderByDescending(c => c.Id)
+                .ToListAsync();
+            record = candidates.FirstOrDefault(c =>
+                string.Equals(c.SerialNumberHex, canonicalHex, StringComparison.OrdinalIgnoreCase)
+                || (CertificateAuthorityService.TryNormalizePositiveSerialHex(c.SerialNumberHex, out var cBi, out _, out _)
+                    && cBi.Equals(targetBi)));
+        }
+
+        if (record == null && int.TryParse(selector, out int parsedId))
+        {
+            record = await db.IssuedCertificates
+                .AsNoTracking()
+                .FirstOrDefaultAsync(c => c.Id == parsedId && !string.IsNullOrEmpty(c.CertificatePem));
+        }
+
+        if (record == null || string.IsNullOrWhiteSpace(record.CertificatePem))
+        {
+            Console.Error.WriteLine($"Export failed: no issued certificate matching '{selector}' was found.");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        CertificateAuthorityService caService = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
+        string issuerChainPem = !string.IsNullOrWhiteSpace(record.ChainPem)
+            ? record.ChainPem
+            : (await caService.ResolveCertificateChainPemAsync(record.CertificatePem) ?? string.Empty);
+
+        IssuanceOutcome exportOutcome = new(
+            true,
+            null,
+            record,
+            record.CertificatePem,
+            record.CertificatePem + issuerChainPem,
+            CertificateAuthorityService.BuildTlsServerChainPem(record.CertificatePem, issuerChainPem),
+            CertificateAuthorityService.ExtractTrustAnchorRootPem(issuerChainPem));
+
+        List<string> destinationPaths = [outCertPath];
+        if (!string.IsNullOrWhiteSpace(outChainPath)) destinationPaths.Add(outChainPath);
+        if (!string.IsNullOrWhiteSpace(outRootPath)) destinationPaths.Add(outRootPath);
+        if (!string.IsNullOrWhiteSpace(outFullChainPath)) destinationPaths.Add(outFullChainPath);
+
+        if (!TryPreflightDestinationPaths(destinationPaths, out string? preflightErr))
+        {
+            Console.Error.WriteLine($"Export failed for certificate serial {record.SerialNumberHex}: {preflightErr}");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        if (!await TryWriteIssuedCertificateOutputsAsync(
+                exportOutcome,
+                outCertPath,
+                outChainPath,
+                outRootPath,
+                outFullChainPath))
+        {
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        Console.WriteLine($"Exported issued certificate serial {record.SerialNumberHex} for '{record.CommonName}' -> {outCertPath}");
         return;
     }
 }
@@ -647,5 +872,236 @@ app.MapCertRoboEndpoints();
 app.MapBlazorHub();
 app.MapFallbackToPage("/_Host");
 app.Run();
+
+static bool TryExtractOptionValue(string[] cliArgs, string flagName, out string? optionValue, out string? errorMessage)
+{
+    optionValue = null;
+    errorMessage = null;
+    int idx = Array.FindIndex(cliArgs, a => string.Equals(a, flagName, StringComparison.OrdinalIgnoreCase));
+    if (idx < 0)
+    {
+        return true;
+    }
+
+    if (idx + 1 >= cliArgs.Length || cliArgs[idx + 1].StartsWith("--", StringComparison.Ordinal) || string.IsNullOrWhiteSpace(cliArgs[idx + 1]))
+    {
+        errorMessage = $"Option '{flagName}' requires a file path argument.";
+        return false;
+    }
+
+    optionValue = cliArgs[idx + 1];
+    return true;
+}
+
+static bool TryPreflightDestinationPaths(IReadOnlyList<string> paths, out string? errorMessage)
+{
+    errorMessage = null;
+    HashSet<string> seenFullPaths = new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+    foreach (string rawPath in paths)
+    {
+        if (string.IsNullOrWhiteSpace(rawPath))
+        {
+            errorMessage = "Output file path cannot be empty.";
+            return false;
+        }
+
+        try
+        {
+            string fullPath = Path.GetFullPath(rawPath);
+            if (!seenFullPaths.Add(fullPath))
+            {
+                errorMessage = $"Duplicate output file path '{rawPath}' is not allowed; each requested output must use a distinct path.";
+                return false;
+            }
+
+            if (Directory.Exists(fullPath))
+            {
+                errorMessage = $"Destination path '{rawPath}' is an existing directory, not a file.";
+                return false;
+            }
+
+            string? dir = Path.GetDirectoryName(fullPath);
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+            {
+                errorMessage = $"Destination directory for '{rawPath}' does not exist.";
+                return false;
+            }
+
+            string probePath = Path.Combine(dir, $".certrobo-write-probe-{Guid.NewGuid():N}.tmp");
+            using (new FileStream(probePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1, FileOptions.DeleteOnClose))
+            {
+            }
+
+            if (File.Exists(fullPath))
+            {
+                using (new FileStream(fullPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+                {
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            errorMessage = $"Destination path '{rawPath}' is not writable ({ex.Message}).";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static async Task<bool> TryWriteIssuedCertificateOutputsAsync(
+    IssuanceOutcome outcome,
+    string outCertPath,
+    string? outTlsServerChainPath,
+    string? outRootPath,
+    string? outFullChainPath)
+{
+    List<(string TargetPath, string TempPath)> stagedFiles = [];
+    try
+    {
+        string leafPem = outcome.CertificatePem ?? string.Empty;
+        string issuerChainPem = outcome.Record?.ChainPem ?? string.Empty;
+        string tlsServerChainPem = !string.IsNullOrEmpty(outcome.TlsServerChainPem)
+            ? outcome.TlsServerChainPem
+            : CertificateAuthorityService.BuildTlsServerChainPem(leafPem, issuerChainPem);
+        string fullChainPem = !string.IsNullOrEmpty(outcome.FullChainPem)
+            ? outcome.FullChainPem
+            : (leafPem + issuerChainPem);
+        string rootPem = !string.IsNullOrEmpty(outcome.RootTrustAnchorPem)
+            ? outcome.RootTrustAnchorPem
+            : CertificateAuthorityService.ExtractTrustAnchorRootPem(issuerChainPem);
+
+        List<(string Path, string Content)> requestedWrites = [(outCertPath, leafPem)];
+        if (!string.IsNullOrWhiteSpace(outTlsServerChainPath))
+        {
+            requestedWrites.Add((outTlsServerChainPath, tlsServerChainPem));
+        }
+        if (!string.IsNullOrWhiteSpace(outRootPath))
+        {
+            requestedWrites.Add((outRootPath, rootPem));
+        }
+        if (!string.IsNullOrWhiteSpace(outFullChainPath))
+        {
+            requestedWrites.Add((outFullChainPath, fullChainPem));
+        }
+
+        string? simulatedFailTarget = Environment.GetEnvironmentVariable("CERTROBO_TEST_FAIL_CLI_OUTPUT_PATH");
+
+        for (int i = 0; i < requestedWrites.Count; i++)
+        {
+            var (targetPath, content) = requestedWrites[i];
+            if (!string.IsNullOrEmpty(simulatedFailTarget)
+                && (string.Equals(targetPath, simulatedFailTarget, StringComparison.Ordinal)
+                    || (string.Equals(simulatedFailTarget, "CHAIN", StringComparison.OrdinalIgnoreCase) && i > 0)))
+            {
+                throw new IOException($"Simulated post-issuance write failure for '{targetPath}'.");
+            }
+
+            string fullTarget = Path.GetFullPath(targetPath);
+            string dir = Path.GetDirectoryName(fullTarget)!;
+            string tempPath = Path.Combine(dir, $".{Path.GetFileName(fullTarget)}.tmp-{Guid.NewGuid():N}");
+            await File.WriteAllTextAsync(tempPath, content);
+            stagedFiles.Add((fullTarget, tempPath));
+        }
+
+        foreach (var (fullTarget, tempPath) in stagedFiles)
+        {
+            File.Move(tempPath, fullTarget, overwrite: true);
+        }
+
+        return true;
+    }
+    catch (Exception ex)
+    {
+        foreach (var (_, tempPath) in stagedFiles)
+        {
+            try
+            {
+                if (File.Exists(tempPath))
+                {
+                    File.Delete(tempPath);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        string serialHex = outcome.Record?.SerialNumberHex ?? "UNKNOWN";
+        string commonName = outcome.Record?.CommonName ?? "unknown";
+        Console.Error.WriteLine(
+            $"Certificate serial {serialHex} for '{commonName}' was issued and recorded, but writing output file(s) failed: {ex.Message} " +
+            $"Recover the issued certificate without duplicate issuance by re-running the same '--issue-csr' command with a writable path or running: " +
+            $"./CertRobo --export-issued {serialHex} <outCertPath> [<outTlsServerChainPath>]");
+        return false;
+    }
+}
+
+static async Task<IssuanceOutcome?> TryRecoverExistingIssuedCertificateForCsrAsync(
+    CertRoboDbContext db,
+    CertificateAuthorityService caService,
+    ApplicationUser user,
+    string csrPem)
+{
+    var (csrValid, _, validatedCsr) = IssuancePolicyService.ParseAndValidateCsr(csrPem);
+    if (!csrValid || validatedCsr == null)
+    {
+        return null;
+    }
+
+    CaAuthorityRecord? activeCa = await caService.GetActiveAuthorityAsync();
+    if (activeCa == null)
+    {
+        return null;
+    }
+
+    byte[] csrSpkiDer = Org.BouncyCastle.X509.SubjectPublicKeyInfoFactory
+        .CreateSubjectPublicKeyInfo(validatedCsr.PublicKey)
+        .GetDerEncoded();
+    string requestedSansCsv = string.Join(",", validatedCsr.CanonicalDnsIdentities);
+    DateTimeOffset now = DateTimeOffset.UtcNow;
+
+    List<IssuedCertificateRecord> candidates = await db.IssuedCertificates
+        .AsNoTracking()
+        .Where(c => c.CaAuthorityId == activeCa.Id
+                 && c.RequestedByUserId == user.Id
+                 && c.Status == IssuanceStatus.Issued
+                 && c.CommonName == validatedCsr.CommonName
+                 && c.SubjectAlternativeNamesCsv == requestedSansCsv)
+        .OrderByDescending(c => c.Id)
+        .ToListAsync();
+
+    foreach (IssuedCertificateRecord candidate in candidates)
+    {
+        if (candidate.NotAfterUtc <= now || string.IsNullOrWhiteSpace(candidate.CertificatePem))
+        {
+            continue;
+        }
+
+        try
+        {
+            using var cert = System.Security.Cryptography.X509Certificates.X509Certificate2.CreateFromPem(candidate.CertificatePem);
+            if (cert.PublicKey.ExportSubjectPublicKeyInfo().SequenceEqual(csrSpkiDer))
+            {
+                string issuerChainPem = !string.IsNullOrWhiteSpace(candidate.ChainPem)
+                    ? candidate.ChainPem
+                    : CertificateAuthorityService.BuildOrderedCertificateChainPem(activeCa);
+                return new IssuanceOutcome(
+                    true,
+                    null,
+                    candidate,
+                    candidate.CertificatePem,
+                    candidate.CertificatePem + issuerChainPem,
+                    CertificateAuthorityService.BuildTlsServerChainPem(candidate.CertificatePem, issuerChainPem),
+                    CertificateAuthorityService.ExtractTrustAnchorRootPem(issuerChainPem));
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    return null;
+}
 
 public partial class Program { }
