@@ -61,7 +61,7 @@
     }
     <div class="row">
         <div class="col" style="width:624px;min-width:624px;max-width:624px">
-            <RadzenCard>
+            <RadzenCard class="h-100 d-flex flex-column justify-content-between">
                 <div class="row" style="margin:0 auto">
                     <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Private key</RadzenText>
                     <RadzenTextArea Cols="64" Rows="8" MaxLength="8192" Style="font-family:Courier New, Courier, monospace;font-size:small" @bind-Value=@privateKey TValue="string" />
@@ -74,8 +74,6 @@
                 <div class="row" style="height: 6px" />
                 <div class="row" style="margin:0 auto">
                     <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Key strength</RadzenText>
-                </div>
-                <div class="row" style="margin:0 auto">
                     <RadzenRadioButtonList @bind-Value=@keyBits TValue="int?">
                         <Items>
                             <RadzenRadioButtonListItem Text="ECDSA 384" Value="384" TValue="int?" />
@@ -86,7 +84,7 @@
                     </RadzenRadioButtonList>
                 </div>
                 <div class="row" style="height: 6px" />
-                <div class="row" style="margin:0 auto">
+                <div class="row" style="margin:0 auto; width:100%">
                     <div class="col" style="width:50%">
                         <RadzenButton Text="Generate key pair" Style="width:100%" Click="@GenerateClick" />
                     </div>
@@ -97,7 +95,7 @@
             </RadzenCard>
         </div>
         <div class="col" style="width:624px;min-width:624px;max-width:624px">
-            <RadzenCard>
+            <RadzenCard class="h-100 d-flex flex-column justify-content-between">
                 <div class="row">
                     <div class="col" style="width:208px;min-width:208px;max-width:208px">
                         <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Common Name</RadzenText>
@@ -201,7 +199,7 @@
     <div class="row" style="height: 24px" />
     <div class="row">
         <div class="col" style="width:624px;min-width:624px;max-width:624px">
-            <RadzenCard>
+            <RadzenCard class="h-100">
                 <div class="row" style="margin:0 auto">
                     <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Certificate Signing Request</RadzenText>
                     <RadzenTextArea Cols="64" Rows="8" MaxLength="4096" Style="font-family:Courier New, Courier, monospace;font-size:small" @bind-Value=@csr TValue="string" />
@@ -209,7 +207,7 @@
             </RadzenCard>
         </div>
         <div class="col" style="width:624px;min-width:624px;max-width:624px">
-            <RadzenCard>
+            <RadzenCard class="h-100">
                 <div class="row" style="margin:0 auto">
                     <RadzenText TextStyle="TextStyle.Subtitle2" TagName="TagName.H3">Certificate</RadzenText>
                     <RadzenTextArea Cols="64" Rows="8" MaxLength="4096" Style="font-family:Courier New, Courier, monospace;font-size:small" @bind-Value=@certificate TValue="string" />

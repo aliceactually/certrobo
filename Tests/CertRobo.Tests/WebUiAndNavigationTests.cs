@@ -140,6 +140,13 @@ public class WebUiAndNavigationTests : IDisposable
             Assert.Contains($"id=\"{targetId}\"", adminHtml);
         }
 
+        // 2b. Fetch / (Certificate Tool) and verify the 4 main RadzenCard containers use equal-height flex layout
+        HttpResponseMessage homeGet = await client.GetAsync("/");
+        Assert.Equal(HttpStatusCode.OK, homeGet.StatusCode);
+        string homeToolHtml = await homeGet.Content.ReadAsStringAsync();
+        MatchCollection homeCards = Regex.Matches(homeToolHtml, @"<div\s+class=""rz-card[^""]*\bh-100\b[^""]*""");
+        Assert.Equal(4, homeCards.Count);
+
         // 3. Extract rendered logout antiforgery token from MainLayout and verify POST /account/logout succeeds
         string logoutToken = ExtractAntiforgeryToken(adminHtml);
         Assert.False(string.IsNullOrWhiteSpace(logoutToken));
