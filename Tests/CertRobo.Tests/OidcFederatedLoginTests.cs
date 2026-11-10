@@ -2421,6 +2421,159 @@ public class OidcFederatedLoginTests : IDisposable
         Assert.False((await policy.EvaluateCsrRequestAsync(extLogin.User.Id, forbiddenCorpCsr)).IsAllowed);
     }
 
+    [Fact]
+    public async Task DefaultProfileSelector_NeverOverridesExplicitRuleProfiles_AppliesOnlyToBarePatterns_SynchronizesTextAndRows_AndSupportsExplicitBulkApply()
+    {
+        var (factory, idp, _) = CreateOidcTestHost();
+
+        using IServiceScope scope = factory.Services.CreateScope();
+        AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+        IssuancePolicyService policy = scope.ServiceProvider.GetRequiredService<IssuancePolicyService>();
+        OidcFederationService oidcSvc = scope.ServiceProvider.GetRequiredService<OidcFederationService>();
+
+        var (_, _, admin) = await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*");
+        Assert.NotNull(admin);
+
+        // 1. Exact reproduction of Review #4 P1:
+        //    Configure group 'dev' with 'b.example.test -> tls-server-ecdsa-256'.
+        await acct.SetExternalGroupRoleMappingAsync(
+            "dev",
+            AppRoles.Issuer,
+            [new ExternalGroupPermissionSpec("b.example.test", CertificateProfiles.EcdsaP256ServerId)]);
+
+        OidcLoginOutcome login = await oidcSvc.ProcessValidatedOidcLoginAsync(
+            new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim("sub", "sub-default-prof-user"),
+                new Claim("iss", idp.Issuer),
+                new Claim("groups", "dev"),
+                new Claim("preferred_username", "dev.user")
+            ], "TestOidc")),
+            idp.Issuer,
+            "sub-default-prof-user");
+        Assert.True(login.Succeeded);
+        string extUserId = login.User!.Id;
+
+        KeyPair ec256 = _crypto.KeyGen(256);
+        KeyPair rsa2048 = _crypto.KeyGen(2048);
+        KeyPair rsa4096 = _crypto.KeyGen(4096);
+
+        string aEc256Csr = _crypto.CSRGen(ec256, "a.example.test", ["a.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string aRsa2048Csr = _crypto.CSRGen(rsa2048, "a.example.test", ["a.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string aRsa4096Csr = _crypto.CSRGen(rsa4096, "a.example.test", ["a.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string bEc256Csr = _crypto.CSRGen(ec256, "b.example.test", ["b.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string bRsa2048Csr = _crypto.CSRGen(rsa2048, "b.example.test", ["b.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string bRsa4096Csr = _crypto.CSRGen(rsa4096, "b.example.test", ["b.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string bareEc256Csr = _crypto.CSRGen(ec256, "bare.example.test", ["bare.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string bareRsa2048Csr = _crypto.CSRGen(rsa2048, "bare.example.test", ["bare.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+
+        // Initially, RSA-2048 for b.example.test is denied
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, bEc256Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, bRsa2048Csr)).IsAllowed);
+
+        CertRobo.Pages.Admin adminPage = new();
+        SetProperty(adminPage, "AccountService", acct);
+        SetProperty(adminPage, "CaService", scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>());
+        SetProperty(adminPage, "CesService", scope.ServiceProvider.GetRequiredService<AdCsCesEnrollmentService>());
+        SetProperty(adminPage, "BackupService", scope.ServiceProvider.GetRequiredService<BackupRestoreService>());
+        SetProperty(adminPage, "MigrationService", scope.ServiceProvider.GetRequiredService<LegacySettingsMigrationService>());
+        SetProperty(adminPage, "Configuration", scope.ServiceProvider.GetRequiredService<IConfiguration>());
+        SetProperty(adminPage, "HostEnvironment", scope.ServiceProvider.GetRequiredService<IWebHostEnvironment>());
+        SetProperty(adminPage, "AuthenticationStateProvider", new ControllableAuthStateProvider(admin!.Id, admin.UserName!, AppRoles.Administrator, admin.SecurityStamp));
+        SetProperty(adminPage, "NotificationService", scope.ServiceProvider.GetRequiredService<Radzen.NotificationService>());
+
+        await InvokeMethodAsync(adminPage, "OnInitializedAsync");
+
+        // Click Edit / Replace, change Default Profile (for bare patterns) to '*' (both via OnDefaultProfileChanged and SetField),
+        // leaving the explicitly profiled domain and row untouched, and save:
+        ExternalGroupMappingSummaryDto singleRuleSummary = (await acct.ListExternalGroupMappingsAsync()).Single(m => m.GroupName == "dev");
+        await InvokeMethodAsync(adminPage, "PopulateEditGroupMappingForm", singleRuleSummary);
+        Assert.Equal("b.example.test@tls-server-ecdsa-256", GetField<string>(adminPage, "newGroupMappingDomains"));
+
+        await InvokeMethodAsync(adminPage, "OnDefaultProfileChanged", "*");
+        SetField(adminPage, "newGroupMappingProfile", "*");
+        await InvokeMethodAsync(adminPage, "SaveExternalGroupMappingClick");
+
+        // Stored rule MUST remain b.example.test -> tls-server-ecdsa-256, and RSA-2048 CSR MUST STILL BE DENIED!
+        ExternalGroupMappingSummaryDto afterDefaultChange = (await acct.ListExternalGroupMappingsAsync()).Single(m => m.GroupName == "dev");
+        DomainPermissionRule singleSavedRule = Assert.Single(afterDefaultChange.DomainPermissions);
+        Assert.Equal("b.example.test", singleSavedRule.DomainPattern);
+        Assert.Equal(CertificateProfiles.EcdsaP256ServerId, singleSavedRule.AllowedProfileId);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, bEc256Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, bRsa2048Csr)).IsAllowed);
+
+        // 2. Uniform multi-row group (both rules start with tls-server-ecdsa-256):
+        //    Test explicit row changes in BOTH orders relative to default profile changes!
+        await acct.SetExternalGroupRoleMappingAsync(
+            "dev",
+            AppRoles.Issuer,
+            [
+                new ExternalGroupPermissionSpec("a.example.test", CertificateProfiles.EcdsaP256ServerId),
+                new ExternalGroupPermissionSpec("b.example.test", CertificateProfiles.EcdsaP256ServerId)
+            ]);
+
+        // Order A: Change row 0 profile to RSA-2048 FIRST, then change Default Profile to '*', then Save
+        ExternalGroupMappingSummaryDto uniformSummary = (await acct.ListExternalGroupMappingsAsync()).Single(m => m.GroupName == "dev");
+        await InvokeMethodAsync(adminPage, "PopulateEditGroupMappingForm", uniformSummary);
+        await InvokeMethodAsync(adminPage, "OnEditingGroupRuleProfileChanged", 0, CertificateProfiles.Rsa2048ServerId);
+        await InvokeMethodAsync(adminPage, "OnDefaultProfileChanged", "*");
+        await InvokeMethodAsync(adminPage, "SaveExternalGroupMappingClick");
+
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, aEc256Csr)).IsAllowed);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, aRsa2048Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, aRsa4096Csr)).IsAllowed); // NOT widened to '*'!
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, bEc256Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, bRsa2048Csr)).IsAllowed); // b kept ECDSA-256!
+
+        // Order B: Reset to uniform ECDSA-256, then change Default Profile to '*' FIRST, then change row 1 profile to RSA-2048, then Save
+        await acct.SetExternalGroupRoleMappingAsync(
+            "dev",
+            AppRoles.Issuer,
+            [
+                new ExternalGroupPermissionSpec("a.example.test", CertificateProfiles.EcdsaP256ServerId),
+                new ExternalGroupPermissionSpec("b.example.test", CertificateProfiles.EcdsaP256ServerId)
+            ]);
+        uniformSummary = (await acct.ListExternalGroupMappingsAsync()).Single(m => m.GroupName == "dev");
+        await InvokeMethodAsync(adminPage, "PopulateEditGroupMappingForm", uniformSummary);
+        await InvokeMethodAsync(adminPage, "OnDefaultProfileChanged", "*");
+        await InvokeMethodAsync(adminPage, "OnEditingGroupRuleProfileChanged", 1, CertificateProfiles.Rsa2048ServerId);
+        await InvokeMethodAsync(adminPage, "SaveExternalGroupMappingClick");
+
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, aEc256Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, aRsa2048Csr)).IsAllowed); // a kept ECDSA-256!
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, bEc256Csr)).IsAllowed);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, bRsa2048Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, bRsa4096Csr)).IsAllowed); // NOT widened to '*'!
+
+        // 3. Bare rules alongside explicit rules + text/row synchronization:
+        //    Enter "a.example.test@tls-server-ecdsa-256, bare.example.test" in the text input,
+        //    then change Default Profile to RSA-2048 -> only 'bare.example.test' adopts RSA-2048 while 'a.example.test' keeps ECDSA-256!
+        await InvokeMethodAsync(adminPage, "OnGroupMappingDomainsChanged", "a.example.test@tls-server-ecdsa-256, bare.example.test");
+        SetField(adminPage, "newGroupMappingName", "dev");
+        SetField(adminPage, "newGroupMappingRole", AppRoles.Issuer);
+        await InvokeMethodAsync(adminPage, "OnDefaultProfileChanged", CertificateProfiles.Rsa2048ServerId);
+        Assert.Equal("a.example.test@tls-server-ecdsa-256, bare.example.test", GetField<string>(adminPage, "newGroupMappingDomains"));
+
+        await InvokeMethodAsync(adminPage, "SaveExternalGroupMappingClick");
+
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, aEc256Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, aRsa2048Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, bareEc256Csr)).IsAllowed);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, bareRsa2048Csr)).IsAllowed);
+
+        // 4. Explicit bulk profile change action (ApplyDefaultProfileToAllEditingRules):
+        //    Visibly updates all rows and text before saving, and only then applies the default profile across all rules.
+        ExternalGroupMappingSummaryDto mixedSummary = (await acct.ListExternalGroupMappingsAsync()).Single(m => m.GroupName == "dev");
+        await InvokeMethodAsync(adminPage, "PopulateEditGroupMappingForm", mixedSummary);
+        await InvokeMethodAsync(adminPage, "OnDefaultProfileChanged", "*");
+        await InvokeMethodAsync(adminPage, "ApplyDefaultProfileToAllEditingRules");
+        Assert.Equal("a.example.test@*, bare.example.test@*", GetField<string>(adminPage, "newGroupMappingDomains"));
+
+        await InvokeMethodAsync(adminPage, "SaveExternalGroupMappingClick");
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, aRsa4096Csr)).IsAllowed);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, bareEc256Csr)).IsAllowed);
+    }
+
     private sealed class ControllableAuthStateProvider : AuthenticationStateProvider
     {
         private ClaimsPrincipal _principal;

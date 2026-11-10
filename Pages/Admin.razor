@@ -1464,7 +1464,10 @@
                             </div>
                             <div class="col-md-3">
                                 <label class="form-label" for="oidc-map-profile">Default Profile (for bare patterns)</label>
-                                <select id="oidc-map-profile" class="form-select" @bind="newGroupMappingProfile">
+                                <select id="oidc-map-profile"
+                                        class="form-select"
+                                        value="@newGroupMappingProfile"
+                                        @onchange="e => OnDefaultProfileChanged(e.Value?.ToString())">
                                     <option value="*">All TLS Server Profiles (*)</option>
                                     @foreach (var prof in CertificateProfiles.All.Values)
                                     {
@@ -1479,20 +1482,26 @@
                             <input id="oidc-map-domains"
                                    class="form-control"
                                    placeholder="e.g. *.contoso.com, api.contoso.com@tls-server-ecdsa-256 or *"
-                                   @bind="newGroupMappingDomains" />
+                                   value="@newGroupMappingDomains"
+                                   @onchange="e => OnGroupMappingDomainsChanged(e.Value?.ToString())" />
                             <div class="form-text">
-                                Enter domain patterns separated by commas. Use <code>pattern@@profileId</code> (for example, <code>a.example.com@@*</code>, <code>b.example.com@@tls-server-ecdsa-256</code>) to specify per-rule profiles, or omit <code>@@profileId</code> to use the Default Profile selected above.
+                                Enter domain patterns separated by commas. Explicit <code>pattern@@profileId</code> rules always keep their specified profile; bare patterns (without <code>@@profileId</code>) use the Default Profile selected above.
                             </div>
                         </div>
 
                         @if (editingGroupMappingRules.Count > 0)
                         {
                             <div class="mb-3">
-                                <div class="d-flex justify-content-between align-items-center mb-2">
+                                <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
                                     <span class="form-label mb-0 fw-semibold">Per-Rule Domain &amp; Profile Pairs (@editingGroupMappingRules.Count)</span>
-                                    <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="AddEditingGroupRuleRow">
-                                        + Add Rule Row
-                                    </button>
+                                    <div class="d-flex flex-wrap gap-2">
+                                        <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="ApplyDefaultProfileToAllEditingRules">
+                                            Apply Default Profile to All Rules
+                                        </button>
+                                        <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="AddEditingGroupRuleRow">
+                                            + Add Rule Row
+                                        </button>
+                                    </div>
                                 </div>
                                 @for (int i = 0; i < editingGroupMappingRules.Count; i++)
                                 {
@@ -2179,6 +2188,7 @@
     {
         public string DomainPattern { get; set; } = "";
         public string AllowedProfileId { get; set; } = "*";
+        public bool UsesDefaultProfile { get; set; }
     }
 
     private OidcFederationOptions oidcSummaryOptions = new();
@@ -2193,8 +2203,6 @@
     private string newGroupMappingDomains = "*.contoso.com";
     private List<EditableGroupRuleRow> editingGroupMappingRules = [];
     private string? lastPopulatedGroupMappingDomains;
-    private string? lastPopulatedGroupMappingProfile;
-    private bool populatedGroupHadSingleProfile;
     private bool showAddAdditionalGroupRuleForm = false;
     private string additionalRuleGroupName = "";
     private string additionalRuleDomainPattern = "";
@@ -2999,36 +3007,34 @@
             return;
         }
 
-        string[] patterns;
-        if (editingGroupMappingRules.Count > 0
-            && string.Equals(newGroupMappingDomains, lastPopulatedGroupMappingDomains, StringComparison.Ordinal))
-        {
-            bool applyChangedSingleProfile = populatedGroupHadSingleProfile
-                && !string.Equals(newGroupMappingProfile, lastPopulatedGroupMappingProfile, StringComparison.OrdinalIgnoreCase);
+        EnsureEditingRulesSyncedWithTextIfModified();
 
-            patterns = editingGroupMappingRules
-                .Where(r => !string.IsNullOrWhiteSpace(r.DomainPattern))
-                .Select(r =>
+        string effectiveDefaultProfile = string.IsNullOrWhiteSpace(newGroupMappingProfile)
+            ? "*"
+            : newGroupMappingProfile.Trim();
+
+        string[] patterns = editingGroupMappingRules
+            .Where(r => !string.IsNullOrWhiteSpace(r.DomainPattern))
+            .Select(r =>
+            {
+                string domain = r.DomainPattern.Trim();
+                if (domain.Contains('@'))
                 {
-                    string prof = applyChangedSingleProfile
-                        ? newGroupMappingProfile
-                        : (string.IsNullOrWhiteSpace(r.AllowedProfileId) ? "*" : r.AllowedProfileId.Trim());
-                    return $"{r.DomainPattern.Trim()}@{prof}";
-                })
-                .ToArray();
-        }
-        else
-        {
-            patterns = string.IsNullOrWhiteSpace(newGroupMappingDomains)
-                ? []
-                : newGroupMappingDomains.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        }
+                    return domain;
+                }
+
+                string prof = r.UsesDefaultProfile
+                    ? effectiveDefaultProfile
+                    : (string.IsNullOrWhiteSpace(r.AllowedProfileId) ? "*" : r.AllowedProfileId.Trim());
+                return $"{domain}@{prof}";
+            })
+            .ToArray();
 
         var (ok, err, mapping) = await AccountService.SetExternalGroupRoleMappingAsync(
             newGroupMappingName,
             newGroupMappingRole,
             patterns,
-            newGroupMappingProfile,
+            effectiveDefaultProfile,
             actingPrincipal: actor);
 
         if (!ok || mapping == null)
@@ -3050,7 +3056,8 @@
             .Select(p => new EditableGroupRuleRow
             {
                 DomainPattern = p.DomainPattern,
-                AllowedProfileId = string.IsNullOrWhiteSpace(p.AllowedProfileId) ? "*" : p.AllowedProfileId
+                AllowedProfileId = string.IsNullOrWhiteSpace(p.AllowedProfileId) ? "*" : p.AllowedProfileId,
+                UsesDefaultProfile = false
             })
             .ToList();
 
@@ -3059,11 +3066,8 @@
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        populatedGroupHadSingleProfile = distinctProfiles.Count <= 1;
         newGroupMappingProfile = distinctProfiles.Count == 1 ? distinctProfiles[0] : "*";
-        newGroupMappingDomains = string.Join(", ", editingGroupMappingRules.Select(r => $"{r.DomainPattern}@{r.AllowedProfileId}"));
-        lastPopulatedGroupMappingProfile = newGroupMappingProfile;
-        lastPopulatedGroupMappingDomains = newGroupMappingDomains;
+        SyncGroupMappingTextFromRules();
         showAddGroupMappingForm = true;
     }
 
@@ -3077,23 +3081,60 @@
         newGroupMappingName = "";
         editingGroupMappingRules = [];
         lastPopulatedGroupMappingDomains = null;
-        lastPopulatedGroupMappingProfile = null;
-        populatedGroupHadSingleProfile = false;
         showAddGroupMappingForm = false;
+    }
+
+    private void OnDefaultProfileChanged(string? newProfile)
+    {
+        EnsureEditingRulesSyncedWithTextIfModified();
+        newGroupMappingProfile = string.IsNullOrWhiteSpace(newProfile) ? "*" : newProfile.Trim();
+        foreach (EditableGroupRuleRow row in editingGroupMappingRules)
+        {
+            if (row.UsesDefaultProfile)
+            {
+                row.AllowedProfileId = newGroupMappingProfile;
+            }
+        }
+
+        if (editingGroupMappingRules.Count > 0)
+        {
+            SyncGroupMappingTextFromRules();
+        }
+    }
+
+    private void OnGroupMappingDomainsChanged(string? newDomainsText)
+    {
+        newGroupMappingDomains = newDomainsText ?? "";
+        SyncGroupMappingRulesFromText(newGroupMappingDomains);
+    }
+
+    private void ApplyDefaultProfileToAllEditingRules()
+    {
+        EnsureEditingRulesSyncedWithTextIfModified();
+        string effectiveDefault = string.IsNullOrWhiteSpace(newGroupMappingProfile) ? "*" : newGroupMappingProfile.Trim();
+        foreach (EditableGroupRuleRow row in editingGroupMappingRules)
+        {
+            row.AllowedProfileId = effectiveDefault;
+            row.UsesDefaultProfile = false;
+        }
+        SyncGroupMappingTextFromRules();
     }
 
     private void AddEditingGroupRuleRow()
     {
+        EnsureEditingRulesSyncedWithTextIfModified();
         editingGroupMappingRules.Add(new EditableGroupRuleRow
         {
             DomainPattern = "",
-            AllowedProfileId = string.IsNullOrWhiteSpace(newGroupMappingProfile) ? "*" : newGroupMappingProfile
+            AllowedProfileId = string.IsNullOrWhiteSpace(newGroupMappingProfile) ? "*" : newGroupMappingProfile.Trim(),
+            UsesDefaultProfile = false
         });
         SyncGroupMappingTextFromRules();
     }
 
     private void RemoveEditingGroupRuleRow(int index)
     {
+        EnsureEditingRulesSyncedWithTextIfModified();
         if (index >= 0 && index < editingGroupMappingRules.Count)
         {
             editingGroupMappingRules.RemoveAt(index);
@@ -3103,24 +3144,80 @@
 
     private void OnEditingGroupRuleDomainChanged(int index, string? newDomain)
     {
+        EnsureEditingRulesSyncedWithTextIfModified();
         if (index >= 0 && index < editingGroupMappingRules.Count)
         {
-            editingGroupMappingRules[index].DomainPattern = newDomain?.Trim() ?? "";
+            string trimmed = newDomain?.Trim() ?? "";
+            int atIdx = trimmed.IndexOf('@');
+            if (atIdx > 0 && atIdx < trimmed.Length - 1 && trimmed.IndexOf('@', atIdx + 1) < 0)
+            {
+                editingGroupMappingRules[index].DomainPattern = trimmed[..atIdx].Trim();
+                editingGroupMappingRules[index].AllowedProfileId = trimmed[(atIdx + 1)..].Trim();
+                editingGroupMappingRules[index].UsesDefaultProfile = false;
+            }
+            else
+            {
+                editingGroupMappingRules[index].DomainPattern = trimmed;
+            }
             SyncGroupMappingTextFromRules();
         }
     }
 
     private void OnEditingGroupRuleProfileChanged(int index, string? newProfile)
     {
+        EnsureEditingRulesSyncedWithTextIfModified();
         if (index >= 0 && index < editingGroupMappingRules.Count)
         {
             editingGroupMappingRules[index].AllowedProfileId = string.IsNullOrWhiteSpace(newProfile) ? "*" : newProfile.Trim();
-            populatedGroupHadSingleProfile = editingGroupMappingRules
-                .Select(r => r.AllowedProfileId)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Count() <= 1;
+            editingGroupMappingRules[index].UsesDefaultProfile = false;
             SyncGroupMappingTextFromRules();
         }
+    }
+
+    private void EnsureEditingRulesSyncedWithTextIfModified()
+    {
+        if (!string.Equals(newGroupMappingDomains, lastPopulatedGroupMappingDomains, StringComparison.Ordinal))
+        {
+            SyncGroupMappingRulesFromText(newGroupMappingDomains);
+        }
+    }
+
+    private void SyncGroupMappingRulesFromText(string? rawText)
+    {
+        editingGroupMappingRules.Clear();
+        string effectiveDefaultProfile = string.IsNullOrWhiteSpace(newGroupMappingProfile)
+            ? "*"
+            : newGroupMappingProfile.Trim();
+
+        if (!string.IsNullOrWhiteSpace(rawText))
+        {
+            foreach (string token in rawText.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                int atIdx = token.IndexOf('@');
+                if (atIdx > 0 && atIdx < token.Length - 1 && token.IndexOf('@', atIdx + 1) < 0)
+                {
+                    string domainPart = token[..atIdx].Trim();
+                    string profilePart = token[(atIdx + 1)..].Trim();
+                    editingGroupMappingRules.Add(new EditableGroupRuleRow
+                    {
+                        DomainPattern = domainPart,
+                        AllowedProfileId = string.IsNullOrWhiteSpace(profilePart) ? "*" : profilePart,
+                        UsesDefaultProfile = false
+                    });
+                }
+                else
+                {
+                    editingGroupMappingRules.Add(new EditableGroupRuleRow
+                    {
+                        DomainPattern = token,
+                        AllowedProfileId = effectiveDefaultProfile,
+                        UsesDefaultProfile = true
+                    });
+                }
+            }
+        }
+
+        lastPopulatedGroupMappingDomains = newGroupMappingDomains;
     }
 
     private void SyncGroupMappingTextFromRules()
@@ -3129,7 +3226,17 @@
             ", ",
             editingGroupMappingRules
                 .Where(r => !string.IsNullOrWhiteSpace(r.DomainPattern))
-                .Select(r => $"{r.DomainPattern.Trim()}@{(string.IsNullOrWhiteSpace(r.AllowedProfileId) ? "*" : r.AllowedProfileId.Trim())}"));
+                .Select(r =>
+                {
+                    string domain = r.DomainPattern.Trim();
+                    if (r.UsesDefaultProfile || domain.Contains('@'))
+                    {
+                        return domain;
+                    }
+
+                    string prof = string.IsNullOrWhiteSpace(r.AllowedProfileId) ? "*" : r.AllowedProfileId.Trim();
+                    return $"{domain}@{prof}";
+                }));
         lastPopulatedGroupMappingDomains = newGroupMappingDomains;
     }
 
