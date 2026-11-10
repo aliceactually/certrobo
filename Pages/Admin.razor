@@ -1445,7 +1445,7 @@
                     <div class="operation-panel mb-4" style="max-width: 860px;">
                         <h4>Add or Replace External Group Mapping</h4>
                         <p class="text-muted-theme small mb-3">
-                            Saving a group mapping sets its mapped CertRobo role and <strong>atomically replaces</strong> that group's domain and profile rules with the patterns entered below. To append an extra rule (for example, for a second certificate profile) without replacing existing rules, use <strong>+ Add Additional Rule to Group</strong>.
+                            Saving a group mapping sets its mapped CertRobo role and <strong>atomically replaces</strong> that group's domain and profile rules with the `(domain pattern, allowed profile)` rules below. A no-change save or role-only edit preserves all existing per-rule profiles.
                         </p>
                         <div class="row g-3 mb-3">
                             <div class="col-md-5">
@@ -1463,7 +1463,7 @@
                                 </select>
                             </div>
                             <div class="col-md-3">
-                                <label class="form-label" for="oidc-map-profile">Allowed Profile</label>
+                                <label class="form-label" for="oidc-map-profile">Default Profile (for bare patterns)</label>
                                 <select id="oidc-map-profile" class="form-select" @bind="newGroupMappingProfile">
                                     <option value="*">All TLS Server Profiles (*)</option>
                                     @foreach (var prof in CertificateProfiles.All.Values)
@@ -1475,18 +1475,67 @@
                         </div>
 
                         <div class="mb-3">
-                            <label class="form-label" for="oidc-map-domains">Replacement Allowed Domain Patterns (comma-separated)</label>
+                            <label class="form-label" for="oidc-map-domains">Replacement Allowed Domain Rules (comma-separated; supports <code>domain@@profile</code> per rule)</label>
                             <input id="oidc-map-domains"
                                    class="form-control"
-                                   placeholder="e.g. *.contoso.com, contoso.com or *"
+                                   placeholder="e.g. *.contoso.com, api.contoso.com@tls-server-ecdsa-256 or *"
                                    @bind="newGroupMappingDomains" />
                             <div class="form-text">
-                                Replaces all domain/profile rules for this external group with the specified pattern(s) and profile.
+                                Enter domain patterns separated by commas. Use <code>pattern@@profileId</code> (for example, <code>a.example.com@@*</code>, <code>b.example.com@@tls-server-ecdsa-256</code>) to specify per-rule profiles, or omit <code>@@profileId</code> to use the Default Profile selected above.
                             </div>
                         </div>
 
+                        @if (editingGroupMappingRules.Count > 0)
+                        {
+                            <div class="mb-3">
+                                <div class="d-flex justify-content-between align-items-center mb-2">
+                                    <span class="form-label mb-0 fw-semibold">Per-Rule Domain &amp; Profile Pairs (@editingGroupMappingRules.Count)</span>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary" @onclick="AddEditingGroupRuleRow">
+                                        + Add Rule Row
+                                    </button>
+                                </div>
+                                @for (int i = 0; i < editingGroupMappingRules.Count; i++)
+                                {
+                                    int rowIdx = i;
+                                    var ruleRow = editingGroupMappingRules[rowIdx];
+                                    string domainInputId = $"oidc-edit-rule-domain-{rowIdx}";
+                                    string profileSelectId = $"oidc-edit-rule-profile-{rowIdx}";
+                                    <div class="row g-2 align-items-end mb-2">
+                                        <div class="col-md-5">
+                                            <label class="form-label small mb-1" for="@domainInputId">Domain Pattern #@(rowIdx + 1)</label>
+                                            <input id="@domainInputId"
+                                                   class="form-control form-control-sm"
+                                                   value="@ruleRow.DomainPattern"
+                                                   @onchange="e => OnEditingGroupRuleDomainChanged(rowIdx, e.Value?.ToString())" />
+                                        </div>
+                                        <div class="col-md-5">
+                                            <label class="form-label small mb-1" for="@profileSelectId">Allowed Profile #@(rowIdx + 1)</label>
+                                            <select id="@profileSelectId"
+                                                    class="form-select form-select-sm"
+                                                    value="@ruleRow.AllowedProfileId"
+                                                    @onchange="e => OnEditingGroupRuleProfileChanged(rowIdx, e.Value?.ToString())">
+                                                <option value="*">All TLS Server Profiles (*)</option>
+                                                @foreach (var prof in CertificateProfiles.All.Values)
+                                                {
+                                                    <option value="@prof.ProfileId">@prof.DisplayName</option>
+                                                }
+                                            </select>
+                                        </div>
+                                        <div class="col-md-2 d-flex gap-1 justify-content-end">
+                                            <button type="button"
+                                                    class="btn btn-sm btn-outline-danger"
+                                                    title="Remove rule row"
+                                                    @onclick="() => RemoveEditingGroupRuleRow(rowIdx)">
+                                                Remove
+                                            </button>
+                                        </div>
+                                    </div>
+                                }
+                            </div>
+                        }
+
                         <div class="d-flex justify-content-end gap-2">
-                            <button type="button" class="btn btn-outline-secondary" @onclick="() => showAddGroupMappingForm = false">Cancel</button>
+                            <button type="button" class="btn btn-outline-secondary" @onclick="CancelGroupMappingFormClick">Cancel</button>
                             <RadzenButton Text="Save & Replace Group Mapping" Click="@SaveExternalGroupMappingClick" />
                         </div>
                     </div>
@@ -2126,6 +2175,12 @@
     private string newUserDomains = "*.contoso.com";
 
     // OpenID Connect Federation & Group Mappings state
+    private sealed class EditableGroupRuleRow
+    {
+        public string DomainPattern { get; set; } = "";
+        public string AllowedProfileId { get; set; } = "*";
+    }
+
     private OidcFederationOptions oidcSummaryOptions = new();
     private OidcPortalSettingsConfig oidcPortalSettings = new();
     private string oidcPortalProviderDisplayName = "OpenID Connect";
@@ -2136,6 +2191,10 @@
     private string newGroupMappingRole = AppRoles.Issuer;
     private string newGroupMappingProfile = "*";
     private string newGroupMappingDomains = "*.contoso.com";
+    private List<EditableGroupRuleRow> editingGroupMappingRules = [];
+    private string? lastPopulatedGroupMappingDomains;
+    private string? lastPopulatedGroupMappingProfile;
+    private bool populatedGroupHadSingleProfile;
     private bool showAddAdditionalGroupRuleForm = false;
     private string additionalRuleGroupName = "";
     private string additionalRuleDomainPattern = "";
@@ -2940,9 +2999,30 @@
             return;
         }
 
-        string[] patterns = string.IsNullOrWhiteSpace(newGroupMappingDomains)
-            ? []
-            : newGroupMappingDomains.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        string[] patterns;
+        if (editingGroupMappingRules.Count > 0
+            && string.Equals(newGroupMappingDomains, lastPopulatedGroupMappingDomains, StringComparison.Ordinal))
+        {
+            bool applyChangedSingleProfile = populatedGroupHadSingleProfile
+                && !string.Equals(newGroupMappingProfile, lastPopulatedGroupMappingProfile, StringComparison.OrdinalIgnoreCase);
+
+            patterns = editingGroupMappingRules
+                .Where(r => !string.IsNullOrWhiteSpace(r.DomainPattern))
+                .Select(r =>
+                {
+                    string prof = applyChangedSingleProfile
+                        ? newGroupMappingProfile
+                        : (string.IsNullOrWhiteSpace(r.AllowedProfileId) ? "*" : r.AllowedProfileId.Trim());
+                    return $"{r.DomainPattern.Trim()}@{prof}";
+                })
+                .ToArray();
+        }
+        else
+        {
+            patterns = string.IsNullOrWhiteSpace(newGroupMappingDomains)
+                ? []
+                : newGroupMappingDomains.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        }
 
         var (ok, err, mapping) = await AccountService.SetExternalGroupRoleMappingAsync(
             newGroupMappingName,
@@ -2957,8 +3037,7 @@
             return;
         }
 
-        newGroupMappingName = "";
-        showAddGroupMappingForm = false;
+        ResetGroupMappingFormState();
         await ReloadAllAsync();
         Notify(Radzen.NotificationSeverity.Success, "Group Mapping Saved", $"Mapped external group '{mapping.GroupName}' to role '{mapping.RoleName}'.");
     }
@@ -2967,9 +3046,91 @@
     {
         newGroupMappingName = mapping.GroupName;
         newGroupMappingRole = mapping.RoleName;
-        newGroupMappingProfile = mapping.DomainPermissions.FirstOrDefault()?.AllowedProfileId ?? "*";
-        newGroupMappingDomains = string.Join(", ", mapping.DomainPermissions.Select(p => p.DomainPattern));
+        editingGroupMappingRules = mapping.DomainPermissions
+            .Select(p => new EditableGroupRuleRow
+            {
+                DomainPattern = p.DomainPattern,
+                AllowedProfileId = string.IsNullOrWhiteSpace(p.AllowedProfileId) ? "*" : p.AllowedProfileId
+            })
+            .ToList();
+
+        List<string> distinctProfiles = editingGroupMappingRules
+            .Select(r => r.AllowedProfileId)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        populatedGroupHadSingleProfile = distinctProfiles.Count <= 1;
+        newGroupMappingProfile = distinctProfiles.Count == 1 ? distinctProfiles[0] : "*";
+        newGroupMappingDomains = string.Join(", ", editingGroupMappingRules.Select(r => $"{r.DomainPattern}@{r.AllowedProfileId}"));
+        lastPopulatedGroupMappingProfile = newGroupMappingProfile;
+        lastPopulatedGroupMappingDomains = newGroupMappingDomains;
         showAddGroupMappingForm = true;
+    }
+
+    private void CancelGroupMappingFormClick()
+    {
+        ResetGroupMappingFormState();
+    }
+
+    private void ResetGroupMappingFormState()
+    {
+        newGroupMappingName = "";
+        editingGroupMappingRules = [];
+        lastPopulatedGroupMappingDomains = null;
+        lastPopulatedGroupMappingProfile = null;
+        populatedGroupHadSingleProfile = false;
+        showAddGroupMappingForm = false;
+    }
+
+    private void AddEditingGroupRuleRow()
+    {
+        editingGroupMappingRules.Add(new EditableGroupRuleRow
+        {
+            DomainPattern = "",
+            AllowedProfileId = string.IsNullOrWhiteSpace(newGroupMappingProfile) ? "*" : newGroupMappingProfile
+        });
+        SyncGroupMappingTextFromRules();
+    }
+
+    private void RemoveEditingGroupRuleRow(int index)
+    {
+        if (index >= 0 && index < editingGroupMappingRules.Count)
+        {
+            editingGroupMappingRules.RemoveAt(index);
+            SyncGroupMappingTextFromRules();
+        }
+    }
+
+    private void OnEditingGroupRuleDomainChanged(int index, string? newDomain)
+    {
+        if (index >= 0 && index < editingGroupMappingRules.Count)
+        {
+            editingGroupMappingRules[index].DomainPattern = newDomain?.Trim() ?? "";
+            SyncGroupMappingTextFromRules();
+        }
+    }
+
+    private void OnEditingGroupRuleProfileChanged(int index, string? newProfile)
+    {
+        if (index >= 0 && index < editingGroupMappingRules.Count)
+        {
+            editingGroupMappingRules[index].AllowedProfileId = string.IsNullOrWhiteSpace(newProfile) ? "*" : newProfile.Trim();
+            populatedGroupHadSingleProfile = editingGroupMappingRules
+                .Select(r => r.AllowedProfileId)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Count() <= 1;
+            SyncGroupMappingTextFromRules();
+        }
+    }
+
+    private void SyncGroupMappingTextFromRules()
+    {
+        newGroupMappingDomains = string.Join(
+            ", ",
+            editingGroupMappingRules
+                .Where(r => !string.IsNullOrWhiteSpace(r.DomainPattern))
+                .Select(r => $"{r.DomainPattern.Trim()}@{(string.IsNullOrWhiteSpace(r.AllowedProfileId) ? "*" : r.AllowedProfileId.Trim())}"));
+        lastPopulatedGroupMappingDomains = newGroupMappingDomains;
     }
 
     private async Task AddAdditionalGroupRuleClick()

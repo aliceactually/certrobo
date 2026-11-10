@@ -32,6 +32,10 @@ public sealed record ExternalGroupMappingSummaryDto(
     DateTimeOffset CreatedAtUtc,
     IReadOnlyList<DomainPermissionRule> DomainPermissions);
 
+public sealed record ExternalGroupPermissionSpec(
+    string DomainPattern,
+    string AllowedProfileId = "*");
+
 public sealed class AccountManagementService(
     UserManager<ApplicationUser> userManager,
     RoleManager<IdentityRole> roleManager,
@@ -1039,8 +1043,94 @@ public sealed class AccountManagementService(
         return (true, null);
     }
 
+    public static bool TryParseDomainPatternAndProfile(
+        string? rawPatternOrSpec,
+        string? defaultAllowedProfileId,
+        out string canonicalDomainPattern,
+        out string canonicalProfileId,
+        out string? errorMessage)
+    {
+        canonicalDomainPattern = string.Empty;
+        canonicalProfileId = "*";
+        errorMessage = null;
+
+        if (string.IsNullOrWhiteSpace(rawPatternOrSpec))
+        {
+            errorMessage = "Domain pattern is invalid.";
+            return false;
+        }
+
+        string trimmed = rawPatternOrSpec.Trim();
+        string rawDomainPart = trimmed;
+        string rawProfilePart = string.IsNullOrWhiteSpace(defaultAllowedProfileId) ? "*" : defaultAllowedProfileId.Trim();
+
+        int atIdx = trimmed.IndexOf('@');
+        if (atIdx >= 0)
+        {
+            if (atIdx == 0 || atIdx == trimmed.Length - 1 || trimmed.IndexOf('@', atIdx + 1) >= 0)
+            {
+                errorMessage = $"Domain pattern '{rawPatternOrSpec}' is invalid.";
+                return false;
+            }
+
+            rawDomainPart = trimmed[..atIdx].Trim();
+            rawProfilePart = trimmed[(atIdx + 1)..].Trim();
+        }
+
+        if (rawProfilePart == "*")
+        {
+            canonicalProfileId = "*";
+        }
+        else if (CertificateProfiles.All.TryGetValue(rawProfilePart, out CertificateProfileDefinition? profDef))
+        {
+            canonicalProfileId = profDef.ProfileId;
+        }
+        else
+        {
+            errorMessage = $"Unknown certificate profile '{rawProfilePart}'.";
+            return false;
+        }
+
+        canonicalDomainPattern = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(rawDomainPart);
+        if (string.IsNullOrEmpty(canonicalDomainPattern))
+        {
+            errorMessage = $"Domain pattern '{rawDomainPart}' is invalid.";
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Creates or updates an external group role mapping and atomically replaces that group's domain/profile rule set
+    /// with an explicit set of (DomainPattern, AllowedProfileId) specifications.
+    /// Validates all inputs before modifying the database so an invalid domain pattern or profile leaves existing grants untouched.
+    /// </summary>
+    public async Task<(bool Succeeded, string? ErrorMessage, ExternalGroupRoleMapping? Mapping)> SetExternalGroupRoleMappingAsync(
+        string groupName,
+        string roleName,
+        IEnumerable<ExternalGroupPermissionSpec> permissionSpecs,
+        CancellationToken cancellationToken = default,
+        ClaimsPrincipal? actingPrincipal = null)
+    {
+        List<string> encodedSpecs = (permissionSpecs ?? [])
+            .Where(s => !string.IsNullOrWhiteSpace(s.DomainPattern))
+            .Select(s => $"{s.DomainPattern.Trim()}@{(string.IsNullOrWhiteSpace(s.AllowedProfileId) ? "*" : s.AllowedProfileId.Trim())}")
+            .ToList();
+
+        return await SetExternalGroupRoleMappingAsync(
+            groupName,
+            roleName,
+            encodedSpecs,
+            allowedProfileId: "*",
+            cancellationToken,
+            actingPrincipal);
+    }
+
     /// <summary>
     /// Creates or updates an external group role mapping and atomically replaces that group's domain/profile rule set.
+    /// Each entry in <paramref name="initialDomainPatterns"/> may be either a bare domain pattern (which uses <paramref name="allowedProfileId"/>)
+    /// or an explicit <c>domainPattern@profileId</c> pair so mixed-profile rule sets are preserved without flattening.
     /// Validates all inputs before modifying the database so an invalid domain pattern or profile leaves existing grants untouched.
     /// </summary>
     public async Task<(bool Succeeded, string? ErrorMessage, ExternalGroupRoleMapping? Mapping)> SetExternalGroupRoleMappingAsync(
@@ -1104,13 +1194,13 @@ public sealed class AccountManagementService(
             return (false, $"Role must be '{AppRoles.Administrator}' or '{AppRoles.Issuer}'.", null);
         }
 
-        string profile = string.IsNullOrWhiteSpace(allowedProfileId) ? "*" : allowedProfileId.Trim();
-        if (profile != "*" && !CertificateProfiles.All.ContainsKey(profile))
+        string defaultProfile = string.IsNullOrWhiteSpace(allowedProfileId) ? "*" : allowedProfileId.Trim();
+        if (defaultProfile != "*" && !CertificateProfiles.All.ContainsKey(defaultProfile))
         {
-            return (false, $"Unknown certificate profile '{profile}'.", null);
+            return (false, $"Unknown certificate profile '{defaultProfile}'.", null);
         }
 
-        List<string> canonicalDomains = [];
+        List<(string DomainPattern, string AllowedProfileId)> canonicalRules = [];
         if (domainPatterns != null)
         {
             foreach (string rawPattern in domainPatterns)
@@ -1120,15 +1210,23 @@ public sealed class AccountManagementService(
                     continue;
                 }
 
-                string canonical = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(rawPattern);
-                if (string.IsNullOrEmpty(canonical))
+                if (!TryParseDomainPatternAndProfile(
+                        rawPattern,
+                        defaultProfile,
+                        out string canonicalDomain,
+                        out string canonicalProfile,
+                        out string? parseErr))
                 {
-                    return (false, $"Domain pattern '{rawPattern}' is invalid.", null);
+                    return (false, parseErr ?? $"Domain pattern '{rawPattern}' is invalid.", null);
                 }
 
-                if (!canonicalDomains.Contains(canonical, StringComparer.OrdinalIgnoreCase))
+                bool alreadyPresent = canonicalRules.Any(r =>
+                    string.Equals(r.DomainPattern, canonicalDomain, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(r.AllowedProfileId, canonicalProfile, StringComparison.OrdinalIgnoreCase));
+
+                if (!alreadyPresent)
                 {
-                    canonicalDomains.Add(canonical);
+                    canonicalRules.Add((canonicalDomain, canonicalProfile));
                 }
             }
         }
@@ -1155,7 +1253,8 @@ public sealed class AccountManagementService(
             }
 
             // Atomically replace all existing DomainPermissionRules for this external group
-            // so updating a group to a narrower domain pattern or profile removes broader previous rules.
+            // so updating a group to a narrower domain pattern or profile removes broader previous rules,
+            // while preserving per-rule (DomainPattern, AllowedProfileId) pairs without flattening.
             List<DomainPermissionRule> existingGroupRules = await dbContext.DomainPermissionRules
                 .Where(r => r.SubjectType == PermissionSubjectTypes.ExternalGroup && r.SubjectValue == trimmedGroup)
                 .ToListAsync(cancellationToken);
@@ -1165,14 +1264,14 @@ public sealed class AccountManagementService(
                 dbContext.DomainPermissionRules.RemoveRange(existingGroupRules);
             }
 
-            foreach (string canonicalDomain in canonicalDomains)
+            foreach (var (canonicalDomain, canonicalProfile) in canonicalRules)
             {
                 dbContext.DomainPermissionRules.Add(new DomainPermissionRule
                 {
                     SubjectType = PermissionSubjectTypes.ExternalGroup,
                     SubjectValue = trimmedGroup,
                     DomainPattern = canonicalDomain,
-                    AllowedProfileId = profile
+                    AllowedProfileId = canonicalProfile
                 });
             }
 
@@ -1276,7 +1375,7 @@ public sealed class AccountManagementService(
         List<DomainPermissionRule> groupRules = await dbContext.DomainPermissionRules
             .AsNoTracking()
             .Where(r => r.SubjectType == PermissionSubjectTypes.ExternalGroup)
-            .OrderBy(r => r.DomainPattern)
+            .OrderBy(r => r.Id)
             .ToListAsync(cancellationToken);
 
         List<ExternalGroupMappingSummaryDto> summaries = new(mappings.Count);

@@ -2210,6 +2210,217 @@ public class OidcFederatedLoginTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task EditingGroupMapping_PreservesMixedProfilesWithoutFlattening_OnNoChangeSave_RoleChange_ReorderedRules_SameDomainMultiProfile_AndWildcardWithRestrictedProfile()
+    {
+        var (factory, idp, _) = CreateOidcTestHost();
+
+        using IServiceScope scope = factory.Services.CreateScope();
+        AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+        IssuancePolicyService policy = scope.ServiceProvider.GetRequiredService<IssuancePolicyService>();
+        OidcFederationService oidcSvc = scope.ServiceProvider.GetRequiredService<OidcFederationService>();
+
+        var (_, _, admin) = await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*");
+        Assert.NotNull(admin);
+
+        // 1. Exact reproduction of Review #3 P1:
+        //    Configure group 'dev' with 'a.example.test -> *' and 'b.example.test -> tls-server-ecdsa-256'.
+        var (initOk, initErr, _) = await acct.SetExternalGroupRoleMappingAsync(
+            "dev",
+            AppRoles.Issuer,
+            [
+                new ExternalGroupPermissionSpec("a.example.test", "*"),
+                new ExternalGroupPermissionSpec("b.example.test", CertificateProfiles.EcdsaP256ServerId)
+            ]);
+        Assert.True(initOk, initErr);
+
+        OidcLoginOutcome login = await oidcSvc.ProcessValidatedOidcLoginAsync(
+            new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim("sub", "sub-mixed-prof-user"),
+                new Claim("iss", idp.Issuer),
+                new Claim("groups", "dev"),
+                new Claim("preferred_username", "mixed.user")
+            ], "TestOidc")),
+            idp.Issuer,
+            "sub-mixed-prof-user");
+        Assert.True(login.Succeeded);
+        string extUserId = login.User!.Id;
+
+        KeyPair ec256 = _crypto.KeyGen(256);
+        KeyPair rsa2048 = _crypto.KeyGen(2048);
+        KeyPair rsa4096 = _crypto.KeyGen(4096);
+
+        string aEc256Csr = _crypto.CSRGen(ec256, "a.example.test", ["a.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string aRsa2048Csr = _crypto.CSRGen(rsa2048, "a.example.test", ["a.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string bEc256Csr = _crypto.CSRGen(ec256, "b.example.test", ["b.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string bRsa2048Csr = _crypto.CSRGen(rsa2048, "b.example.test", ["b.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+
+        // Verify issuance decisions BEFORE UI edit:
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, aEc256Csr)).IsAllowed);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, aRsa2048Csr)).IsAllowed);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, bEc256Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, bRsa2048Csr)).IsAllowed); // b.example.test only allows ECDSA-256!
+
+        CertRobo.Pages.Admin adminPage = new();
+        SetProperty(adminPage, "AccountService", acct);
+        SetProperty(adminPage, "CaService", scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>());
+        SetProperty(adminPage, "CesService", scope.ServiceProvider.GetRequiredService<AdCsCesEnrollmentService>());
+        SetProperty(adminPage, "BackupService", scope.ServiceProvider.GetRequiredService<BackupRestoreService>());
+        SetProperty(adminPage, "MigrationService", scope.ServiceProvider.GetRequiredService<LegacySettingsMigrationService>());
+        SetProperty(adminPage, "Configuration", scope.ServiceProvider.GetRequiredService<IConfiguration>());
+        SetProperty(adminPage, "HostEnvironment", scope.ServiceProvider.GetRequiredService<IWebHostEnvironment>());
+        SetProperty(adminPage, "AuthenticationStateProvider", new ControllableAuthStateProvider(admin!.Id, admin.UserName!, AppRoles.Administrator, admin.SecurityStamp));
+        SetProperty(adminPage, "NotificationService", scope.ServiceProvider.GetRequiredService<Radzen.NotificationService>());
+
+        await InvokeMethodAsync(adminPage, "OnInitializedAsync");
+
+        // 2. Click Edit / Replace (PopulateEditGroupMappingForm) and Save (SaveExternalGroupMappingClick) WITHOUT changing anything (no-change save):
+        ExternalGroupMappingSummaryDto devSummaryBefore = (await acct.ListExternalGroupMappingsAsync()).Single(m => m.GroupName == "dev");
+        await InvokeMethodAsync(adminPage, "PopulateEditGroupMappingForm", devSummaryBefore);
+        await InvokeMethodAsync(adminPage, "SaveExternalGroupMappingClick");
+
+        ExternalGroupMappingSummaryDto devSummaryAfterNoChange = (await acct.ListExternalGroupMappingsAsync()).Single(m => m.GroupName == "dev");
+        Assert.Equal(2, devSummaryAfterNoChange.DomainPermissions.Count);
+        Assert.Contains(devSummaryAfterNoChange.DomainPermissions, r => r.DomainPattern == "a.example.test" && r.AllowedProfileId == "*");
+        Assert.Contains(devSummaryAfterNoChange.DomainPermissions, r => r.DomainPattern == "b.example.test" && r.AllowedProfileId == CertificateProfiles.EcdsaP256ServerId);
+
+        // Verify issuance decisions AFTER no-change save: b.example.test MUST STILL BE DENIED for RSA-2048!
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, aRsa2048Csr)).IsAllowed);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, bEc256Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, bRsa2048Csr)).IsAllowed);
+
+        // 3. Role-only edit via UI: change role from Issuer to Administrator and save -> must preserve both mixed-profile rules!
+        await InvokeMethodAsync(adminPage, "PopulateEditGroupMappingForm", devSummaryAfterNoChange);
+        SetField(adminPage, "newGroupMappingRole", AppRoles.Administrator);
+        await InvokeMethodAsync(adminPage, "SaveExternalGroupMappingClick");
+
+        ExternalGroupMappingSummaryDto devSummaryAfterRoleEdit = (await acct.ListExternalGroupMappingsAsync()).Single(m => m.GroupName == "dev");
+        Assert.Equal(AppRoles.Administrator, devSummaryAfterRoleEdit.RoleName);
+        Assert.Equal(2, devSummaryAfterRoleEdit.DomainPermissions.Count);
+        Assert.Contains(devSummaryAfterRoleEdit.DomainPermissions, r => r.DomainPattern == "a.example.test" && r.AllowedProfileId == "*");
+        Assert.Contains(devSummaryAfterRoleEdit.DomainPermissions, r => r.DomainPattern == "b.example.test" && r.AllowedProfileId == CertificateProfiles.EcdsaP256ServerId);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, bRsa2048Csr)).IsAllowed);
+
+        // 4. Reordered rules (restricted profile rule FIRST, '*' profile rule SECOND):
+        //    Verify Edit + Save neither narrows a.example.test to ECDSA-256 nor widens b.example.test to '*'!
+        await acct.SetExternalGroupRoleMappingAsync(
+            "dev",
+            AppRoles.Issuer,
+            [
+                new ExternalGroupPermissionSpec("b.example.test", CertificateProfiles.EcdsaP256ServerId),
+                new ExternalGroupPermissionSpec("a.example.test", "*")
+            ]);
+        ExternalGroupMappingSummaryDto devReordered = (await acct.ListExternalGroupMappingsAsync()).Single(m => m.GroupName == "dev");
+        Assert.Equal("b.example.test", devReordered.DomainPermissions[0].DomainPattern);
+        Assert.Equal(CertificateProfiles.EcdsaP256ServerId, devReordered.DomainPermissions[0].AllowedProfileId);
+
+        await InvokeMethodAsync(adminPage, "PopulateEditGroupMappingForm", devReordered);
+        await InvokeMethodAsync(adminPage, "SaveExternalGroupMappingClick");
+
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, aRsa2048Csr)).IsAllowed); // a.example.test still allows RSA-2048!
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, bEc256Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, bRsa2048Csr)).IsAllowed); // b.example.test still denies RSA-2048!
+
+        // 5. Same domain with multiple profiles + multiple domains per profile + '*' domain with restricted profile:
+        //    - shared.example.test -> tls-server-ecdsa-256 AND tls-server-rsa-2048 (denies RSA-4096)
+        //    - multi1.example.test, multi2.example.test -> tls-server-ecdsa-256
+        //    - * -> tls-server-ecdsa-256 (all domains allowed for ECDSA-256, but NOT for RSA-4096)
+        await acct.SetExternalGroupRoleMappingAsync(
+            "dev",
+            AppRoles.Issuer,
+            [
+                new ExternalGroupPermissionSpec("shared.example.test", CertificateProfiles.EcdsaP256ServerId),
+                new ExternalGroupPermissionSpec("shared.example.test", CertificateProfiles.Rsa2048ServerId),
+                new ExternalGroupPermissionSpec("multi1.example.test", CertificateProfiles.EcdsaP256ServerId),
+                new ExternalGroupPermissionSpec("multi2.example.test", CertificateProfiles.EcdsaP256ServerId),
+                new ExternalGroupPermissionSpec("*", CertificateProfiles.EcdsaP256ServerId)
+            ]);
+
+        ExternalGroupMappingSummaryDto complexSummary = (await acct.ListExternalGroupMappingsAsync()).Single(m => m.GroupName == "dev");
+        Assert.Equal(5, complexSummary.DomainPermissions.Count);
+
+        // Edit and save through the UI component
+        await InvokeMethodAsync(adminPage, "PopulateEditGroupMappingForm", complexSummary);
+        await InvokeMethodAsync(adminPage, "SaveExternalGroupMappingClick");
+
+        ExternalGroupMappingSummaryDto complexAfterSave = (await acct.ListExternalGroupMappingsAsync()).Single(m => m.GroupName == "dev");
+        Assert.Equal(5, complexAfterSave.DomainPermissions.Count);
+
+        string sharedEc256Csr = _crypto.CSRGen(ec256, "shared.example.test", ["shared.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string sharedRsa2048Csr = _crypto.CSRGen(rsa2048, "shared.example.test", ["shared.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string sharedRsa4096Csr = _crypto.CSRGen(rsa4096, "shared.example.test", ["shared.example.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string anyEc256Csr = _crypto.CSRGen(ec256, "any.other.test", ["any.other.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string anyRsa2048Csr = _crypto.CSRGen(rsa2048, "any.other.test", ["any.other.test"], "US", "WA", "Redmond", "Contoso", "IT", "");
+
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, sharedEc256Csr)).IsAllowed);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, sharedRsa2048Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, sharedRsa4096Csr)).IsAllowed);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, anyEc256Csr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, anyRsa2048Csr)).IsAllowed);
+    }
+
+    [Fact]
+    public async Task SingleLabelPrivateWildcardSuffixes_DotLocalAndDotInternal_RemainValidForExistingAndNewRules_WhileSingleLabelCertificateNamesAreRejected()
+    {
+        var (factory, idp, _) = CreateOidcTestHost();
+
+        using IServiceScope scope = factory.Services.CreateScope();
+        AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+        IssuancePolicyService policy = scope.ServiceProvider.GetRequiredService<IssuancePolicyService>();
+        OidcFederationService oidcSvc = scope.ServiceProvider.GetRequiredService<OidcFederationService>();
+        CertRoboDbContext db = scope.ServiceProvider.GetRequiredService<CertRoboDbContext>();
+
+        var (_, _, admin) = await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*.local");
+        Assert.NotNull(admin);
+
+        // 1. Verify '*.local' and '*.internal' canonicalize and match multi-label private FQDNs
+        Assert.Equal("*.local", DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity("*.local"));
+        Assert.Equal("*.internal", DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity("*.INTERNAL."));
+        Assert.True(DomainPolicyEvaluator.DomainMatchesPattern("nas.local", "*.local"));
+        Assert.True(DomainPolicyEvaluator.DomainMatchesPattern("printer.office.local", "*.local"));
+        Assert.True(DomainPolicyEvaluator.DomainMatchesPattern("*.sub.local", "*.local"));
+        Assert.True(DomainPolicyEvaluator.DomainMatchesPattern("vault.internal", "*.internal"));
+
+        // Malformed patterns and bare single-label patterns (without '*.') are still rejected
+        Assert.Equal(string.Empty, DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity("local"));
+        Assert.Equal(string.Empty, DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity("*."));
+        Assert.Equal(string.Empty, DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity("invalid domain!"));
+
+        // Single-label requested certificate identities (e.g. 'localhost' or 'local' or '*.local' as a cert CN/SAN) are still rejected
+        Assert.False(IssuancePolicyService.IsValidRequestedDnsIdentity("local", out _));
+        Assert.False(IssuancePolicyService.IsValidRequestedDnsIdentity("localhost", out _));
+        Assert.False(IssuancePolicyService.IsValidRequestedDnsIdentity("*.local", out _));
+        Assert.True(IssuancePolicyService.IsValidRequestedDnsIdentity("nas.local", out _));
+        Assert.True(IssuancePolicyService.IsValidRequestedDnsIdentity("*.sub.local", out _));
+
+        // 2. Simulate an existing pre-upgrade rule stored in SQLite for both a local user and an external OIDC group
+        await acct.SetExternalGroupRoleMappingAsync("lan-admins", AppRoles.Issuer, ["*.local", "*.internal"], "*");
+        OidcLoginOutcome extLogin = await oidcSvc.ProcessValidatedOidcLoginAsync(
+            new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim("sub", "sub-lan-user-1"),
+                new Claim("iss", idp.Issuer),
+                new Claim("groups", "lan-admins"),
+                new Claim("preferred_username", "lan.operator")
+            ], "TestOidc")),
+            idp.Issuer,
+            "sub-lan-user-1");
+        Assert.True(extLogin.Succeeded);
+
+        KeyPair ec256 = _crypto.KeyGen(256);
+        string nasLocalCsr = _crypto.CSRGen(ec256, "nas.local", ["nas.local", "backup.nas.local"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string vaultInternalCsr = _crypto.CSRGen(ec256, "vault.internal", ["vault.internal"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        string forbiddenCorpCsr = _crypto.CSRGen(ec256, "server.corp", ["server.corp"], "US", "WA", "Redmond", "Contoso", "IT", "");
+
+        // Local admin (with stored '*.local' rule from bootstrap) and external OIDC user (with '*.local' and '*.internal' group rules)
+        // can both issue certificates for 'nas.local'
+        Assert.True((await policy.EvaluateCsrRequestAsync(admin!.Id, nasLocalCsr)).IsAllowed);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extLogin.User!.Id, nasLocalCsr)).IsAllowed);
+        Assert.True((await policy.EvaluateCsrRequestAsync(extLogin.User.Id, vaultInternalCsr)).IsAllowed);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extLogin.User.Id, forbiddenCorpCsr)).IsAllowed);
+    }
+
     private sealed class ControllableAuthStateProvider : AuthenticationStateProvider
     {
         private ClaimsPrincipal _principal;

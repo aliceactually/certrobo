@@ -337,9 +337,14 @@ public sealed class OidcFederationOptions
 
             foreach (string rawPattern in mapping.DomainPatterns)
             {
-                if (string.IsNullOrWhiteSpace(DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(rawPattern)))
+                if (!AccountManagementService.TryParseDomainPatternAndProfile(
+                        rawPattern,
+                        profileId,
+                        out _,
+                        out _,
+                        out string? patternErr))
                 {
-                    return (false, $"Configured OIDC group '{mapping.GroupName}' specifies invalid domain pattern '{rawPattern}'.");
+                    return (false, $"Configured OIDC group '{mapping.GroupName}' specifies invalid domain rule '{rawPattern}': {patternErr}");
                 }
             }
         }
@@ -566,23 +571,28 @@ public sealed class OidcFederationOptions
                     role = rhs;
                 }
 
-                int atIdx = domainsPart.IndexOf('@');
-                if (atIdx >= 0)
-                {
-                    profileId = domainsPart[(atIdx + 1)..].Trim();
-                    domainsPart = domainsPart[..atIdx].Trim();
-                }
-
-                List<string> domains = domainsPart
+                List<string> rawTokens = domainsPart
                     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                     .ToList();
+
+                // If only the final comma-separated token carries '@<profileId>' (e.g. "*.contoso.com,contoso.com@tls-server-ecdsa-256"),
+                // treat that suffix as the default profile for all bare patterns in this group entry.
+                // If earlier tokens also carry '@<profileId>' (e.g. "a.example.test@*,b.example.test@tls-server-ecdsa-256"),
+                // preserve the explicit per-token '@<profileId>' specifications on each token.
+                if (rawTokens.Count > 0
+                    && rawTokens.Take(rawTokens.Count - 1).All(t => !t.Contains('@'))
+                    && rawTokens[^1].IndexOf('@') is int lastAt and > 0)
+                {
+                    profileId = rawTokens[^1][(lastAt + 1)..].Trim();
+                    rawTokens[^1] = rawTokens[^1][..lastAt].Trim();
+                }
 
                 list.Add(new ConfiguredOidcGroupMapping
                 {
                     GroupName = groupName,
                     Role = string.IsNullOrWhiteSpace(role) ? AppRoles.Issuer : role,
                     AllowedProfileId = string.IsNullOrWhiteSpace(profileId) ? "*" : profileId,
-                    DomainPatterns = domains
+                    DomainPatterns = rawTokens
                 });
             }
         }

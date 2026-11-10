@@ -54,10 +54,16 @@ public static class DomainPolicyEvaluator
             return string.Empty;
         }
 
-        string trimmed = input.Trim().TrimEnd('.');
-        if (trimmed == "*")
+        string rawTrimmed = input.Trim();
+        if (rawTrimmed == "*")
         {
             return "*";
+        }
+
+        string trimmed = rawTrimmed.TrimEnd('.');
+        if (trimmed == "*")
+        {
+            return string.Empty;
         }
 
         bool isWildcard = false;
@@ -90,7 +96,9 @@ public static class DomainPolicyEvaluator
         }
 
         string[] labels = hostPart.Split('.');
-        if (labels.Length < 2 || labels.Any(string.IsNullOrWhiteSpace))
+        int minLabels = isWildcard ? 1 : 2;
+        if (labels.Length < minLabels
+            || labels.Any(l => string.IsNullOrWhiteSpace(l) || l.StartsWith('-') || l.EndsWith('-')))
         {
             return string.Empty;
         }

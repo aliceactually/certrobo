@@ -71,6 +71,12 @@ public class BaselineCryptoAndPolicyTests
     // Global wildcard * matches everything
     [InlineData("anything.example.org", "*", true)]
     [InlineData("*.anything.example.org", "*", true)]
+    // Single-label private suffixes (*.local, *.internal) match multi-label hosts under those suffixes
+    [InlineData("nas.local", "*.local", true)]
+    [InlineData("deep.nas.local", "*.local", true)]
+    [InlineData("*.sub.local", "*.local", true)]
+    [InlineData("db.internal", "*.internal", true)]
+    [InlineData("nas.other", "*.local", false)]
     public void DomainMatchesPattern_PreservesExistingWildcardAndApexSemantics(
         string requestedDomain, string allowedPattern, bool expectedMatch)
     {
