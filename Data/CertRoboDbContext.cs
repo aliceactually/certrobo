@@ -20,6 +20,47 @@ public static class PermissionSubjectTypes
     public const string ExternalGroup = "ExternalGroup";
 }
 
+public static class LoginEmphasisModes
+{
+    public const string LocalPrimary = "Local";
+    public const string OidcPrimary = "Oidc";
+
+    public static string Normalize(string? mode) =>
+        string.Equals(mode?.Trim(), OidcPrimary, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(mode?.Trim(), "OidcPrimary", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(mode?.Trim(), "Federated", StringComparison.OrdinalIgnoreCase)
+            ? OidcPrimary
+            : LocalPrimary;
+}
+
+public class OidcPortalSettingsConfig
+{
+    [Key]
+    public int Id { get; set; } = 1;
+
+    /// <summary>
+    /// Durable marker persisted in SQLite indicating that initial configured OIDC group mappings
+    /// have already been imported (or that group mappings have been modified in the database),
+    /// preventing process restarts from re-creating removed mappings, roles, or domain rules.
+    /// </summary>
+    public bool HasSeededConfiguredGroupMappings { get; set; }
+
+    /// <summary>
+    /// True once an administrator saves custom OIDC portal login settings via UI or CLI.
+    /// </summary>
+    public bool IsCustomizedByAdmin { get; set; }
+
+    [Required]
+    [MaxLength(128)]
+    public string ProviderDisplayName { get; set; } = "OpenID Connect";
+
+    [Required]
+    [MaxLength(32)]
+    public string DefaultLoginMode { get; set; } = LoginEmphasisModes.LocalPrimary;
+
+    public DateTimeOffset UpdatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public class ApplicationUser : IdentityUser
 {
     public bool IsDisabled { get; set; }
@@ -438,6 +479,7 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
 {
     public DbSet<DomainPermissionRule> DomainPermissionRules => Set<DomainPermissionRule>();
     public DbSet<ExternalGroupRoleMapping> ExternalGroupRoleMappings => Set<ExternalGroupRoleMapping>();
+    public DbSet<OidcPortalSettingsConfig> OidcPortalSettings => Set<OidcPortalSettingsConfig>();
     public DbSet<SubjectDefaultsConfig> SubjectDefaults => Set<SubjectDefaultsConfig>();
     public DbSet<CaAuthorityRecord> CaAuthorities => Set<CaAuthorityRecord>();
     public DbSet<PendingCaEnrollmentRecord> PendingCaEnrollments => Set<PendingCaEnrollmentRecord>();
@@ -729,10 +771,22 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
                 ON "ExternalGroupRoleMappings" ("GroupName");
             """;
 
+        const string createOidcPortalSettingsTableSql = """
+            CREATE TABLE IF NOT EXISTS "OidcPortalSettings" (
+                "Id" INTEGER NOT NULL CONSTRAINT "PK_OidcPortalSettings" PRIMARY KEY AUTOINCREMENT,
+                "HasSeededConfiguredGroupMappings" INTEGER NOT NULL DEFAULT 0,
+                "IsCustomizedByAdmin" INTEGER NOT NULL DEFAULT 0,
+                "ProviderDisplayName" TEXT NOT NULL DEFAULT 'OpenID Connect',
+                "DefaultLoginMode" TEXT NOT NULL DEFAULT 'Local',
+                "UpdatedAtUtc" TEXT NOT NULL
+            );
+            """;
+
         await Database.ExecuteSqlRawAsync(createPendingTableSql, cancellationToken);
         await Database.ExecuteSqlRawAsync(createCesConfigTableSql, cancellationToken);
         await Database.ExecuteSqlRawAsync(createRevocationEventsTableSql, cancellationToken);
         await Database.ExecuteSqlRawAsync(createExternalGroupMappingsTableSql, cancellationToken);
+        await Database.ExecuteSqlRawAsync(createOidcPortalSettingsTableSql, cancellationToken);
         await EnsureAspNetUsersExternalColumnsAsync(cancellationToken);
         await Database.ExecuteSqlRawAsync(
             """

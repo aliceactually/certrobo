@@ -789,14 +789,13 @@ public class OidcFederatedLoginTests : IDisposable
     }
 
     [Fact]
-    public async Task GroupMappings_EnforceRolesAndDomainProfilePolicy_SupportCustomClaimNames_AndRejectUnmappedOrMissingClaims()
+    public async Task GroupMappings_EnforceRolesAndDomainProfilePolicy_SupportCustomGroupClaimNames_AndBindStrictlyToStandardOidcSub()
     {
-        // Configure non-default claim types and UserInfo endpoint retrieval to prove provider-agnostic OIDC behavior
+        // Configure custom GroupClaimType and UserInfo endpoint retrieval while binding identity strictly to standard OIDC 'sub'
         var (factory, idp, _) = CreateOidcTestHost(configureOidc: opts =>
         {
             opts.GroupClaimType = " directory_groups ";
             opts.GroupClaimType = opts.GroupClaimType.Trim();
-            opts.SubjectClaimType = "oid";
             opts.GetClaimsFromUserInfoEndpoint = true;
         });
 
@@ -820,10 +819,10 @@ public class OidcFederatedLoginTests : IDisposable
             Assert.True(mapOk, mapErr);
         }
 
-        // 1. Reject login when required OIDC 'sub' or custom subject claim ("oid") is missing
+        // 1. Reject login when required standard OIDC 'sub' claim is missing in ID token
         await AssertOidcCallbackRejectedAsync(factory, idp, authUri =>
-            idp.IssueAuthorizationCode(authUri, subject: null, subjectClaimType: "oid", groupClaimType: "directory_groups", groups: ["ecdsa256-app-issuers"]),
-            "subject");
+            idp.IssueAuthorizationCode(authUri, subject: null, subjectClaimType: "sub", groupClaimType: "directory_groups", groups: ["ecdsa256-app-issuers"]),
+            "sub");
 
         // 2. Reject login when group claims are missing
         await AssertOidcCallbackRejectedAsync(factory, idp, authUri =>
@@ -835,8 +834,7 @@ public class OidcFederatedLoginTests : IDisposable
                 groups: [],
                 userInfoClaims: new Dictionary<string, object>
                 {
-                    ["sub"] = "user-no-groups",
-                    ["oid"] = "user-no-groups"
+                    ["sub"] = "user-no-groups"
                 }),
             "did not contain any 'directory_groups' group claims");
 
@@ -850,8 +848,7 @@ public class OidcFederatedLoginTests : IDisposable
                 groups: ["Everyone", "HR-Users"],
                 userInfoClaims: new Dictionary<string, object>
                 {
-                    ["sub"] = "user-unmapped",
-                    ["oid"] = "user-unmapped"
+                    ["sub"] = "user-unmapped"
                 }),
             "none of your identity provider groups are mapped");
 
@@ -875,7 +872,6 @@ public class OidcFederatedLoginTests : IDisposable
             userInfoClaims: new Dictionary<string, object>
             {
                 ["sub"] = "oid-issuer-42",
-                ["oid"] = "oid-issuer-42",
                 ["directory_groups"] = new[] { "ecdsa256-app-issuers" }
             });
 
@@ -1057,7 +1053,8 @@ public class OidcFederatedLoginTests : IDisposable
         using (IServiceScope scope = factory.Services.CreateScope())
         {
             AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
-            await acct.SetUserDisabledAsync(extUserId, isDisabled: true);
+            var (disExtOk, disExtErr) = await acct.SetUserDisabledAsync(extUserId, isDisabled: true);
+            Assert.True(disExtOk, disExtErr);
         }
 
         await AssertOidcCallbackRejectedAsync(factory, idp, authUri =>
@@ -1405,10 +1402,572 @@ public class OidcFederatedLoginTests : IDisposable
         Assert.Contains("Removed external group mapping 'CLI-Issuers'", rmOut);
     }
 
+    [Fact]
+    public async Task ConfiguredGroupMappings_DoNotResurrectAfterRemovalRoleChangeOrRuleDeletion_AcrossSeparateCliProcessesAndBackupRestore()
+    {
+        string dbPath = Path.Combine(_tempDir, "precedence-restart.db");
+        string caDir = Path.Combine(_tempDir, "precedence-restart-ca");
+        string dpDir = Path.Combine(_tempDir, "precedence-restart-dp");
+        Directory.CreateDirectory(caDir);
+        Directory.CreateDirectory(dpDir);
+
+        Dictionary<string, string> envWithConfiguredMappings = new()
+        {
+            ["CertRobo__Oidc__GroupMappingsSpec"] = "test-admins=Administrator:*;dev-issuers=Issuer:*.dev.contoso.com,dev.contoso.com@*"
+        };
+
+        // 1. Process #1: Bootstrap local admin while CertRobo__Oidc__GroupMappingsSpec is set
+        var (bootExit, bootOut, bootErr) = await RunCliAsync(
+            dbPath, caDir,
+            ["--bootstrap-admin", "admin", "AdminSecret!2026", "*"],
+            envWithConfiguredMappings);
+        Assert.True(bootExit == 0, $"Bootstrap failed: {bootOut}\n{bootErr}");
+
+        // Verify both configured mappings were seeded once
+        await using (CertRoboDbContext db1 = CreateSqliteContext(dbPath))
+        {
+            List<ExternalGroupRoleMapping> seeded = await db1.ExternalGroupRoleMappings.OrderBy(m => m.GroupName).ToListAsync();
+            Assert.Equal(2, seeded.Count);
+            Assert.Contains(seeded, m => m.GroupName == "test-admins" && m.RoleName == AppRoles.Administrator);
+            Assert.Contains(seeded, m => m.GroupName == "dev-issuers" && m.RoleName == AppRoles.Issuer);
+            OidcPortalSettingsConfig settingsRow = await db1.OidcPortalSettings.SingleAsync();
+            Assert.True(settingsRow.HasSeededConfiguredGroupMappings);
+        }
+
+        // 2. Process #2: Remove 'test-admins' via CLI while CertRobo__Oidc__GroupMappingsSpec is still set in environment
+        var (rmExit, rmOut, rmErr) = await RunCliAsync(
+            dbPath, caDir,
+            ["--remove-oidc-group-mapping", "test-admins"],
+            envWithConfiguredMappings);
+        Assert.True(rmExit == 0, $"Remove failed: {rmOut}\n{rmErr}");
+
+        // 3. Process #3: Change 'dev-issuers' role/domains via CLI and delete one of its domain rules
+        var (modExit, modOut, modErr) = await RunCliAsync(
+            dbPath, caDir,
+            ["--add-oidc-group-mapping", "dev-issuers", "Issuer", "*.restricted.contoso.com", "tls-server-ecdsa-256"],
+            envWithConfiguredMappings);
+        Assert.True(modExit == 0, $"Modify failed: {modOut}\n{modErr}");
+
+        await using (CertRoboDbContext db2 = CreateSqliteContext(dbPath))
+        {
+            // Remove the original '*.dev.contoso.com' and 'dev.contoso.com' rules from dev-issuers
+            List<DomainPermissionRule> oldRules = await db2.DomainPermissionRules
+                .Where(r => r.SubjectType == PermissionSubjectTypes.ExternalGroup
+                         && r.SubjectValue == "dev-issuers"
+                         && (r.DomainPattern == "*.dev.contoso.com" || r.DomainPattern == "dev.contoso.com"))
+                .ToListAsync();
+            Assert.Equal(2, oldRules.Count);
+            db2.DomainPermissionRules.RemoveRange(oldRules);
+            await db2.SaveChangesAsync();
+        }
+
+        // 4. Process #4 & #5: Run additional CLI processes with CertRobo__Oidc__GroupMappingsSpec still present in environment
+        //    (including a bootstrap attempt and a backup command) and verify neither 'test-admins' nor the deleted domain rules return!
+        var (reBootExit, _, _) = await RunCliAsync(
+            dbPath, caDir,
+            ["--bootstrap-admin", "admin2", "AdminSecret!2026", "*"],
+            envWithConfiguredMappings);
+        Assert.NotEqual(0, reBootExit);
+
+        string backupZipPath = Path.Combine(_tempDir, "precedence-backup.zip");
+        var (bakExit, bakOut, bakErr) = await RunCliAsync(
+            dbPath, caDir,
+            ["--backup", backupZipPath],
+            envWithConfiguredMappings);
+        Assert.True(bakExit == 0, $"Backup failed: {bakOut}\n{bakErr}");
+
+        await using (CertRoboDbContext dbAfterRestart = CreateSqliteContext(dbPath))
+        {
+            List<ExternalGroupRoleMapping> remainingMappings = await dbAfterRestart.ExternalGroupRoleMappings.ToListAsync();
+            ExternalGroupRoleMapping singleRemaining = Assert.Single(remainingMappings);
+            Assert.Equal("dev-issuers", singleRemaining.GroupName);
+            Assert.Equal(AppRoles.Issuer, singleRemaining.RoleName);
+
+            List<DomainPermissionRule> remainingGroupRules = await dbAfterRestart.DomainPermissionRules
+                .Where(r => r.SubjectType == PermissionSubjectTypes.ExternalGroup)
+                .ToListAsync();
+            DomainPermissionRule singleRule = Assert.Single(remainingGroupRules);
+            Assert.Equal("dev-issuers", singleRule.SubjectValue);
+            Assert.Equal("*.restricted.contoso.com", singleRule.DomainPattern);
+            Assert.Equal(CertificateProfiles.EcdsaP256ServerId, singleRule.AllowedProfileId);
+        }
+
+        // 5. Process #6 & #7: Restore the backup archive to a clean directory and start a new process with the same env vars;
+        //    verify the restored database also preserves the HasSeededConfiguredGroupMappings marker and does NOT resurrect 'test-admins'.
+        string restoredDbPath = Path.Combine(_tempDir, "precedence-restored", "certrobo.db");
+        string restoredCaDir = Path.Combine(_tempDir, "precedence-restored", "ca");
+        var (resExit, resOut, resErr) = await RunCliAsync(
+            restoredDbPath, restoredCaDir,
+            ["--restore", backupZipPath],
+            envWithConfiguredMappings);
+        Assert.True(resExit == 0, $"Restore failed: {resOut}\n{resErr}");
+
+        // Trigger startup EnsureRolesAndDefaultsAsync on the restored DB with CertRobo__Oidc__GroupMappingsSpec active
+        var (postResExit, _, _) = await RunCliAsync(
+            restoredDbPath, restoredCaDir,
+            ["--invalidate-external-sessions"],
+            envWithConfiguredMappings);
+        Assert.Equal(0, postResExit);
+
+        await using (CertRoboDbContext dbRestored = CreateSqliteContext(restoredDbPath))
+        {
+            List<ExternalGroupRoleMapping> restoredMappings = await dbRestored.ExternalGroupRoleMappings.ToListAsync();
+            ExternalGroupRoleMapping singleRestored = Assert.Single(restoredMappings);
+            Assert.Equal("dev-issuers", singleRestored.GroupName);
+            Assert.DoesNotContain(restoredMappings, m => m.GroupName == "test-admins");
+        }
+    }
+
+    [Fact]
+    public async Task SoleLocalAdminProtection_ConcurrentDisableDemoteSerialization_AndStaleAdminCircuitBoundaryChecks()
+    {
+        var (factory, _, _) = CreateOidcTestHost();
+
+        using IServiceScope scope = factory.Services.CreateScope();
+        AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+        UserManager<ApplicationUser> userMgr = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+
+        var (bootOk, bootErr, admin1) = await acct.BootstrapFirstAdminAsync("admin1", "AdminOnePass!2026", "admin1@contoso.com", "*");
+        Assert.True(bootOk, bootErr);
+        Assert.NotNull(admin1);
+
+        //Even if an external OIDC Administrator exists, the sole local Administrator with a local password CANNOT be disabled, demoted, or deleted
+        await acct.SetExternalGroupRoleMappingAsync("Ext-Admins", AppRoles.Administrator, ["*"], "*");
+        OidcFederationService oidcSvc = scope.ServiceProvider.GetRequiredService<OidcFederationService>();
+        OidcLoginOutcome extAdminLogin = await oidcSvc.ProcessValidatedOidcLoginAsync(
+            new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim("sub", "ext-admin-sub-1"),
+                new Claim("iss", LocalSignedOidcIdpFixture.DefaultIssuer),
+                new Claim("groups", "Ext-Admins"),
+                new Claim("preferred_username", "ext.admin")
+            ], "TestOidc")),
+            LocalSignedOidcIdpFixture.DefaultIssuer,
+            "ext-admin-sub-1");
+        Assert.True(extAdminLogin.Succeeded);
+
+        // 1. Sole local admin cannot be disabled, demoted, or deleted
+        var (soleDisableOk, soleDisableErr) = await acct.SetUserDisabledAsync(admin1!.Id, isDisabled: true);
+        Assert.False(soleDisableOk);
+        Assert.Contains("last active local Administrator", soleDisableErr);
+
+        var (soleDemoteOk, soleDemoteErr) = await acct.SetLocalUserRolesAsync(admin1.Id, [AppRoles.Issuer]);
+        Assert.False(soleDemoteOk);
+        Assert.Contains("last active local Administrator", soleDemoteErr);
+
+        var (soleDeleteOk, soleDeleteErr) = await acct.DeleteUserAsync(admin1.Id);
+        Assert.False(soleDeleteOk);
+        Assert.Contains("last active local Administrator", soleDeleteErr);
+
+        // 2. Create a second local administrator (admin2) and race two concurrent disables and two concurrent demotions:
+        //    Exactly ONE must succeed and the second must be rejected so at least one local admin always remains active!
+        var (create2Ok, create2Err, admin2) = await acct.CreateUserAsync(
+            "admin2", "AdminTwoPass!2026", "admin2@contoso.com", [AppRoles.Administrator, AppRoles.Issuer], ["*"]);
+        Assert.True(create2Ok, create2Err);
+        Assert.NotNull(admin2);
+
+        Task<(bool Succeeded, string? ErrorMessage)>[] concurrentDisables =
+        [
+            Task.Run(async () =>
+            {
+                using IServiceScope s = factory.Services.CreateScope();
+                return await s.ServiceProvider.GetRequiredService<AccountManagementService>().SetUserDisabledAsync(admin1.Id, true);
+            }),
+            Task.Run(async () =>
+            {
+                using IServiceScope s = factory.Services.CreateScope();
+                return await s.ServiceProvider.GetRequiredService<AccountManagementService>().SetUserDisabledAsync(admin2!.Id, true);
+            })
+        ];
+
+        var disableResults = await Task.WhenAll(concurrentDisables);
+        Assert.Equal(1, disableResults.Count(r => r.Succeeded));
+        Assert.Equal(1, disableResults.Count(r => !r.Succeeded));
+
+        // Re-enable both, then race two concurrent demotions
+        await acct.SetUserDisabledAsync(admin1.Id, false);
+        await acct.SetUserDisabledAsync(admin2!.Id, false);
+
+        Task<(bool Succeeded, string? ErrorMessage)>[] concurrentDemotes =
+        [
+            Task.Run(async () =>
+            {
+                using IServiceScope s = factory.Services.CreateScope();
+                return await s.ServiceProvider.GetRequiredService<AccountManagementService>().SetLocalUserRolesAsync(admin1.Id, [AppRoles.Issuer]);
+            }),
+            Task.Run(async () =>
+            {
+                using IServiceScope s = factory.Services.CreateScope();
+                return await s.ServiceProvider.GetRequiredService<AccountManagementService>().SetLocalUserRolesAsync(admin2.Id, [AppRoles.Issuer]);
+            })
+        ];
+
+        var demoteResults = await Task.WhenAll(concurrentDemotes);
+        Assert.Equal(1, demoteResults.Count(r => r.Succeeded));
+        Assert.Equal(1, demoteResults.Count(r => !r.Succeeded));
+
+        // Restore both to active Administrator
+        var (r1Ok, r1Err) = await acct.SetLocalUserRolesAsync(admin1.Id, [AppRoles.Administrator, AppRoles.Issuer]);
+        Assert.True(r1Ok, r1Err);
+        var (r2Ok, r2Err) = await acct.SetLocalUserRolesAsync(admin2.Id, [AppRoles.Administrator, AppRoles.Issuer]);
+        Assert.True(r2Ok, r2Err);
+
+        // 3. Stale circuit actor boundary tests on Pages.Admin:
+        //    Instantiate Pages.Admin bound to admin2's principal (including SecurityStamp).
+        ApplicationUser reloadedAdmin2 = (await userMgr.FindByIdAsync(admin2.Id))!;
+        await scope.ServiceProvider.GetRequiredService<CertRoboDbContext>().Entry(reloadedAdmin2).ReloadAsync();
+        ControllableAuthStateProvider circuitAuth = new(
+            reloadedAdmin2.Id,
+            reloadedAdmin2.UserName!,
+            AppRoles.Administrator,
+            reloadedAdmin2.SecurityStamp);
+
+        CertRobo.Pages.Admin adminPage = new();
+        SetProperty(adminPage, "AccountService", acct);
+        SetProperty(adminPage, "CaService", scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>());
+        SetProperty(adminPage, "CesService", scope.ServiceProvider.GetRequiredService<AdCsCesEnrollmentService>());
+        SetProperty(adminPage, "BackupService", scope.ServiceProvider.GetRequiredService<BackupRestoreService>());
+        SetProperty(adminPage, "MigrationService", scope.ServiceProvider.GetRequiredService<LegacySettingsMigrationService>());
+        SetProperty(adminPage, "Configuration", scope.ServiceProvider.GetRequiredService<IConfiguration>());
+        SetProperty(adminPage, "HostEnvironment", scope.ServiceProvider.GetRequiredService<IWebHostEnvironment>());
+        SetProperty(adminPage, "AuthenticationStateProvider", circuitAuth);
+        SetProperty(adminPage, "NotificationService", scope.ServiceProvider.GetRequiredService<Radzen.NotificationService>());
+
+        await InvokeMethodAsync(adminPage, "OnInitializedAsync");
+
+        // Disable admin2 via admin1 (or direct service call) while admin2's Admin component still holds its stale ClaimsPrincipal
+        var (dis2Ok, dis2Err) = await acct.SetUserDisabledAsync(admin2.Id, isDisabled: true);
+        Assert.True(dis2Ok, dis2Err);
+
+        IReadOnlyList<UserSummaryDto> usersSnapshot = await acct.ListUsersAsync();
+        UserSummaryDto admin2Dto = usersSnapshot.Single(u => u.Id == admin2.Id);
+        Assert.True(admin2Dto.IsDisabled);
+
+        // Stale disabled admin2 circuit attempts to re-enable itself via ToggleUserDisabledClick -> MUST BE DENIED with no side effects!
+        await InvokeMethodAsync(adminPage, "ToggleUserDisabledClick", admin2Dto);
+        Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage"));
+        Assert.True((await userMgr.FindByIdAsync(admin2.Id))!.IsDisabled);
+
+        // Stale disabled admin2 circuit attempts to create a user, add a group mapping, or change OIDC settings -> all MUST BE DENIED with no side effects!
+        SetField(adminPage, "newUserName", "rogue-user");
+        SetField(adminPage, "newUserPassword", "RoguePass!2026");
+        await InvokeMethodAsync(adminPage, "CreateUserClick");
+        Assert.Null(await userMgr.FindByNameAsync("rogue-user"));
+
+        SetField(adminPage, "newGroupMappingName", "Rogue-Group");
+        SetField(adminPage, "newGroupMappingRole", AppRoles.Administrator);
+        await InvokeMethodAsync(adminPage, "SaveExternalGroupMappingClick");
+        Assert.DoesNotContain(await acct.ListExternalGroupMappingsAsync(), m => m.GroupName == "Rogue-Group");
+
+        // Now re-enable admin2, refresh its circuit principal, then DEMOTE admin2 to Issuer only and verify stale admin circuit is denied
+        await acct.SetUserDisabledAsync(admin2.Id, isDisabled: false);
+        reloadedAdmin2 = (await userMgr.FindByIdAsync(admin2.Id))!;
+        circuitAuth.SetPrincipal(reloadedAdmin2.Id, reloadedAdmin2.UserName!, AppRoles.Administrator, reloadedAdmin2.SecurityStamp);
+
+        var (demote2Ok, demote2Err) = await acct.SetLocalUserRolesAsync(admin2.Id, [AppRoles.Issuer]);
+        Assert.True(demote2Ok, demote2Err);
+
+        // Stale demoted admin2 circuit (whose in-memory ClaimsPrincipal still says Role=Administrator) tries to promote itself or disable admin1 -> DENIED!
+        UserSummaryDto admin1Dto = (await acct.ListUsersAsync()).Single(u => u.Id == admin1.Id);
+        await InvokeMethodAsync(adminPage, "ToggleUserDisabledClick", admin1Dto);
+        Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage"));
+        Assert.False((await userMgr.FindByIdAsync(admin1.Id))!.IsDisabled);
+
+        // 4. Verify CLI break-glass password reset (--reset-admin-password) still works without an interactive actor
+        var (cliResetOk, cliResetErr) = await acct.ResetPasswordAsync(admin2.UserName!, "RecoveredViaCli!2026");
+        Assert.True(cliResetOk, cliResetErr);
+    }
+
+    [Fact]
+    public async Task ExternalOidcAccounts_IgnoreBroadLocalRoleRules_AndEnforceGroupAndDirectUserRulesOnly()
+    {
+        var (factory, idp, _) = CreateOidcTestHost();
+
+        using IServiceScope scope = factory.Services.CreateScope();
+        AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+        IssuancePolicyService policy = scope.ServiceProvider.GetRequiredService<IssuancePolicyService>();
+        OidcFederationService oidcSvc = scope.ServiceProvider.GetRequiredService<OidcFederationService>();
+
+        await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*");
+
+        // Configure a broad local Role rule: Role "Issuer" -> "*" (all domains and profiles)
+        var (roleRuleOk, roleRuleErr) = await acct.AddDomainPermissionAsync(
+            PermissionSubjectTypes.Role,
+            AppRoles.Issuer,
+            "*",
+            "*");
+        Assert.True(roleRuleOk, roleRuleErr);
+
+        // Configure a narrow external group mapping: "dev-only" -> Role "Issuer", domain "*.dev.contoso.com" only
+        await acct.SetExternalGroupRoleMappingAsync(
+            "dev-only",
+            AppRoles.Issuer,
+            ["*.dev.contoso.com"],
+            CertificateProfiles.EcdsaP256ServerId);
+
+        // Configure a second external group mapping: "stage-rsa" -> Role "Issuer", domain "*.stage.contoso.com" for RSA-2048 only
+        await acct.SetExternalGroupRoleMappingAsync(
+            "stage-rsa",
+            AppRoles.Issuer,
+            ["*.stage.contoso.com"],
+            CertificateProfiles.Rsa2048ServerId);
+
+        // Provision external user in both "dev-only" and "stage-rsa"
+        OidcLoginOutcome loginOutcome = await oidcSvc.ProcessValidatedOidcLoginAsync(
+            new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim("sub", "ext-scoped-user-1"),
+                new Claim("iss", idp.Issuer),
+                new Claim("groups", "dev-only"),
+                new Claim("groups", "stage-rsa"),
+                new Claim("preferred_username", "scoped.external")
+            ], "TestOidc")),
+            idp.Issuer,
+            "ext-scoped-user-1");
+        Assert.True(loginOutcome.Succeeded);
+        string extUserId = loginOutcome.User!.Id;
+
+        KeyPair ec256 = _crypto.KeyGen(256);
+        KeyPair rsa2048 = _crypto.KeyGen(2048);
+
+        // 1. CSR for prod.contoso.com MUST BE DENIED for the external user even though local Role "Issuer" has "*"!
+        string prodCsr = _crypto.CSRGen(ec256, "prod.contoso.com", ["prod.contoso.com"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        PolicyEvaluationResult prodEval = await policy.EvaluateCsrRequestAsync(extUserId, prodCsr);
+        Assert.False(prodEval.IsAllowed);
+        Assert.Contains("prod.contoso.com", prodEval.DenialReason);
+
+        // 2. CSR for app.dev.contoso.com with ECDSA P-256 is allowed via "dev-only" group rule
+        string devEcCsr = _crypto.CSRGen(ec256, "app.dev.contoso.com", ["app.dev.contoso.com"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, devEcCsr)).IsAllowed);
+
+        // 3. CSR for app.dev.contoso.com with RSA-2048 is DENIED because "dev-only" only allows EcdsaP256 and "stage-rsa" only allows *.stage.contoso.com
+        string devRsaCsr = _crypto.CSRGen(rsa2048, "app.dev.contoso.com", ["app.dev.contoso.com"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, devRsaCsr)).IsAllowed);
+
+        // 4. CSR for api.stage.contoso.com with RSA-2048 is allowed via "stage-rsa" group rule
+        string stageRsaCsr = _crypto.CSRGen(rsa2048, "api.stage.contoso.com", ["api.stage.contoso.com"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, stageRsaCsr)).IsAllowed);
+
+        // 5. Adding an explicit direct User rule for this external account ID grants that additional domain, and removing it revokes it immediately
+        await acct.AddDomainPermissionAsync(PermissionSubjectTypes.User, extUserId, "special.prod.contoso.com", CertificateProfiles.EcdsaP256ServerId);
+        string specialProdCsr = _crypto.CSRGen(ec256, "special.prod.contoso.com", ["special.prod.contoso.com"], "US", "WA", "Redmond", "Contoso", "IT", "");
+        Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, specialProdCsr)).IsAllowed);
+
+        UserSummaryDto extSummary = (await acct.ListUsersAsync()).Single(u => u.Id == extUserId);
+        Assert.Empty(extSummary.EffectiveRolePermissions!); // Local role rules never shown or applied to external users
+        Assert.Equal(2, extSummary.EffectiveGroupPermissions!.Count);
+        DomainPermissionRule directRule = Assert.Single(extSummary.DirectPermissions);
+
+        await acct.RemoveDomainPermissionAsync(directRule.Id);
+        Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, specialProdCsr)).IsAllowed);
+
+        // 6. Meanwhile, a LOCAL account in Role "Issuer" with no direct rules DOES inherit the local Role "Issuer -> *" rule
+        var (_, _, localIssuer) = await acct.CreateUserAsync("local-issuer", "LocalIssuer!2026", null, [AppRoles.Issuer], []);
+        Assert.True((await policy.EvaluateCsrRequestAsync(localIssuer!.Id, prodCsr)).IsAllowed);
+    }
+
+    [Fact]
+    public async Task StrictOidcSubBinding_RejectsNonSubSubjectClaimConfig_IsolatesDistinctUsersWithCollidingNonSubClaims_AndPreservesIdentityAcrossRenames()
+    {
+        // 1. Configuring SubjectClaimType != "sub" (e.g. "email" or "oid") is rejected by OidcFederationOptions.Validate()
+        OidcFederationOptions mutableSubConfig = new()
+        {
+            Enabled = true,
+            Issuer = "https://idp.example.test",
+            ClientId = "cid",
+            ClientSecret = "sec",
+            PublicCallbackUrl = "https://pki.contoso.com/signin-oidc",
+            SubjectClaimType = "email"
+        };
+        var (valid, valErr) = mutableSubConfig.Validate();
+        Assert.False(valid);
+        Assert.Contains("must be 'sub'", valErr);
+
+        // 2. Two distinct IdP users (sub="00u-alice-immutable" and sub="00u-bob-immutable") who share or swap the same
+        //    email, preferred_username, and custom 'oid' claim are strictly isolated into two distinct ApplicationUser records.
+        var (factory, idp, _) = CreateOidcTestHost();
+        using IServiceScope scope = factory.Services.CreateScope();
+        AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+        OidcFederationService oidcSvc = scope.ServiceProvider.GetRequiredService<OidcFederationService>();
+
+        await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*");
+        await acct.SetExternalGroupRoleMappingAsync("Cert-Issuers", AppRoles.Issuer, ["*.contoso.com"], "*");
+
+        ClaimsIdentity user1Identity = new(
+        [
+            new Claim("sub", "00u-alice-immutable"),
+            new Claim("iss", idp.Issuer),
+            new Claim("oid", "shared-mutable-oid"),
+            new Claim("email", "shared-alias@contoso.com"),
+            new Claim("preferred_username", "shared.handle"),
+            new Claim("name", "Alice Original"),
+            new Claim("groups", "Cert-Issuers")
+        ], "TestOidc");
+
+        OidcLoginOutcome outcome1 = await oidcSvc.ProcessValidatedOidcLoginAsync(
+            new ClaimsPrincipal(user1Identity), idp.Issuer, "00u-alice-immutable");
+        Assert.True(outcome1.Succeeded, outcome1.ErrorMessage);
+
+        ClaimsIdentity user2IdentityWithCollidingClaims = new(
+        [
+            new Claim("sub", "00u-bob-immutable"),
+            new Claim("iss", idp.Issuer),
+            new Claim("oid", "shared-mutable-oid"),
+            new Claim("email", "shared-alias@contoso.com"),
+            new Claim("preferred_username", "shared.handle"),
+            new Claim("name", "Bob Colliding"),
+            new Claim("groups", "Cert-Issuers")
+        ], "TestOidc");
+
+        OidcLoginOutcome outcome2 = await oidcSvc.ProcessValidatedOidcLoginAsync(
+            new ClaimsPrincipal(user2IdentityWithCollidingClaims), idp.Issuer, "00u-bob-immutable");
+        Assert.True(outcome2.Succeeded, outcome2.ErrorMessage);
+        Assert.NotEqual(outcome1.User!.Id, outcome2.User!.Id);
+
+        // 3. When user 1 renames their email, preferred_username, and display name while keeping sub="00u-alice-immutable",
+        //    they resolve to the exact same ApplicationUser record.
+        ClaimsIdentity user1Renamed = new(
+        [
+            new Claim("sub", "00u-alice-immutable"),
+            new Claim("iss", idp.Issuer),
+            new Claim("email", "alice.newname@contoso.com"),
+            new Claim("preferred_username", "alice.newname"),
+            new Claim("name", "Alice Renamed"),
+            new Claim("groups", "Cert-Issuers")
+        ], "TestOidc");
+
+        OidcLoginOutcome outcome1AfterRename = await oidcSvc.ProcessValidatedOidcLoginAsync(
+            new ClaimsPrincipal(user1Renamed), idp.Issuer, "00u-alice-immutable");
+        Assert.True(outcome1AfterRename.Succeeded);
+        Assert.Equal(outcome1.User.Id, outcome1AfterRename.User!.Id);
+        Assert.Equal("alice.newname@contoso.com", outcome1AfterRename.User.Email);
+        Assert.Equal("Alice Renamed", outcome1AfterRename.User.DisplayName);
+    }
+
+    [Fact]
+    public async Task LoginPortalPresentation_SupportsAdminConfigurableProviderLabel_HtmlEscaping_BothDefaultEmphasisModes_AndPersistsAcrossRestart()
+    {
+        var (factory, _, _) = CreateOidcTestHost();
+
+        using (IServiceScope scope = factory.Services.CreateScope())
+        {
+            AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+            await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*");
+        }
+
+        using HttpClient client = factory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://pki.contoso.com"),
+            AllowAutoRedirect = false
+        });
+
+        // 1. Default mode is LocalPrimary: local login form appears before OIDC login form, local button is btn-primary,
+        //    and both local and OIDC sign-in paths are present on /login.
+        string initialLoginHtml = await client.GetStringAsync("/login");
+        Assert.Contains("data-default-login-mode=\"Local\"", initialLoginHtml);
+        int localFormIdx1 = initialLoginHtml.IndexOf("id=\"local-login-form\"", StringComparison.Ordinal);
+        int oidcFormIdx1 = initialLoginHtml.IndexOf("id=\"oidc-login-form\"", StringComparison.Ordinal);
+        Assert.True(localFormIdx1 > 0 && oidcFormIdx1 > localFormIdx1);
+        Assert.Contains("id=\"local-login-submit\" class=\"btn btn-primary w-100\"", initialLoginHtml);
+        Assert.Contains("id=\"oidc-login-submit\" class=\"btn btn-outline-primary w-100\"", initialLoginHtml);
+
+        // 2. Update provider label (including characters requiring HTML escaping) and switch default emphasis to OidcPrimary via Admin component
+        const string maliciousLabel = "Okta <script>alert(1)</script> & \"Corp\" SSO";
+        using (IServiceScope scope = factory.Services.CreateScope())
+        {
+            AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+            CertRobo.Pages.Admin adminPage = new();
+            SetProperty(adminPage, "AccountService", acct);
+            SetProperty(adminPage, "CaService", scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>());
+            SetProperty(adminPage, "CesService", scope.ServiceProvider.GetRequiredService<AdCsCesEnrollmentService>());
+            SetProperty(adminPage, "BackupService", scope.ServiceProvider.GetRequiredService<BackupRestoreService>());
+            SetProperty(adminPage, "MigrationService", scope.ServiceProvider.GetRequiredService<LegacySettingsMigrationService>());
+            SetProperty(adminPage, "Configuration", scope.ServiceProvider.GetRequiredService<IConfiguration>());
+            SetProperty(adminPage, "HostEnvironment", scope.ServiceProvider.GetRequiredService<IWebHostEnvironment>());
+            SetProperty(adminPage, "AuthenticationStateProvider", scope.ServiceProvider.GetRequiredService<AuthenticationStateProvider>());
+            SetProperty(adminPage, "NotificationService", scope.ServiceProvider.GetRequiredService<Radzen.NotificationService>());
+
+            await InvokeMethodAsync(adminPage, "OnInitializedAsync");
+            SetField(adminPage, "oidcPortalProviderDisplayName", maliciousLabel);
+            SetField(adminPage, "oidcPortalDefaultLoginMode", LoginEmphasisModes.OidcPrimary);
+            await InvokeMethodAsync(adminPage, "SaveOidcPortalSettingsClick");
+            Assert.Contains("OIDC Settings Saved", GetField<string?>(adminPage, "statusBannerMessage"));
+        }
+
+        // 3. Fetch /login and verify:
+        //    - Label is properly HTML-escaped (no raw <script> tag)
+        //    - OIDC login form now appears FIRST with btn-primary emphasis
+        //    - Local username/password login form remains present and accessible on the page for break-glass use during an IdP outage
+        string updatedLoginHtml = await client.GetStringAsync("/login");
+        Assert.Contains("data-default-login-mode=\"Oidc\"", updatedLoginHtml);
+        Assert.DoesNotContain("<script>alert(1)</script>", updatedLoginHtml);
+        Assert.Contains("Sign in with Okta &lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;Corp&quot; SSO", updatedLoginHtml);
+
+        int oidcFormIdx2 = updatedLoginHtml.IndexOf("id=\"oidc-login-form\"", StringComparison.Ordinal);
+        int localFormIdx2 = updatedLoginHtml.IndexOf("id=\"local-login-form\"", StringComparison.Ordinal);
+        Assert.True(oidcFormIdx2 > 0 && localFormIdx2 > oidcFormIdx2);
+        Assert.Contains("id=\"oidc-login-submit\" class=\"btn btn-primary w-100\"", updatedLoginHtml);
+        Assert.Contains("id=\"local-login-submit\" class=\"btn btn-outline-primary w-100\"", updatedLoginHtml);
+
+        // 4. Verify persistence across restart / fresh DI container against the same SQLite database even when
+        //    IConfiguration still has DisplayName="Corporate SSO" and DefaultLoginMode="Local"
+        using (IServiceScope scope = factory.Services.CreateScope())
+        {
+            AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+            await acct.EnsureRolesAndDefaultsAsync();
+            OidcPortalSettingsConfig persisted = await acct.GetOidcPortalSettingsAsync();
+            Assert.True(persisted.IsCustomizedByAdmin);
+            Assert.Equal(maliciousLabel, persisted.ProviderDisplayName);
+            Assert.Equal(LoginEmphasisModes.OidcPrimary, persisted.DefaultLoginMode);
+        }
+    }
+
+    private sealed class ControllableAuthStateProvider : AuthenticationStateProvider
+    {
+        private ClaimsPrincipal _principal;
+
+        public ControllableAuthStateProvider(string userId, string userName, string role, string? securityStamp)
+        {
+            _principal = BuildPrincipal(userId, userName, role, securityStamp);
+        }
+
+        public void SetPrincipal(string userId, string userName, string role, string? securityStamp)
+        {
+            _principal = BuildPrincipal(userId, userName, role, securityStamp);
+        }
+
+        private static ClaimsPrincipal BuildPrincipal(string userId, string userName, string role, string? securityStamp)
+        {
+            List<Claim> claims =
+            [
+                new Claim(ClaimTypes.NameIdentifier, userId),
+                new Claim(ClaimTypes.Name, userName),
+                new Claim(ClaimTypes.Role, role)
+            ];
+            if (!string.IsNullOrEmpty(securityStamp))
+            {
+                claims.Add(new Claim("AspNet.Identity.SecurityStamp", securityStamp));
+            }
+            return new ClaimsPrincipal(new ClaimsIdentity(claims, "TestAuth"));
+        }
+
+        public override Task<AuthenticationState> GetAuthenticationStateAsync() =>
+            Task.FromResult(new AuthenticationState(_principal));
+    }
+
+    private static CertRoboDbContext CreateSqliteContext(string dbPath)
+    {
+        DbContextOptions<CertRoboDbContext> opts = new DbContextOptionsBuilder<CertRoboDbContext>()
+            .UseSqlite($"Data Source={dbPath}")
+            .Options;
+        return new CertRoboDbContext(opts);
+    }
+
     private static async Task<(int ExitCode, string Stdout, string Stderr)> RunCliAsync(
         string dbPath,
         string caDir,
-        IReadOnlyList<string> cliArgs)
+        IReadOnlyList<string> cliArgs,
+        IReadOnlyDictionary<string, string>? extraEnv = null)
     {
         string certRoboDll = typeof(Program).Assembly.Location;
         System.Diagnostics.ProcessStartInfo psi = new("dotnet")
@@ -1427,6 +1986,14 @@ public class OidcFederatedLoginTests : IDisposable
         psi.Environment["CertRobo__DataDirectory"] = Path.GetDirectoryName(dbPath)!;
         psi.Environment["CertRobo__SqliteFilePath"] = dbPath;
         psi.Environment["CertRobo__CaStorageDirectory"] = caDir;
+        psi.Environment["CertRobo__CaPassphrase"] = "TestCaPassphrase!2026";
+        if (extraEnv != null)
+        {
+            foreach (var kv in extraEnv)
+            {
+                psi.Environment[kv.Key] = kv.Value;
+            }
+        }
 
         using System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi)!;
         string stdout = await proc.StandardOutput.ReadToEndAsync();

@@ -31,27 +31,74 @@ public static class WebEndpoints
                 ? string.Empty
                 : $"<div class=\"alert alert-danger\">{WebUtility.HtmlEncode(error)}</div>";
 
-            string oidcSectionHtml = string.Empty;
+            OidcPortalSettingsConfig portalSettings = await accountService.GetOidcPortalSettingsAsync(ctx.RequestAborted);
+            string providerLabel = !string.IsNullOrWhiteSpace(portalSettings.ProviderDisplayName)
+                ? portalSettings.ProviderDisplayName
+                : oidcOptions.DisplayName;
+            string effectiveDefaultMode = LoginEmphasisModes.Normalize(portalSettings.DefaultLoginMode);
+            bool oidcIsPrimary = oidcOptions.Enabled
+                && string.Equals(effectiveDefaultMode, LoginEmphasisModes.OidcPrimary, StringComparison.OrdinalIgnoreCase);
+
+            string localFormHtml = $$"""
+                <form method="post" action="/account/login" id="local-login-form" data-emphasis="{{(oidcIsPrimary ? "secondary" : "primary")}}">
+                    <input type="hidden" name="{{tokens.FormFieldName}}" value="{{tokens.RequestToken}}" />
+                    <input type="hidden" name="returnUrl" value="{{WebUtility.HtmlEncode(returnUrl)}}" />
+                    <div class="mb-3">
+                        <label class="form-label" for="userName">Username</label>
+                        <input class="form-control" id="userName" name="userName" type="text" required autocomplete="username" />
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="password">Password</label>
+                        <input class="form-control" id="password" name="password" type="password" required autocomplete="current-password" />
+                    </div>
+                    <button type="submit" id="local-login-submit" class="btn {{(oidcIsPrimary ? "btn-outline-primary" : "btn-primary")}} w-100">Sign In</button>
+                </form>
+                """;
+
+            string loginBodyHtml;
             if (oidcOptions.Enabled)
             {
                 var (oidcValid, oidcConfigErr) = oidcOptions.Validate();
                 if (oidcValid)
                 {
-                    oidcSectionHtml = $$"""
-                        <form method="post" action="/account/external-login" class="mb-3">
+                    string oidcFormHtml = $$"""
+                        <form method="post" action="/account/external-login" id="oidc-login-form" data-emphasis="{{(oidcIsPrimary ? "primary" : "secondary")}}">
                             <input type="hidden" name="{{tokens.FormFieldName}}" value="{{tokens.RequestToken}}" />
                             <input type="hidden" name="returnUrl" value="{{WebUtility.HtmlEncode(returnUrl)}}" />
-                            <button type="submit" class="btn btn-outline-primary w-100">
-                                Sign in with {{WebUtility.HtmlEncode(oidcOptions.DisplayName)}}
+                            <button type="submit" id="oidc-login-submit" class="btn {{(oidcIsPrimary ? "btn-primary" : "btn-outline-primary")}} w-100">
+                                Sign in with {{WebUtility.HtmlEncode(providerLabel)}}
                             </button>
                         </form>
-                        <div class="text-center text-muted small mb-3">&mdash; or sign in with a local account &mdash;</div>
                         """;
+
+                    if (oidcIsPrimary)
+                    {
+                        loginBodyHtml = $$"""
+                            {{oidcFormHtml}}
+                            <div class="text-center text-muted small my-3">&mdash; or sign in with a local account &mdash;</div>
+                            {{localFormHtml}}
+                            """;
+                    }
+                    else
+                    {
+                        loginBodyHtml = $$"""
+                            {{localFormHtml}}
+                            <div class="text-center text-muted small my-3">&mdash; or sign in with {{WebUtility.HtmlEncode(providerLabel)}} &mdash;</div>
+                            {{oidcFormHtml}}
+                            """;
+                    }
                 }
-                else if (!string.IsNullOrWhiteSpace(oidcConfigErr))
+                else
                 {
-                    oidcSectionHtml = $"<div class=\"alert alert-warning small mb-3\">{WebUtility.HtmlEncode(oidcConfigErr)}</div>";
+                    string warnHtml = !string.IsNullOrWhiteSpace(oidcConfigErr)
+                        ? $"<div class=\"alert alert-warning small mb-3\">{WebUtility.HtmlEncode(oidcConfigErr)}</div>"
+                        : string.Empty;
+                    loginBodyHtml = warnHtml + localFormHtml;
                 }
+            }
+            else
+            {
+                loginBodyHtml = localFormHtml;
             }
 
             string html = $$"""
@@ -67,23 +114,10 @@ public static class WebEndpoints
                 </head>
                 <body>
                     <div class="container" style="max-width: 460px; margin-top: 4rem;">
-                        <div class="card rz-card p-4">
+                        <div class="card rz-card p-4" data-default-login-mode="{{WebUtility.HtmlEncode(effectiveDefaultMode)}}">
                             <h3 class="mb-3">Sign in to CertRobo</h3>
                             {{errorHtml}}
-                            {{oidcSectionHtml}}
-                            <form method="post" action="/account/login">
-                                <input type="hidden" name="{{tokens.FormFieldName}}" value="{{tokens.RequestToken}}" />
-                                <input type="hidden" name="returnUrl" value="{{WebUtility.HtmlEncode(returnUrl)}}" />
-                                <div class="mb-3">
-                                    <label class="form-label" for="userName">Username</label>
-                                    <input class="form-control" id="userName" name="userName" type="text" required autocomplete="username" />
-                                </div>
-                                <div class="mb-3">
-                                    <label class="form-label" for="password">Password</label>
-                                    <input class="form-control" id="password" name="password" type="password" required autocomplete="current-password" />
-                                </div>
-                                <button type="submit" class="btn btn-primary w-100">Sign In</button>
-                            </form>
+                            {{loginBodyHtml}}
                         </div>
                     </div>
                 </body>

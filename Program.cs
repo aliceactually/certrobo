@@ -1299,12 +1299,15 @@ static void ConfigureOidcHandlerOptions(OpenIdConnectOptions options, OidcFedera
     string[] mappedClaimTypes =
     [
         oidcOptions.GroupClaimType,
-        oidcOptions.SubjectClaimType,
         oidcOptions.PreferredUsernameClaimType,
         oidcOptions.EmailClaimType,
         oidcOptions.DisplayNameClaimType
     ];
-    foreach (string claimType in mappedClaimTypes.Where(c => !string.IsNullOrWhiteSpace(c)).Distinct(StringComparer.Ordinal))
+    foreach (string claimType in mappedClaimTypes
+        .Where(c => !string.IsNullOrWhiteSpace(c)
+                 && !string.Equals(c.Trim(), "sub", StringComparison.OrdinalIgnoreCase)
+                 && !string.Equals(c.Trim(), "iss", StringComparison.OrdinalIgnoreCase))
+        .Distinct(StringComparer.Ordinal))
     {
         options.ClaimActions.Add(new MultiValueJsonClaimAction(claimType));
     }
@@ -1401,7 +1404,15 @@ static void ConfigureOidcHandlerOptions(OpenIdConnectOptions options, OidcFedera
                 return Task.CompletedTask;
             }
 
+            string? idTokenSub = context.SecurityToken?.Subject;
+            if (string.IsNullOrWhiteSpace(idTokenSub))
+            {
+                context.Fail("OIDC ID token is missing required 'sub' claim.");
+                return Task.CompletedTask;
+            }
+
             context.HttpContext.Items["certrobo:validated_token_issuer"] = context.SecurityToken?.Issuer;
+            context.HttpContext.Items["certrobo:validated_token_subject"] = idTokenSub;
             return Task.CompletedTask;
         },
         OnTicketReceived = async context =>
@@ -1409,6 +1420,9 @@ static void ConfigureOidcHandlerOptions(OpenIdConnectOptions options, OidcFedera
             OidcFederationService oidcService = context.HttpContext.RequestServices.GetRequiredService<OidcFederationService>();
             string? validatedIssuer = context.HttpContext.Items.TryGetValue("certrobo:validated_token_issuer", out object? rawIssuer)
                 ? rawIssuer as string
+                : null;
+            string? validatedSubject = context.HttpContext.Items.TryGetValue("certrobo:validated_token_subject", out object? rawSub)
+                ? rawSub as string
                 : null;
 
             if (context.Principal == null)
@@ -1421,6 +1435,7 @@ static void ConfigureOidcHandlerOptions(OpenIdConnectOptions options, OidcFedera
             OidcLoginOutcome outcome = await oidcService.ProcessValidatedOidcLoginAsync(
                 context.Principal,
                 validatedIssuer,
+                validatedSubject,
                 context.HttpContext.RequestAborted);
 
             if (!outcome.Succeeded || outcome.ApplicationPrincipal == null)

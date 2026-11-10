@@ -141,6 +141,7 @@ public sealed class OidcFederationOptions
 {
     public bool Enabled { get; set; }
     public string DisplayName { get; set; } = "OpenID Connect";
+    public string DefaultLoginMode { get; set; } = LoginEmphasisModes.LocalPrimary;
     public string Issuer { get; set; } = string.Empty;
     public string Authority { get; set; } = string.Empty;
     public string? MetadataAddress { get; set; }
@@ -172,6 +173,9 @@ public sealed class OidcFederationOptions
 
     public string EffectiveAuthority =>
         !string.IsNullOrWhiteSpace(Authority) ? Authority.Trim() : Issuer.Trim();
+
+    public string EffectiveDefaultLoginMode =>
+        LoginEmphasisModes.Normalize(DefaultLoginMode);
 
     public string EffectiveCallbackPath
     {
@@ -301,9 +305,10 @@ public sealed class OidcFederationOptions
             return (false, "OIDC GroupClaimType cannot be empty.");
         }
 
-        if (string.IsNullOrWhiteSpace(SubjectClaimType))
+        if (string.IsNullOrWhiteSpace(SubjectClaimType)
+            || !string.Equals(SubjectClaimType.Trim(), "sub", StringComparison.Ordinal))
         {
-            return (false, "OIDC SubjectClaimType cannot be empty.");
+            return (false, "OIDC SubjectClaimType must be 'sub'. External account identity is bound strictly to the standard OIDC 'sub' claim and validated issuer.");
         }
 
         if (MaxSessionLifetimeMinutes < 1 || MaxSessionLifetimeMinutes > 1440)
@@ -359,6 +364,11 @@ public sealed class OidcFederationOptions
         if (!string.IsNullOrWhiteSpace(section["DisplayName"]))
         {
             opts.DisplayName = section["DisplayName"]!.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(section["DefaultLoginMode"]))
+        {
+            opts.DefaultLoginMode = LoginEmphasisModes.Normalize(section["DefaultLoginMode"]);
         }
 
         if (!string.IsNullOrWhiteSpace(section["Issuer"]))
@@ -728,13 +738,14 @@ public sealed class OidcFederationService(
     }
 
     /// <summary>
-    /// Validates the authenticated OIDC principal against CertRobo's issuer, subject, account status,
+    /// Validates the authenticated OIDC principal against CertRobo's issuer, standard 'sub' subject claim, account status,
     /// and administrator-controlled group mappings, then provisions or updates the external user record
     /// keyed strictly by (ExternalIssuer, ExternalSubject) without linking by email or username.
     /// </summary>
     public async Task<OidcLoginOutcome> ProcessValidatedOidcLoginAsync(
         ClaimsPrincipal externalPrincipal,
         string? validatedTokenIssuer = null,
+        string? validatedIdTokenSubject = null,
         CancellationToken cancellationToken = default)
     {
         var (configValid, configErr) = oidcOptions.Validate();
@@ -756,10 +767,26 @@ public sealed class OidcFederationService(
             return new(false, "Access denied: OIDC token issuer does not match the configured trusted issuer.");
         }
 
-        string? subject = externalPrincipal.FindFirstValue(oidcOptions.SubjectClaimType)?.Trim();
-        if (string.IsNullOrWhiteSpace(subject) || subject.Length > 256)
+        List<string> subClaims = externalPrincipal.FindAll("sub")
+            .Select(c => c.Value?.Trim() ?? string.Empty)
+            .Where(v => !string.IsNullOrEmpty(v))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (subClaims.Count > 1)
         {
-            return new(false, $"Access denied: OIDC token is missing a valid '{oidcOptions.SubjectClaimType}' subject claim.");
+            return new(false, "Access denied: conflicting 'sub' subject claims were received.");
+        }
+
+        string? claimSub = subClaims.FirstOrDefault();
+        string? subject = !string.IsNullOrWhiteSpace(validatedIdTokenSubject)
+            ? validatedIdTokenSubject.Trim()
+            : claimSub;
+
+        if (string.IsNullOrWhiteSpace(subject)
+            || subject.Length > 256
+            || (!string.IsNullOrWhiteSpace(claimSub) && !string.Equals(claimSub, subject, StringComparison.Ordinal)))
+        {
+            return new(false, "Access denied: OIDC ID token is missing a valid 'sub' subject claim.");
         }
 
         IReadOnlyList<string> tokenGroups = ExtractGroupsFromPrincipal(externalPrincipal, oidcOptions.GroupClaimType);

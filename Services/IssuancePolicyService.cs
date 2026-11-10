@@ -127,22 +127,35 @@ public sealed class IssuancePolicyService(
             return new(false, csrError ?? "CSR validation failed.", null, user);
         }
 
-        // Gather applicable DomainPermissionRules for this user, their roles, and their active mapped external groups
-        List<DomainPermissionRule> rules = await dbContext.DomainPermissionRules
-            .Where(r =>
-                (r.SubjectType == PermissionSubjectTypes.User && r.SubjectValue == user.Id)
-                || (r.SubjectType == PermissionSubjectTypes.Role && userRoles.Contains(r.SubjectValue))
-                || (user.IsExternalAccount
-                    && r.SubjectType == PermissionSubjectTypes.ExternalGroup
-                    && activeMappedExternalGroups.Contains(r.SubjectValue)))
-            .ToListAsync(cancellationToken);
-
+        // Gather applicable DomainPermissionRules with explicit local vs. external precedence:
+        // - External OIDC accounts: union of their currently mapped ExternalGroup rules and any explicit direct User rules for this account ID.
+        //   Ordinary local Role rules (SubjectType == "Role") NEVER apply to external OIDC accounts so a broad local role rule
+        //   cannot widen a narrower external group restriction.
+        // - Local accounts: union of their direct User rules and local Role rules.
+        List<DomainPermissionRule> rules;
         if (user.IsExternalAccount)
         {
+            rules = await dbContext.DomainPermissionRules
+                .AsNoTracking()
+                .Where(r =>
+                    (r.SubjectType == PermissionSubjectTypes.User && r.SubjectValue == user.Id)
+                    || (r.SubjectType == PermissionSubjectTypes.ExternalGroup && activeMappedExternalGroups.Contains(r.SubjectValue)))
+                .ToListAsync(cancellationToken);
+
             rules = rules
-                .Where(r => r.SubjectType != PermissionSubjectTypes.ExternalGroup
-                         || activeMappedExternalGroups.Contains(r.SubjectValue, StringComparer.Ordinal))
+                .Where(r => r.SubjectType == PermissionSubjectTypes.User
+                         || (r.SubjectType == PermissionSubjectTypes.ExternalGroup
+                             && activeMappedExternalGroups.Contains(r.SubjectValue, StringComparer.Ordinal)))
                 .ToList();
+        }
+        else
+        {
+            rules = await dbContext.DomainPermissionRules
+                .AsNoTracking()
+                .Where(r =>
+                    (r.SubjectType == PermissionSubjectTypes.User && r.SubjectValue == user.Id)
+                    || (r.SubjectType == PermissionSubjectTypes.Role && userRoles.Contains(r.SubjectValue)))
+                .ToListAsync(cancellationToken);
         }
 
         // Filter rules that allow the resolved profile

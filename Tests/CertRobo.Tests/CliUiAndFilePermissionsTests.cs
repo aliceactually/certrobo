@@ -303,8 +303,11 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
         Assert.Equal(IssuanceStatus.Issued, (await caService.SearchCertificatesAsync("cert1.contoso.com", null)).Single().Status);
         Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage"));
 
+        // Create a second local administrator so disabling adminUser is allowed by the last-local-admin invariant
+        await acct.CreateUserAsync("backup-admin", "BackupAdmin!2026", "backup@contoso.com", [AppRoles.Administrator]);
         authProvider.SetPrincipal(adminUser.Id, "admin", AppRoles.Administrator);
-        await acct.SetUserDisabledAsync(adminUser.Id, true);
+        var (disOk, disErr) = await acct.SetUserDisabledAsync(adminUser.Id, true);
+        Assert.True(disOk, disErr);
         await InvokeMethodAsync(adminPage, "ConfirmRevokeCertClick");
         Assert.Equal(IssuanceStatus.Issued, (await caService.SearchCertificatesAsync("cert1.contoso.com", null)).Single().Status);
         Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage"));

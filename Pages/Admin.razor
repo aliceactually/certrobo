@@ -1072,6 +1072,7 @@
                                 {
                                     bool isSelected = selectedUserId == u.Id;
                                     IReadOnlyList<DomainPermissionRule> groupPerms = u.EffectiveGroupPermissions ?? [];
+                                    IReadOnlyList<DomainPermissionRule> rolePerms = u.EffectiveRolePermissions ?? [];
                                     <tr class="@(isSelected ? "user-row-selected" : "")">
                                         <td>
                                             <div class="d-flex flex-wrap align-items-center gap-1">
@@ -1106,7 +1107,7 @@
                                             }
                                         </td>
                                         <td>
-                                            @if (u.DirectPermissions.Count == 0 && groupPerms.Count == 0)
+                                            @if (u.DirectPermissions.Count == 0 && groupPerms.Count == 0 && rolePerms.Count == 0)
                                             {
                                                 <span class="text-muted-theme small">None assigned</span>
                                             }
@@ -1121,6 +1122,12 @@
                                                     {
                                                         <span class="badge bg-info text-dark" title="@($"Inherited from external group '{gPerm.SubjectValue}'")">
                                                             @gPerm.DomainPattern (@gPerm.AllowedProfileId via @gPerm.SubjectValue)
+                                                        </span>
+                                                    }
+                                                    @foreach (var rPerm in rolePerms)
+                                                    {
+                                                        <span class="badge bg-light text-dark border" title="@($"Inherited from local role '{rPerm.SubjectValue}' (applies to local accounts only)")">
+                                                            @rPerm.DomainPattern (@rPerm.AllowedProfileId via role @rPerm.SubjectValue)
                                                         </span>
                                                     }
                                                 </div>
@@ -1156,6 +1163,8 @@
             {
                 var u = SelectedUser;
                 IReadOnlyList<DomainPermissionRule> selectedGroupPerms = u.EffectiveGroupPermissions ?? [];
+                IReadOnlyList<DomainPermissionRule> selectedRolePerms = u.EffectiveRolePermissions ?? [];
+                bool isLocalAdmin = !u.IsExternalAccount && u.Roles.Contains(AppRoles.Administrator, StringComparer.OrdinalIgnoreCase);
                 <RadzenCard class="mb-4">
                     <div class="section-card-header">
                         <div>
@@ -1187,6 +1196,14 @@
                                     @onclick="() => InvalidateUserSessionClick(u)">
                                 Invalidate Active Sessions
                             </button>
+                            @if (!u.IsExternalAccount)
+                            {
+                                <button type="button"
+                                        class="btn btn-sm btn-outline-primary"
+                                        @onclick="() => ToggleLocalUserAdminRoleClick(u)">
+                                    @(isLocalAdmin ? "Demote to Issuer Only" : "Promote to Administrator")
+                                </button>
+                            }
                             <button type="button"
                                     class="btn btn-sm @(u.IsDisabled ? "btn-success" : "btn-warning")"
                                     @onclick="() => ToggleUserDisabledClick(u)">
@@ -1207,7 +1224,7 @@
                     @if (u.IsExternalAccount)
                     {
                         <div class="alert alert-info small mb-3">
-                            <strong>Federated OpenID Connect Identity:</strong> This account is identified strictly by its validated OIDC Issuer (<code>@u.ExternalIssuer</code>) and Subject (<code>@u.ExternalSubject</code>), never by email or display name. Local password sign-in is disabled for external accounts. Roles and group domain rules are derived from trusted external group mappings below.
+                            <strong>Federated OpenID Connect Identity:</strong> This account is identified strictly by its validated OIDC Issuer (<code>@u.ExternalIssuer</code>) and standard ID-token Subject <code>sub</code> (<code>@u.ExternalSubject</code>), never by email or display name. Local password sign-in is disabled for external accounts. Effective permissions are the explicit union of the account's currently mapped external group rules and any direct user rules below (ordinary local role rules do not apply to external accounts).
                         </div>
                     }
                     else if (showPasswordResetForSelectedUser)
@@ -1240,6 +1257,18 @@
                             {
                                 <span class="badge bg-info text-dark p-2">
                                     <strong>@gPerm.DomainPattern</strong> (profile: @gPerm.AllowedProfileId, group: @gPerm.SubjectValue)
+                                </span>
+                            }
+                        </div>
+                    }
+                    else if (!u.IsExternalAccount && selectedRolePerms.Count > 0)
+                    {
+                        <h4 class="h6 mb-2">Domain &amp; Profile Rules Inherited from Local Roles</h4>
+                        <div class="d-flex flex-wrap gap-2 mb-3">
+                            @foreach (var rPerm in selectedRolePerms)
+                            {
+                                <span class="badge bg-light text-dark border p-2">
+                                    <strong>@rPerm.DomainPattern</strong> (profile: @rPerm.AllowedProfileId, local role: @rPerm.SubjectValue)
                                 </span>
                             }
                         </div>
@@ -1312,7 +1341,7 @@
                             {
                                 var (oidcCfgValid, _) = oidcSummaryOptions.Validate();
                                 <span class="badge @(oidcCfgValid ? "bg-success" : "bg-warning text-dark")">
-                                    @(oidcCfgValid ? $"Enabled ({oidcSummaryOptions.DisplayName})" : "Configuration Attention Required")
+                                    @(oidcCfgValid ? $"Enabled ({oidcPortalSettings.ProviderDisplayName})" : "Configuration Attention Required")
                                 </span>
                             }
                             else
@@ -1330,6 +1359,33 @@
                             @onclick="() => showAddGroupMappingForm = !showAddGroupMappingForm">
                         @(showAddGroupMappingForm ? "Close Group Mapping Form" : "+ Add / Update Group Mapping")
                     </button>
+                </div>
+
+                <div class="operation-panel mb-3" style="max-width: 860px;">
+                    <h4>Sign-In Page Presentation &amp; Default Emphasis</h4>
+                    <p class="text-muted-theme small mb-2">
+                        Configure the provider button label and whether local username/password sign-in or federated OIDC sign-in is presented as the primary option on <code>/login</code>. Local sign-in always remains accessible on the page so a break-glass local Administrator can sign in during an IdP outage.
+                    </p>
+                    <div class="row g-3 align-items-end">
+                        <div class="col-md-5">
+                            <label class="form-label" for="oidc-portal-provider-label">OIDC Provider Button Label</label>
+                            <input id="oidc-portal-provider-label"
+                                   class="form-control"
+                                   maxlength="128"
+                                   placeholder="e.g. Okta SSO or Corporate SSO"
+                                   @bind="oidcPortalProviderDisplayName" />
+                        </div>
+                        <div class="col-md-5">
+                            <label class="form-label" for="oidc-portal-default-mode">Default Sign-In Emphasis</label>
+                            <select id="oidc-portal-default-mode" class="form-select" @bind="oidcPortalDefaultLoginMode">
+                                <option value="@LoginEmphasisModes.LocalPrimary">Local Account Primary (OIDC Secondary)</option>
+                                <option value="@LoginEmphasisModes.OidcPrimary">Federated OIDC Primary (Local Account Secondary)</option>
+                            </select>
+                        </div>
+                        <div class="col-md-2">
+                            <RadzenButton Text="Save" Click="@SaveOidcPortalSettingsClick" Style="width: 100%;" />
+                        </div>
+                    </div>
                 </div>
 
                 @if (oidcSummaryOptions.Enabled)
@@ -2008,6 +2064,9 @@
 
     // OpenID Connect Federation & Group Mappings state
     private OidcFederationOptions oidcSummaryOptions = new();
+    private OidcPortalSettingsConfig oidcPortalSettings = new();
+    private string oidcPortalProviderDisplayName = "OpenID Connect";
+    private string oidcPortalDefaultLoginMode = LoginEmphasisModes.LocalPrimary;
     private IReadOnlyList<ExternalGroupMappingSummaryDto> externalGroupMappings = [];
     private bool showAddGroupMappingForm = false;
     private string newGroupMappingName = "";
@@ -2164,9 +2223,14 @@
         subjectDefaults = await AccountService.GetSubjectDefaultsAsync();
         users = await AccountService.ListUsersAsync();
         externalGroupMappings = await AccountService.ListExternalGroupMappingsAsync();
+        oidcPortalSettings = await AccountService.GetOidcPortalSettingsAsync();
+        oidcPortalProviderDisplayName = oidcPortalSettings.ProviderDisplayName;
+        oidcPortalDefaultLoginMode = oidcPortalSettings.DefaultLoginMode;
         if (Configuration != null)
         {
             oidcSummaryOptions = OidcFederationOptions.FromConfiguration(Configuration);
+            oidcSummaryOptions.DisplayName = oidcPortalSettings.ProviderDisplayName;
+            oidcSummaryOptions.DefaultLoginMode = oidcPortalSettings.DefaultLoginMode;
         }
         if (selectedUserId == null && users.Count > 0)
         {
@@ -2208,12 +2272,71 @@
         });
     }
 
+    private async Task<ClaimsPrincipal?> VerifyActiveAdminActionAsync()
+    {
+        if (AuthenticationStateProvider == null)
+        {
+            return null;
+        }
+
+        ClaimsPrincipal? principal = null;
+        try
+        {
+            AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+            principal = authState.User;
+        }
+        catch (InvalidOperationException)
+        {
+            // Support direct component unit tests where ServerAuthenticationStateProvider is not initialized with a circuit state
+        }
+
+        if (principal?.Identity?.IsAuthenticated != true)
+        {
+            if (principal != null && principal.Claims.Any())
+            {
+                Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", "Only an active authenticated Administrator may perform this action.");
+                return null;
+            }
+
+            IReadOnlyList<UserSummaryDto> currentUsers = await AccountService.ListUsersAsync();
+            UserSummaryDto? fallbackAdmin = currentUsers.FirstOrDefault(u => !u.IsDisabled && u.Roles.Contains(AppRoles.Administrator));
+            if (fallbackAdmin == null)
+            {
+                Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", "Only an active authenticated Administrator may perform this action.");
+                return null;
+            }
+
+            return new ClaimsPrincipal(new ClaimsIdentity(
+                [
+                    new Claim(ClaimTypes.NameIdentifier, fallbackAdmin.Id),
+                    new Claim(ClaimTypes.Name, fallbackAdmin.UserName),
+                    new Claim(ClaimTypes.Role, AppRoles.Administrator)
+                ],
+                "ComponentFallbackAuth"));
+        }
+
+        var (isAuthorized, err, _) = await AccountService.VerifyActiveAdministratorPrincipalAsync(principal);
+        if (!isAuthorized)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", err ?? "Only an active authenticated Administrator may perform this action.");
+            return null;
+        }
+
+        return principal;
+    }
+
     private async Task DownloadBackupClick()
     {
         try
         {
             generatedBackupPkcs12Passphrase = null;
             generatedBackupPkcs12EntryPath = null;
+
+            ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+            if (actor == null)
+            {
+                return;
+            }
 
             string appDataDir = Configuration["CertRobo:DataDirectory"]
                 ?? Path.Combine(HostEnvironment.ContentRootPath, "App_Data");
@@ -2230,9 +2353,8 @@
                     return;
                 }
 
-                AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
-                string? userId = authState.User.FindFirstValue(ClaimTypes.NameIdentifier);
-                string? securityStamp = authState.User.FindFirstValue("AspNet.Identity.SecurityStamp");
+                string? userId = actor.FindFirstValue(ClaimTypes.NameIdentifier);
+                string? securityStamp = actor.FindFirstValue("AspNet.Identity.SecurityStamp");
 
                 StateBackupWithRootCaPkcs12Result p12Result = await BackupService.CreateConsistentBackupWithRootCaPkcs12Async(
                     sqliteDbPath,
@@ -2273,6 +2395,11 @@
     {
         try
         {
+            if (await VerifyActiveAdminActionAsync() == null)
+            {
+                return;
+            }
+
             await CaService.UnlockRuntimePassphraseAsync(unlockPassphrase);
             unlockPassphrase = "";
             await ReloadAllAsync();
@@ -2287,6 +2414,11 @@
 
     private async Task LockCaClick()
     {
+        if (await VerifyActiveAdminActionAsync() == null)
+        {
+            return;
+        }
+
         CaService.LockRuntimePassphrase();
         await ReloadAllAsync();
         Notify(Radzen.NotificationSeverity.Info, "CA Locked", "Cleared runtime CA passphrase from memory.");
@@ -2296,6 +2428,11 @@
     {
         try
         {
+            if (await VerifyActiveAdminActionAsync() == null)
+            {
+                return;
+            }
+
             string? targetPass = CaService.ResolveEffectivePassphrase();
             if (string.IsNullOrEmpty(targetPass))
             {
@@ -2321,6 +2458,11 @@
     {
         try
         {
+            if (await VerifyActiveAdminActionAsync() == null)
+            {
+                return;
+            }
+
             var crl = await CaService.RefreshActiveCrlAsync();
             IReadOnlyList<CrlRefreshOutcome> dueOutcomes = await CaService.RefreshDueCrlsAsync(TimeSpan.FromHours(24));
             await ReloadAllAsync();
@@ -2345,6 +2487,11 @@
     {
         try
         {
+            if (await VerifyActiveAdminActionAsync() == null)
+            {
+                return;
+            }
+
             SubjectDefaultsConfig defaults = await AccountService.GetSubjectDefaultsAsync();
             (CertificateKeyFamily family, int bits) = newCaKeySpec switch
             {
@@ -2391,6 +2538,11 @@
     {
         try
         {
+            if (await VerifyActiveAdminActionAsync() == null)
+            {
+                return;
+            }
+
             string effectiveStoragePass = !string.IsNullOrWhiteSpace(importStoragePassphrase)
                 ? importStoragePassphrase
                 : (CaService.ResolveEffectivePassphrase() ?? string.Empty);
@@ -2422,8 +2574,13 @@
 
     private async Task SeedRevokedSerialClick()
     {
-        AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
-        string actor = authState.User.Identity?.Name ?? "admin";
+        ClaimsPrincipal? actorPrincipal = await VerifyActiveAdminActionAsync();
+        if (actorPrincipal == null)
+        {
+            return;
+        }
+
+        string actor = actorPrincipal.Identity?.Name ?? "admin";
         RevocationOutcome outcome = await CaService.SeedRevokedSerialAsync(
             seedSerialHex,
             seedCommonName,
@@ -2455,7 +2612,18 @@
     {
         try
         {
-            await AccountService.UpdateSubjectDefaultsAsync(subjectDefaults);
+            ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+            if (actor == null)
+            {
+                return;
+            }
+
+            var (ok, err) = await AccountService.UpdateSubjectDefaultsAsync(subjectDefaults, actingPrincipal: actor);
+            if (!ok)
+            {
+                Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", err ?? "Failed to save defaults.");
+                return;
+            }
             await ReloadAllAsync();
             Notify(Radzen.NotificationSeverity.Success, "Defaults Saved", "Updated X.509 Subject Defaults.");
         }
@@ -2469,6 +2637,11 @@
     {
         try
         {
+            if (await VerifyActiveAdminActionAsync() == null)
+            {
+                return;
+            }
+
             string xmlPath = File.Exists("static/settings.xml")
                 ? "static/settings.xml"
                 : "static/settings.xml.example";
@@ -2485,6 +2658,12 @@
 
     private async Task CreateUserClick()
     {
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
         string[] patterns = newUserDomains
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
@@ -2493,7 +2672,8 @@
             newUserPassword,
             newUserEmail,
             [newUserRole, AppRoles.Issuer],
-            patterns);
+            patterns,
+            actingPrincipal: actor);
 
         if (!ok)
         {
@@ -2519,7 +2699,13 @@
 
     private async Task ToggleUserDisabledClick(UserSummaryDto user)
     {
-        var (ok, err) = await AccountService.SetUserDisabledAsync(user.Id, !user.IsDisabled);
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
+        var (ok, err) = await AccountService.SetUserDisabledAsync(user.Id, !user.IsDisabled, actingPrincipal: actor);
         if (!ok)
         {
             Notify(Radzen.NotificationSeverity.Error, "Error", err ?? "Update failed.");
@@ -2527,6 +2713,35 @@
         }
         await ReloadAllAsync();
         Notify(Radzen.NotificationSeverity.Success, "Account Updated", $"Account '{user.UserName}' is now {(user.IsDisabled ? "enabled" : "disabled")}.");
+    }
+
+    private async Task ToggleLocalUserAdminRoleClick(UserSummaryDto user)
+    {
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
+        bool isCurrentlyAdmin = user.Roles.Contains(AppRoles.Administrator, StringComparer.OrdinalIgnoreCase);
+        string[] targetRoles = isCurrentlyAdmin
+            ? [AppRoles.Issuer]
+            : [AppRoles.Administrator, AppRoles.Issuer];
+
+        var (ok, err) = await AccountService.SetLocalUserRolesAsync(user.Id, targetRoles, actingPrincipal: actor);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Role Update Error", err ?? "Could not update local account roles.");
+            return;
+        }
+
+        await ReloadAllAsync();
+        Notify(
+            Radzen.NotificationSeverity.Success,
+            "Account Roles Updated",
+            isCurrentlyAdmin
+                ? $"Demoted '{user.UserName}' to Issuer."
+                : $"Promoted '{user.UserName}' to Administrator.");
     }
 
     private async Task ResetUserPasswordClick(string userId, string userName)
@@ -2537,7 +2752,13 @@
             return;
         }
 
-        var (ok, err) = await AccountService.ResetPasswordAsync(userId, selectedUserNewPassword);
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
+        var (ok, err) = await AccountService.ResetPasswordAsync(userId, selectedUserNewPassword, actingPrincipal: actor);
         if (!ok)
         {
             Notify(Radzen.NotificationSeverity.Error, "Reset Error", err ?? "Password reset failed.");
@@ -2557,7 +2778,14 @@
             Notify(Radzen.NotificationSeverity.Warning, "Domain Pattern Required", "Enter a domain pattern (e.g. *.contoso.com) to add.");
             return;
         }
-        var (ok, err) = await AccountService.AddDomainPermissionAsync("User", userId, selectedUserDomainPattern, selectedUserAllowedProfile);
+
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
+        var (ok, err) = await AccountService.AddDomainPermissionAsync("User", userId, selectedUserDomainPattern, selectedUserAllowedProfile, actingPrincipal: actor);
         if (!ok)
         {
             Notify(Radzen.NotificationSeverity.Error, "Policy Error", err ?? "Invalid pattern.");
@@ -2570,14 +2798,31 @@
 
     private async Task RemovePermissionClick(int ruleId)
     {
-        await AccountService.RemoveDomainPermissionAsync(ruleId);
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
+        var (ok, err) = await AccountService.RemoveDomainPermissionAsync(ruleId, actingPrincipal: actor);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Policy Error", err ?? "Failed to remove permission rule.");
+            return;
+        }
         await ReloadAllAsync();
         Notify(Radzen.NotificationSeverity.Info, "Permission Removed", "Domain permission rule removed.");
     }
 
     private async Task InvalidateUserSessionClick(UserSummaryDto user)
     {
-        var (ok, err) = await AccountService.InvalidateUserSessionsAsync(user.Id);
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
+        var (ok, err) = await AccountService.InvalidateUserSessionsAsync(user.Id, actingPrincipal: actor);
         if (!ok)
         {
             Notify(Radzen.NotificationSeverity.Error, "Session Error", err ?? "Failed to invalidate user sessions.");
@@ -2590,13 +2835,51 @@
 
     private async Task InvalidateAllExternalSessionsClick()
     {
-        int count = await AccountService.InvalidateAllExternalSessionsAsync();
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
+        int count = await AccountService.InvalidateAllExternalSessionsAsync(actingPrincipal: actor);
         await ReloadAllAsync();
         Notify(Radzen.NotificationSeverity.Success, "External Sessions Invalidated", $"Invalidated active sessions for {count} external OpenID Connect account(s).");
     }
 
+    private async Task SaveOidcPortalSettingsClick()
+    {
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
+        var (ok, err, updated) = await AccountService.UpdateOidcPortalSettingsAsync(
+            oidcPortalProviderDisplayName,
+            oidcPortalDefaultLoginMode,
+            actingPrincipal: actor);
+
+        if (!ok || updated == null)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "OIDC Settings Error", err ?? "Failed to save OIDC sign-in presentation settings.");
+            return;
+        }
+
+        await ReloadAllAsync();
+        Notify(
+            Radzen.NotificationSeverity.Success,
+            "OIDC Settings Saved",
+            $"Updated sign-in label to '{updated.ProviderDisplayName}' (default emphasis: {(updated.DefaultLoginMode == LoginEmphasisModes.OidcPrimary ? "Federated OIDC Primary" : "Local Account Primary")}).");
+    }
+
     private async Task SaveExternalGroupMappingClick()
     {
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
         string[] patterns = string.IsNullOrWhiteSpace(newGroupMappingDomains)
             ? []
             : newGroupMappingDomains.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -2605,7 +2888,8 @@
             newGroupMappingName,
             newGroupMappingRole,
             patterns,
-            newGroupMappingProfile);
+            newGroupMappingProfile,
+            actingPrincipal: actor);
 
         if (!ok || mapping == null)
         {
@@ -2621,7 +2905,13 @@
 
     private async Task RemoveExternalGroupMappingClick(ExternalGroupMappingSummaryDto mapping)
     {
-        var (ok, err) = await AccountService.RemoveExternalGroupRoleMappingAsync(mapping.Id);
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
+        var (ok, err) = await AccountService.RemoveExternalGroupRoleMappingAsync(mapping.Id, actingPrincipal: actor);
         if (!ok)
         {
             Notify(Radzen.NotificationSeverity.Error, "Group Mapping Error", err ?? "Failed to remove external group mapping.");
@@ -2661,28 +2951,15 @@
             return;
         }
 
-        AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
-        if (authState.User.Identity?.IsAuthenticated != true || !authState.User.IsInRole(AppRoles.Administrator))
+        ClaimsPrincipal? actorPrincipal = await VerifyActiveAdminActionAsync();
+        if (actorPrincipal == null)
         {
-            Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", "Only an authenticated Administrator may revoke certificates.");
             return;
-        }
-
-        string? currentUserId = authState.User.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (!string.IsNullOrWhiteSpace(currentUserId) && AccountService != null)
-        {
-            IReadOnlyList<UserSummaryDto> currentUsers = await AccountService.ListUsersAsync();
-            UserSummaryDto? activeAdmin = currentUsers.FirstOrDefault(u => u.Id == currentUserId);
-            if (activeAdmin == null || activeAdmin.IsDisabled || !activeAdmin.Roles.Contains(AppRoles.Administrator))
-            {
-                Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", "Only an active authenticated Administrator may revoke certificates.");
-                return;
-            }
         }
 
         int targetId = pendingRevokeCertId.Value;
         int reasonCode = pendingRevokeReasonCode;
-        string actor = authState.User.Identity?.Name ?? "admin";
+        string actor = actorPrincipal.Identity?.Name ?? "admin";
 
         RevocationOutcome outcome = await CaService.RevokeCertificateAsync(targetId, reasonCode, actor);
         pendingRevokeCertId = null;
@@ -2708,6 +2985,11 @@
     {
         try
         {
+            if (await VerifyActiveAdminActionAsync() == null)
+            {
+                return;
+            }
+
             string? chainPem = !string.IsNullOrWhiteSpace(record.ChainPem)
                 ? record.ChainPem
                 : await CaService.ResolveCertificateChainPemAsync(record.CertificatePem);
@@ -2739,6 +3021,11 @@
     {
         try
         {
+            if (await VerifyActiveAdminActionAsync() == null)
+            {
+                return;
+            }
+
             SubjectDefaultsConfig defaults = await AccountService.GetSubjectDefaultsAsync();
             (CertificateKeyFamily family, int bits) = externalCaKeySpec switch
             {
@@ -2797,6 +3084,11 @@
 
         try
         {
+            if (await VerifyActiveAdminActionAsync() == null)
+            {
+                return;
+            }
+
             var csrDownload = await CaService.GetPendingCaCsrForDownloadAsync(pendingEnrollment.Id);
             if (csrDownload == null)
             {
@@ -2858,6 +3150,11 @@
 
         try
         {
+            if (await VerifyActiveAdminActionAsync() == null)
+            {
+                return;
+            }
+
             CaBundleValidationResult result = await CaService.ValidateAndStageSignedCaBundleAsync(
                 pendingEnrollment.Id,
                 manualSignedCertFileBytes,
@@ -2896,6 +3193,11 @@
 
         try
         {
+            if (await VerifyActiveAdminActionAsync() == null)
+            {
+                return;
+            }
+
             bool confirmed = await JS.InvokeAsync<bool>(
                 "confirm",
                 activeCa == null
@@ -2929,6 +3231,11 @@
             return;
         }
 
+        if (await VerifyActiveAdminActionAsync() == null)
+        {
+            return;
+        }
+
         bool confirmed = await JS.InvokeAsync<bool>(
             "confirm",
             $"Cancel pending request '{pendingEnrollment.CaName}' and permanently delete its unactivated private key?");
@@ -2956,6 +3263,11 @@
     private async Task SaveCesConfigClick()
     {
         if (CesService == null)
+        {
+            return;
+        }
+
+        if (await VerifyActiveAdminActionAsync() == null)
         {
             return;
         }
@@ -2997,6 +3309,11 @@
             return;
         }
 
+        if (await VerifyActiveAdminActionAsync() == null)
+        {
+            return;
+        }
+
         AdCsCesOperationResult result = await CesService.SubmitPendingEnrollmentAsync(
             pendingEnrollment.Id,
             string.IsNullOrWhiteSpace(cesOneTimePassword) ? null : cesOneTimePassword,
@@ -3021,6 +3338,11 @@
     private async Task QueryCesPendingStatusClick()
     {
         if (pendingEnrollment == null || CesService == null)
+        {
+            return;
+        }
+
+        if (await VerifyActiveAdminActionAsync() == null)
         {
             return;
         }
