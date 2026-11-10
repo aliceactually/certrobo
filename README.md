@@ -438,9 +438,10 @@ Administrators control which external IdP groups map to CertRobo roles (`Adminis
 * **Sign-In Page Presentation (`ProviderDisplayName` & `DefaultLoginMode`):** In **Administration → Users and permissions → Sign-In Page Presentation & Default Emphasis**, administrators can customize the OIDC provider button label (e.g., `Okta SSO`) and choose whether **Local Account Primary** (`Local`) or **Federated OIDC Primary** (`Oidc`) is emphasized first on `/login`. Both sign-in methods always remain rendered on `/login` so local break-glass sign-in is reachable during an IdP outage.
 * **In the Web Portal (`/admin`):**
   1. Sign in as an `Administrator` and open **Administration → Users and permissions**.
-  2. In **OpenID Connect (OIDC) Federated Sign-In & Group Mappings**, click **+ Add / Update Group Mapping**.
-  3. Enter the exact external group claim value (e.g., `CertRobo-Issuers`), choose the role (`Issuer` or `Administrator`), select the allowed certificate profile (`*` or a specific profile such as `tls-server-ecdsa-256`), and enter comma-separated domain patterns (e.g., `*.contoso.com, contoso.com`).
-  4. To revoke a group's access, click **Remove Group Mapping** (or remove individual domain rules with `×`). Removing a group mapping immediately strips the role from affected external accounts and rotates their `SecurityStamp`.
+  2. In **OpenID Connect (OIDC) Federated Sign-In & Group Mappings**, click **+ Add / Replace Group Mapping** (or **Edit / Replace...** on an existing row).
+  3. Enter the exact external group claim value (e.g., `CertRobo-Issuers`), choose the role (`Issuer` or `Administrator`), select the allowed certificate profile (`*` or a specific profile such as `tls-server-ecdsa-256`), and enter comma-separated domain patterns (e.g., `*.contoso.com, contoso.com`). Saving atomically replaces that group's domain/profile rule set.
+  4. To append an additional domain/profile rule to an existing mapped group without replacing its current rules (for example, to authorize a second certificate profile on a different subdomain), click **+ Add Additional Rule to Group**.
+  5. To revoke a group's access, click **Remove Group Mapping** (or remove individual domain rules with `×`). Removing a group mapping immediately strips the role from affected external accounts and rotates their `SecurityStamp`.
 * **Via the Host CLI:**
   ```bash
   # Grant or update a group mapping:

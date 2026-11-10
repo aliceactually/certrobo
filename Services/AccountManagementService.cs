@@ -2,6 +2,8 @@ using CertRobo.Data;
 using CertRobo.Models;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Security.Claims;
 
 namespace CertRobo.Services;
@@ -37,19 +39,134 @@ public sealed class AccountManagementService(
     OidcFederationOptions? oidcOptions = null,
     OidcFederationService? oidcFederationService = null)
 {
-    private static readonly SemaphoreSlim AccountMutationLock = new(1, 1);
+    private const string CrossProcessAccountLockFileName = ".certrobo-accounts.lock";
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> InProcessAccountLocks = new(
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+    private static SemaphoreSlim GetInProcessLock(string lockKey) =>
+        InProcessAccountLocks.GetOrAdd(lockKey, static _ => new SemaphoreSlim(1, 1));
+
+    /// <summary>
+    /// Acquires both an in-process SemaphoreSlim and a cross-process exclusive file lock in the SQLite database directory
+    /// so account, role, and group-mapping invariants are strictly serialized across threads and OS processes.
+    /// </summary>
+    private async Task<IAsyncDisposable> AcquireAccountMutationLockAsync(CancellationToken cancellationToken)
+    {
+        string? dataSource = null;
+        try
+        {
+            dataSource = dbContext.Database.GetDbConnection().DataSource;
+        }
+        catch
+        {
+        }
+
+        string? lockDir = null;
+        string lockKey = "<in-memory>";
+        if (!string.IsNullOrWhiteSpace(dataSource)
+            && !dataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
+            && !dataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                string fullDbPath = Path.GetFullPath(dataSource);
+                lockDir = Path.GetDirectoryName(fullDbPath);
+                if (!string.IsNullOrEmpty(lockDir))
+                {
+                    lockKey = fullDbPath;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        TimeSpan timeout = TimeSpan.FromSeconds(30);
+        Stopwatch sw = Stopwatch.StartNew();
+        SemaphoreSlim inProcessLock = GetInProcessLock(lockKey);
+        if (!await inProcessLock.WaitAsync(timeout, cancellationToken))
+        {
+            throw new TimeoutException("Timed out waiting for in-process account mutation lock.");
+        }
+
+        FileStream? lockStream = null;
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(lockDir))
+            {
+                Directory.CreateDirectory(lockDir);
+                string lockFilePath = Path.Combine(lockDir, CrossProcessAccountLockFileName);
+
+                while (true)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    try
+                    {
+                        FileStreamOptions opts = new()
+                        {
+                            Mode = FileMode.OpenOrCreate,
+                            Access = FileAccess.ReadWrite,
+                            Share = FileShare.None
+                        };
+                        if (!OperatingSystem.IsWindows())
+                        {
+                            opts.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                        }
+
+                        lockStream = File.Open(lockFilePath, opts);
+                        break;
+                    }
+                    catch (IOException ex)
+                    {
+                        TimeSpan remaining = timeout - sw.Elapsed;
+                        if (remaining <= TimeSpan.Zero)
+                        {
+                            throw new TimeoutException(
+                                $"Timed out waiting for cross-process account mutation lock '{lockFilePath}'.",
+                                ex);
+                        }
+
+                        int delayMs = (int)Math.Clamp(remaining.TotalMilliseconds, 10, 25);
+                        await Task.Delay(delayMs, cancellationToken);
+                    }
+                }
+            }
+
+            return new AccountMutationLockHandle(inProcessLock, lockStream);
+        }
+        catch
+        {
+            lockStream?.Dispose();
+            inProcessLock.Release();
+            throw;
+        }
+    }
+
+    private sealed class AccountMutationLockHandle(SemaphoreSlim inProcessLock, FileStream? lockStream) : IAsyncDisposable
+    {
+        private int _disposed;
+
+        public ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                try
+                {
+                    lockStream?.Dispose();
+                }
+                finally
+                {
+                    inProcessLock.Release();
+                }
+            }
+            return ValueTask.CompletedTask;
+        }
+    }
 
     public async Task EnsureRolesAndDefaultsAsync(CancellationToken cancellationToken = default)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
-        {
-            await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
-        }
-        finally
-        {
-            AccountMutationLock.Release();
-        }
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
     }
 
     private async Task EnsureRolesAndDefaultsCoreAsync(CancellationToken cancellationToken)
@@ -196,40 +313,34 @@ public sealed class AccountManagementService(
 
         string normalizedMode = LoginEmphasisModes.Normalize(defaultLoginMode);
 
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
+        var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
+        if (!actorOk)
         {
-            await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
-            var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
-            if (!actorOk)
-            {
-                return (false, actorErr, null);
-            }
-
-            OidcPortalSettingsConfig existing = await EnsureOidcPortalSettingsRowCoreAsync(cancellationToken);
-            existing.ProviderDisplayName = trimmedLabel;
-            existing.DefaultLoginMode = normalizedMode;
-            existing.IsCustomizedByAdmin = true;
-            existing.UpdatedAtUtc = DateTimeOffset.UtcNow;
-            await dbContext.SaveChangesAsync(cancellationToken);
-
-            if (oidcOptions != null)
-            {
-                oidcOptions.DisplayName = trimmedLabel;
-                oidcOptions.DefaultLoginMode = normalizedMode;
-            }
-
-            return (true, null, existing);
+            return (false, actorErr, null);
         }
-        finally
+
+        OidcPortalSettingsConfig existing = await EnsureOidcPortalSettingsRowCoreAsync(cancellationToken);
+        existing.ProviderDisplayName = trimmedLabel;
+        existing.DefaultLoginMode = normalizedMode;
+        existing.IsCustomizedByAdmin = true;
+        existing.UpdatedAtUtc = DateTimeOffset.UtcNow;
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        if (oidcOptions != null)
         {
-            AccountMutationLock.Release();
+            oidcOptions.DisplayName = trimmedLabel;
+            oidcOptions.DefaultLoginMode = normalizedMode;
         }
+
+        return (true, null, existing);
     }
 
     /// <summary>
-    /// Revalidates an acting administrator's live database state (enabled, unlocked, matching SecurityStamp,
+    /// Revalidates an acting administrator's live database state (enabled, unlocked, required non-empty matching SecurityStamp,
     /// active Administrator role, and for external OIDC sessions, active group mapping to Administrator and bounded lifetime).
+    /// Fails closed on null, unauthenticated, anonymous, or stamp-less principals.
     /// </summary>
     public async Task<(bool IsAuthorized, string? ErrorMessage, ApplicationUser? Actor)> VerifyActiveAdministratorPrincipalAsync(
         ClaimsPrincipal? principal,
@@ -261,12 +372,14 @@ public sealed class AccountManagementService(
             return (false, "Authorisation Error: the acting administrator account is locked out.", null);
         }
 
+        // Require an explicit, non-empty SecurityStamp claim on interactive administrator principals and match against DB
         string? principalStamp = principal.FindFirstValue("AspNet.Identity.SecurityStamp")
             ?? principal.FindFirstValue(userManager.Options.ClaimsIdentity.SecurityStampClaimType);
-        if (!string.IsNullOrEmpty(principalStamp)
-            && !string.Equals(principalStamp, actor.SecurityStamp, StringComparison.Ordinal))
+        if (string.IsNullOrWhiteSpace(principalStamp)
+            || string.IsNullOrWhiteSpace(actor.SecurityStamp)
+            || !string.Equals(principalStamp, actor.SecurityStamp, StringComparison.Ordinal))
         {
-            return (false, "Authorisation Error: your administrator session has been invalidated. Please sign in again.", null);
+            return (false, "Authorisation Error: your administrator session security stamp is missing or has been invalidated. Please sign in again.", null);
         }
 
         IReadOnlyList<string> actorRoles = await GetFreshUserRoleNamesCoreAsync(actor.Id, cancellationToken);
@@ -324,7 +437,7 @@ public sealed class AccountManagementService(
     /// <summary>
     /// Counts how many local accounts currently have the Administrator role, a local password hash,
     /// and are enabled and not locked out, optionally excluding a target user ID.
-    /// Queries SQLite directly with AsNoTracking() so concurrent operations in other scopes are always observed.
+    /// Queries SQLite directly with AsNoTracking() so concurrent operations in other scopes/processes are always observed.
     /// </summary>
     private async Task<int> CountActiveLocalAdministratorsWithPasswordCoreAsync(
         string? excludeUserId,
@@ -391,59 +504,52 @@ public sealed class AccountManagementService(
             return (false, "Username and password are required.", null);
         }
 
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
+
+        IList<ApplicationUser> existingAdmins = await userManager.GetUsersInRoleAsync(AppRoles.Administrator);
+        if (existingAdmins.Any(a => !a.IsExternalAccount && !string.IsNullOrEmpty(a.PasswordHash)))
         {
-            await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
+            return (false, "Initial administrator setup has already been completed.", null);
+        }
 
-            IList<ApplicationUser> existingAdmins = await userManager.GetUsersInRoleAsync(AppRoles.Administrator);
-            if (existingAdmins.Any(a => !a.IsExternalAccount && !string.IsNullOrEmpty(a.PasswordHash)))
+        await DisambiguateCollidingExternalUserNameIfAnyAsync(userName.Trim(), cancellationToken);
+
+        ApplicationUser user = new()
+        {
+            UserName = userName.Trim(),
+            Email = string.IsNullOrWhiteSpace(email) ? null : email.Trim(),
+            EmailConfirmed = true,
+            IsDisabled = false,
+            IsExternalAccount = false,
+            DisplayName = "Initial Administrator"
+        };
+
+        IdentityResult createResult = await userManager.CreateAsync(user, password);
+        if (!createResult.Succeeded)
+        {
+            return (false, string.Join("; ", createResult.Errors.Select(e => e.Description)), null);
+        }
+
+        await userManager.AddToRolesAsync(user, [AppRoles.Administrator, AppRoles.Issuer]);
+
+        if (!string.IsNullOrWhiteSpace(initialAllowedDomainPattern))
+        {
+            string canonical = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(initialAllowedDomainPattern);
+            if (!string.IsNullOrEmpty(canonical))
             {
-                return (false, "Initial administrator setup has already been completed.", null);
-            }
-
-            await DisambiguateCollidingExternalUserNameIfAnyAsync(userName.Trim(), cancellationToken);
-
-            ApplicationUser user = new()
-            {
-                UserName = userName.Trim(),
-                Email = string.IsNullOrWhiteSpace(email) ? null : email.Trim(),
-                EmailConfirmed = true,
-                IsDisabled = false,
-                IsExternalAccount = false,
-                DisplayName = "Initial Administrator"
-            };
-
-            IdentityResult createResult = await userManager.CreateAsync(user, password);
-            if (!createResult.Succeeded)
-            {
-                return (false, string.Join("; ", createResult.Errors.Select(e => e.Description)), null);
-            }
-
-            await userManager.AddToRolesAsync(user, [AppRoles.Administrator, AppRoles.Issuer]);
-
-            if (!string.IsNullOrWhiteSpace(initialAllowedDomainPattern))
-            {
-                string canonical = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(initialAllowedDomainPattern);
-                if (!string.IsNullOrEmpty(canonical))
+                dbContext.DomainPermissionRules.Add(new DomainPermissionRule
                 {
-                    dbContext.DomainPermissionRules.Add(new DomainPermissionRule
-                    {
-                        SubjectType = PermissionSubjectTypes.User,
-                        SubjectValue = user.Id,
-                        DomainPattern = canonical,
-                        AllowedProfileId = "*"
-                    });
-                    await dbContext.SaveChangesAsync(cancellationToken);
-                }
+                    SubjectType = PermissionSubjectTypes.User,
+                    SubjectValue = user.Id,
+                    DomainPattern = canonical,
+                    AllowedProfileId = "*"
+                });
+                await dbContext.SaveChangesAsync(cancellationToken);
             }
+        }
 
-            return (true, null, user);
-        }
-        finally
-        {
-            AccountMutationLock.Release();
-        }
+        return (true, null, user);
     }
 
     public async Task<(bool Succeeded, string? ErrorMessage, ApplicationUser? User)> CreateUserAsync(
@@ -455,70 +561,63 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
+        var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
+        if (!actorOk)
         {
-            await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
-            var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
-            if (!actorOk)
+            return (false, actorErr, null);
+        }
+
+        string trimmedUserName = userName.Trim();
+        await DisambiguateCollidingExternalUserNameIfAnyAsync(trimmedUserName, cancellationToken);
+
+        ApplicationUser user = new()
+        {
+            UserName = trimmedUserName,
+            Email = string.IsNullOrWhiteSpace(email) ? null : email.Trim(),
+            EmailConfirmed = true,
+            IsDisabled = false,
+            IsExternalAccount = false
+        };
+
+        IdentityResult createResult = await userManager.CreateAsync(user, password);
+        if (!createResult.Succeeded)
+        {
+            return (false, string.Join("; ", createResult.Errors.Select(e => e.Description)), null);
+        }
+
+        string[] validRoles = roles
+            .Where(r => r.Equals(AppRoles.Administrator, StringComparison.OrdinalIgnoreCase)
+                     || r.Equals(AppRoles.Issuer, StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (validRoles.Length > 0)
+        {
+            await userManager.AddToRolesAsync(user, validRoles);
+        }
+
+        if (allowedDomainPatterns != null)
+        {
+            foreach (string rawPattern in allowedDomainPatterns)
             {
-                return (false, actorErr, null);
-            }
-
-            string trimmedUserName = userName.Trim();
-            await DisambiguateCollidingExternalUserNameIfAnyAsync(trimmedUserName, cancellationToken);
-
-            ApplicationUser user = new()
-            {
-                UserName = trimmedUserName,
-                Email = string.IsNullOrWhiteSpace(email) ? null : email.Trim(),
-                EmailConfirmed = true,
-                IsDisabled = false,
-                IsExternalAccount = false
-            };
-
-            IdentityResult createResult = await userManager.CreateAsync(user, password);
-            if (!createResult.Succeeded)
-            {
-                return (false, string.Join("; ", createResult.Errors.Select(e => e.Description)), null);
-            }
-
-            string[] validRoles = roles
-                .Where(r => r.Equals(AppRoles.Administrator, StringComparison.OrdinalIgnoreCase)
-                         || r.Equals(AppRoles.Issuer, StringComparison.OrdinalIgnoreCase))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-
-            if (validRoles.Length > 0)
-            {
-                await userManager.AddToRolesAsync(user, validRoles);
-            }
-
-            if (allowedDomainPatterns != null)
-            {
-                foreach (string rawPattern in allowedDomainPatterns)
+                string canonical = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(rawPattern);
+                if (!string.IsNullOrEmpty(canonical))
                 {
-                    string canonical = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(rawPattern);
-                    if (!string.IsNullOrEmpty(canonical))
+                    dbContext.DomainPermissionRules.Add(new DomainPermissionRule
                     {
-                        dbContext.DomainPermissionRules.Add(new DomainPermissionRule
-                        {
-                            SubjectType = PermissionSubjectTypes.User,
-                            SubjectValue = user.Id,
-                            DomainPattern = canonical,
-                            AllowedProfileId = "*"
-                        });
-                    }
+                        SubjectType = PermissionSubjectTypes.User,
+                        SubjectValue = user.Id,
+                        DomainPattern = canonical,
+                        AllowedProfileId = "*"
+                    });
                 }
-                await dbContext.SaveChangesAsync(cancellationToken);
             }
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
 
-            return (true, null, user);
-        }
-        finally
-        {
-            AccountMutationLock.Release();
-        }
+        return (true, null, user);
     }
 
     private async Task DisambiguateCollidingExternalUserNameIfAnyAsync(string targetLocalUserName, CancellationToken cancellationToken)
@@ -603,26 +702,35 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await using var tx = await dbContext.Database.BeginTransactionAsync(cancellationToken);
         try
         {
+            await dbContext.Database.ExecuteSqlRawAsync(
+                "UPDATE \"AspNetUsers\" SET \"Id\" = \"Id\" WHERE 1 = 0;",
+                cancellationToken);
+
             var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
             if (!actorOk)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return (false, actorErr);
             }
 
             ApplicationUser? user = await FindFreshTrackedUserByIdOrNameAsync(userId, cancellationToken);
             if (user == null)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return (false, "User not found.");
             }
 
-            if (isDisabled && !user.IsExternalAccount && await userManager.IsInRoleAsync(user, AppRoles.Administrator))
+            IReadOnlyList<string> targetRoles = await GetFreshUserRoleNamesCoreAsync(user.Id, cancellationToken);
+            if (isDisabled && !user.IsExternalAccount && targetRoles.Contains(AppRoles.Administrator, StringComparer.OrdinalIgnoreCase))
             {
                 int remainingLocalAdmins = await CountActiveLocalAdministratorsWithPasswordCoreAsync(user.Id, cancellationToken);
                 if (remainingLocalAdmins == 0)
                 {
+                    await tx.RollbackAsync(cancellationToken);
                     return (
                         false,
                         "Cannot disable the last active local Administrator account. CertRobo requires at least one enabled local Administrator with a local password for break-glass recovery.");
@@ -636,15 +744,18 @@ public sealed class AccountManagementService(
             IdentityResult updateResult = await userManager.UpdateAsync(user);
             if (!updateResult.Succeeded)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return (false, string.Join("; ", updateResult.Errors.Select(e => e.Description)));
             }
 
             await userManager.UpdateSecurityStampAsync(user);
+            await tx.CommitAsync(cancellationToken);
             return (true, null);
         }
-        finally
+        catch
         {
-            AccountMutationLock.Release();
+            await tx.RollbackAsync(cancellationToken);
+            throw;
         }
     }
 
@@ -658,24 +769,32 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
+        await using var tx = await dbContext.Database.BeginTransactionAsync(cancellationToken);
         try
         {
-            await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
+            await dbContext.Database.ExecuteSqlRawAsync(
+                "UPDATE \"AspNetUsers\" SET \"Id\" = \"Id\" WHERE 1 = 0;",
+                cancellationToken);
+
             var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
             if (!actorOk)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return (false, actorErr);
             }
 
             ApplicationUser? user = await FindFreshTrackedUserByIdOrNameAsync(userId, cancellationToken);
             if (user == null)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return (false, "User not found.");
             }
 
             if (user.IsExternalAccount)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return (false, "External OpenID Connect account roles are controlled by external group mappings.");
             }
 
@@ -688,6 +807,7 @@ public sealed class AccountManagementService(
 
             if (targetRoles.Length == 0)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return (false, $"At least one valid role ('{AppRoles.Issuer}' or '{AppRoles.Administrator}') must be assigned.");
             }
 
@@ -700,6 +820,7 @@ public sealed class AccountManagementService(
                 int remainingLocalAdmins = await CountActiveLocalAdministratorsWithPasswordCoreAsync(user.Id, cancellationToken);
                 if (remainingLocalAdmins == 0)
                 {
+                    await tx.RollbackAsync(cancellationToken);
                     return (
                         false,
                         "Cannot demote the last active local Administrator account. CertRobo requires at least one enabled local Administrator with a local password for break-glass recovery.");
@@ -727,11 +848,13 @@ public sealed class AccountManagementService(
                 await userManager.UpdateSecurityStampAsync(user);
             }
 
+            await tx.CommitAsync(cancellationToken);
             return (true, null);
         }
-        finally
+        catch
         {
-            AccountMutationLock.Release();
+            await tx.RollbackAsync(cancellationToken);
+            throw;
         }
     }
 
@@ -743,26 +866,35 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await using var tx = await dbContext.Database.BeginTransactionAsync(cancellationToken);
         try
         {
+            await dbContext.Database.ExecuteSqlRawAsync(
+                "UPDATE \"AspNetUsers\" SET \"Id\" = \"Id\" WHERE 1 = 0;",
+                cancellationToken);
+
             var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
             if (!actorOk)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return (false, actorErr);
             }
 
             ApplicationUser? user = await FindFreshTrackedUserByIdOrNameAsync(userId, cancellationToken);
             if (user == null)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return (false, "User not found.");
             }
 
-            if (!user.IsExternalAccount && await userManager.IsInRoleAsync(user, AppRoles.Administrator))
+            IReadOnlyList<string> targetRoles = await GetFreshUserRoleNamesCoreAsync(user.Id, cancellationToken);
+            if (!user.IsExternalAccount && targetRoles.Contains(AppRoles.Administrator, StringComparer.OrdinalIgnoreCase))
             {
                 int remainingLocalAdmins = await CountActiveLocalAdministratorsWithPasswordCoreAsync(user.Id, cancellationToken);
                 if (remainingLocalAdmins == 0)
                 {
+                    await tx.RollbackAsync(cancellationToken);
                     return (
                         false,
                         "Cannot delete the last active local Administrator account. CertRobo requires at least one enabled local Administrator with a local password for break-glass recovery.");
@@ -781,14 +913,17 @@ public sealed class AccountManagementService(
             IdentityResult delResult = await userManager.DeleteAsync(user);
             if (!delResult.Succeeded)
             {
+                await tx.RollbackAsync(cancellationToken);
                 return (false, string.Join("; ", delResult.Errors.Select(e => e.Description)));
             }
 
+            await tx.CommitAsync(cancellationToken);
             return (true, null);
         }
-        finally
+        catch
         {
-            AccountMutationLock.Release();
+            await tx.RollbackAsync(cancellationToken);
+            throw;
         }
     }
 
@@ -801,33 +936,26 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
+        if (!actorOk)
         {
-            var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
-            if (!actorOk)
-            {
-                return (false, actorErr);
-            }
-
-            ApplicationUser? user = await FindFreshTrackedUserByIdOrNameAsync(userNameOrId, cancellationToken);
-            if (user == null)
-            {
-                return (false, $"User '{userNameOrId}' was not found.");
-            }
-
-            IdentityResult stampResult = await userManager.UpdateSecurityStampAsync(user);
-            if (!stampResult.Succeeded)
-            {
-                return (false, string.Join("; ", stampResult.Errors.Select(e => e.Description)));
-            }
-
-            return (true, null);
+            return (false, actorErr);
         }
-        finally
+
+        ApplicationUser? user = await FindFreshTrackedUserByIdOrNameAsync(userNameOrId, cancellationToken);
+        if (user == null)
         {
-            AccountMutationLock.Release();
+            return (false, $"User '{userNameOrId}' was not found.");
         }
+
+        IdentityResult stampResult = await userManager.UpdateSecurityStampAsync(user);
+        if (!stampResult.Succeeded)
+        {
+            return (false, string.Join("; ", stampResult.Errors.Select(e => e.Description)));
+        }
+
+        return (true, null);
     }
 
     /// <summary>
@@ -838,35 +966,29 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
+        if (!actorOk)
         {
-            var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
-            if (!actorOk)
-            {
-                throw new UnauthorizedAccessException(actorErr);
-            }
-
-            List<ApplicationUser> externalUsers = await userManager.Users
-                .Where(u => u.IsExternalAccount)
-                .ToListAsync(cancellationToken);
-
-            int count = 0;
-            foreach (ApplicationUser extUser in externalUsers)
-            {
-                IdentityResult res = await userManager.UpdateSecurityStampAsync(extUser);
-                if (res.Succeeded)
-                {
-                    count++;
-                }
-            }
-
-            return count;
+            throw new UnauthorizedAccessException(actorErr);
         }
-        finally
+
+        List<ApplicationUser> externalUsers = await userManager.Users
+            .Where(u => u.IsExternalAccount)
+            .ToListAsync(cancellationToken);
+
+        int count = 0;
+        foreach (ApplicationUser extUser in externalUsers)
         {
-            AccountMutationLock.Release();
+            await dbContext.Entry(extUser).ReloadAsync(cancellationToken);
+            IdentityResult res = await userManager.UpdateSecurityStampAsync(extUser);
+            if (res.Succeeded)
+            {
+                count++;
+            }
         }
+
+        return count;
     }
 
     /// <summary>
@@ -881,49 +1003,46 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
+        if (!actorOk)
         {
-            var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
-            if (!actorOk)
-            {
-                return (false, actorErr);
-            }
-
-            ApplicationUser? user = await FindFreshTrackedUserByIdOrNameAsync(userNameOrId, cancellationToken);
-
-            if (user == null)
-            {
-                return (false, $"User '{userNameOrId}' was not found.");
-            }
-
-            if (user.IsExternalAccount)
-            {
-                return (false, $"Account '{user.UserName}' is an external OpenID Connect account and cannot be assigned a local password.");
-            }
-
-            string resetToken = await userManager.GeneratePasswordResetTokenAsync(user);
-            IdentityResult resetResult = await userManager.ResetPasswordAsync(user, resetToken, newPassword);
-            if (!resetResult.Succeeded)
-            {
-                return (false, string.Join("; ", resetResult.Errors.Select(e => e.Description)));
-            }
-
-            if (user.IsDisabled)
-            {
-                user.IsDisabled = false;
-            }
-            user.LockoutEnd = null;
-            await userManager.UpdateAsync(user);
-            await userManager.UpdateSecurityStampAsync(user);
-            return (true, null);
+            return (false, actorErr);
         }
-        finally
+
+        ApplicationUser? user = await FindFreshTrackedUserByIdOrNameAsync(userNameOrId, cancellationToken);
+
+        if (user == null)
         {
-            AccountMutationLock.Release();
+            return (false, $"User '{userNameOrId}' was not found.");
         }
+
+        if (user.IsExternalAccount)
+        {
+            return (false, $"Account '{user.UserName}' is an external OpenID Connect account and cannot be assigned a local password.");
+        }
+
+        string resetToken = await userManager.GeneratePasswordResetTokenAsync(user);
+        IdentityResult resetResult = await userManager.ResetPasswordAsync(user, resetToken, newPassword);
+        if (!resetResult.Succeeded)
+        {
+            return (false, string.Join("; ", resetResult.Errors.Select(e => e.Description)));
+        }
+
+        if (user.IsDisabled)
+        {
+            user.IsDisabled = false;
+        }
+        user.LockoutEnd = null;
+        await userManager.UpdateAsync(user);
+        await userManager.UpdateSecurityStampAsync(user);
+        return (true, null);
     }
 
+    /// <summary>
+    /// Creates or updates an external group role mapping and atomically replaces that group's domain/profile rule set.
+    /// Validates all inputs before modifying the database so an invalid domain pattern or profile leaves existing grants untouched.
+    /// </summary>
     public async Task<(bool Succeeded, string? ErrorMessage, ExternalGroupRoleMapping? Mapping)> SetExternalGroupRoleMappingAsync(
         string groupName,
         string roleName,
@@ -932,38 +1051,31 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
+        var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
+        if (!actorOk)
         {
-            await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
-            var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
-            if (!actorOk)
-            {
-                return (false, actorErr, null);
-            }
+            return (false, actorErr, null);
+        }
 
-            var result = await SetExternalGroupRoleMappingCoreAsync(
-                groupName,
-                roleName,
-                initialDomainPatterns,
-                allowedProfileId,
-                cancellationToken);
-            if (result.Succeeded)
-            {
-                await MarkConfiguredGroupMappingsSeededCoreAsync(cancellationToken);
-            }
-            return result;
-        }
-        finally
+        var result = await SetExternalGroupRoleMappingCoreAsync(
+            groupName,
+            roleName,
+            initialDomainPatterns,
+            allowedProfileId,
+            cancellationToken);
+        if (result.Succeeded)
         {
-            AccountMutationLock.Release();
+            await MarkConfiguredGroupMappingsSeededCoreAsync(cancellationToken);
         }
+        return result;
     }
 
     private async Task<(bool Succeeded, string? ErrorMessage, ExternalGroupRoleMapping? Mapping)> SetExternalGroupRoleMappingCoreAsync(
         string groupName,
         string roleName,
-        IEnumerable<string>? initialDomainPatterns,
+        IEnumerable<string>? domainPatterns,
         string allowedProfileId,
         CancellationToken cancellationToken)
     {
@@ -999,9 +1111,9 @@ public sealed class AccountManagementService(
         }
 
         List<string> canonicalDomains = [];
-        if (initialDomainPatterns != null)
+        if (domainPatterns != null)
         {
-            foreach (string rawPattern in initialDomainPatterns)
+            foreach (string rawPattern in domainPatterns)
             {
                 if (string.IsNullOrWhiteSpace(rawPattern))
                 {
@@ -1021,34 +1133,39 @@ public sealed class AccountManagementService(
             }
         }
 
-        ExternalGroupRoleMapping? existing = await dbContext.ExternalGroupRoleMappings
-            .FirstOrDefaultAsync(m => m.GroupName == trimmedGroup, cancellationToken);
-
-        if (existing == null)
+        await using var tx = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+        try
         {
-            existing = new ExternalGroupRoleMapping
+            ExternalGroupRoleMapping? existing = await dbContext.ExternalGroupRoleMappings
+                .FirstOrDefaultAsync(m => m.GroupName == trimmedGroup, cancellationToken);
+
+            if (existing == null)
             {
-                GroupName = trimmedGroup,
-                RoleName = canonicalRole,
-                CreatedAtUtc = DateTimeOffset.UtcNow
-            };
-            dbContext.ExternalGroupRoleMappings.Add(existing);
-        }
-        else
-        {
-            existing.RoleName = canonicalRole;
-        }
+                existing = new ExternalGroupRoleMapping
+                {
+                    GroupName = trimmedGroup,
+                    RoleName = canonicalRole,
+                    CreatedAtUtc = DateTimeOffset.UtcNow
+                };
+                dbContext.ExternalGroupRoleMappings.Add(existing);
+            }
+            else
+            {
+                existing.RoleName = canonicalRole;
+            }
 
-        foreach (string canonicalDomain in canonicalDomains)
-        {
-            bool ruleExists = await dbContext.DomainPermissionRules.AnyAsync(
-                r => r.SubjectType == PermissionSubjectTypes.ExternalGroup
-                  && r.SubjectValue == trimmedGroup
-                  && r.DomainPattern == canonicalDomain
-                  && r.AllowedProfileId == profile,
-                cancellationToken);
+            // Atomically replace all existing DomainPermissionRules for this external group
+            // so updating a group to a narrower domain pattern or profile removes broader previous rules.
+            List<DomainPermissionRule> existingGroupRules = await dbContext.DomainPermissionRules
+                .Where(r => r.SubjectType == PermissionSubjectTypes.ExternalGroup && r.SubjectValue == trimmedGroup)
+                .ToListAsync(cancellationToken);
 
-            if (!ruleExists)
+            if (existingGroupRules.Count > 0)
+            {
+                dbContext.DomainPermissionRules.RemoveRange(existingGroupRules);
+            }
+
+            foreach (string canonicalDomain in canonicalDomains)
             {
                 dbContext.DomainPermissionRules.Add(new DomainPermissionRule
                 {
@@ -1058,12 +1175,18 @@ public sealed class AccountManagementService(
                     AllowedProfileId = profile
                 });
             }
+
+            await dbContext.SaveChangesAsync(cancellationToken);
+            await tx.CommitAsync(cancellationToken);
+
+            await SynchronizeExternalUsersForGroupAsync(trimmedGroup, cancellationToken);
+            return (true, null, existing);
         }
-
-        await dbContext.SaveChangesAsync(cancellationToken);
-        await SynchronizeExternalUsersForGroupAsync(trimmedGroup, cancellationToken);
-
-        return (true, null, existing);
+        catch
+        {
+            await tx.RollbackAsync(cancellationToken);
+            throw;
+        }
     }
 
     public async Task<(bool Succeeded, string? ErrorMessage)> RemoveExternalGroupRoleMappingAsync(
@@ -1071,29 +1194,22 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
+        var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
+        if (!actorOk)
         {
-            await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
-            var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
-            if (!actorOk)
-            {
-                return (false, actorErr);
-            }
-
-            ExternalGroupRoleMapping? mapping = await dbContext.ExternalGroupRoleMappings
-                .FindAsync([mappingId], cancellationToken);
-            if (mapping == null)
-            {
-                return (false, "External group mapping was not found.");
-            }
-
-            return await RemoveExternalGroupRoleMappingCoreAsync(mapping, cancellationToken);
+            return (false, actorErr);
         }
-        finally
+
+        ExternalGroupRoleMapping? mapping = await dbContext.ExternalGroupRoleMappings
+            .FindAsync([mappingId], cancellationToken);
+        if (mapping == null)
         {
-            AccountMutationLock.Release();
+            return (false, "External group mapping was not found.");
         }
+
+        return await RemoveExternalGroupRoleMappingCoreAsync(mapping, cancellationToken);
     }
 
     public async Task<(bool Succeeded, string? ErrorMessage)> RemoveExternalGroupRoleMappingByNameAsync(
@@ -1101,35 +1217,28 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
+        var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
+        if (!actorOk)
         {
-            await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
-            var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
-            if (!actorOk)
-            {
-                return (false, actorErr);
-            }
-
-            if (string.IsNullOrWhiteSpace(groupName))
-            {
-                return (false, "External group name is required.");
-            }
-
-            string trimmed = groupName.Trim();
-            ExternalGroupRoleMapping? mapping = await dbContext.ExternalGroupRoleMappings
-                .FirstOrDefaultAsync(m => m.GroupName == trimmed, cancellationToken);
-            if (mapping == null)
-            {
-                return (false, $"External group mapping '{trimmed}' was not found.");
-            }
-
-            return await RemoveExternalGroupRoleMappingCoreAsync(mapping, cancellationToken);
+            return (false, actorErr);
         }
-        finally
+
+        if (string.IsNullOrWhiteSpace(groupName))
         {
-            AccountMutationLock.Release();
+            return (false, "External group name is required.");
         }
+
+        string trimmed = groupName.Trim();
+        ExternalGroupRoleMapping? mapping = await dbContext.ExternalGroupRoleMappings
+            .FirstOrDefaultAsync(m => m.GroupName == trimmed, cancellationToken);
+        if (mapping == null)
+        {
+            return (false, $"External group mapping '{trimmed}' was not found.");
+        }
+
+        return await RemoveExternalGroupRoleMappingCoreAsync(mapping, cancellationToken);
     }
 
     private async Task<(bool Succeeded, string? ErrorMessage)> RemoveExternalGroupRoleMappingCoreAsync(
@@ -1207,6 +1316,9 @@ public sealed class AccountManagementService(
 
         foreach (ApplicationUser extUser in externalUsers)
         {
+            await dbContext.Entry(extUser).ReloadAsync(cancellationToken);
+            await SyncTrackedUserRolesCacheAsync(extUser.Id, cancellationToken);
+
             IReadOnlyList<string> userGroups = OidcFederationService.ParseSyncedGroupsJson(extUser.LastSyncedGroupsJson);
             if (!userGroups.Contains(affectedGroupName, StringComparer.Ordinal))
             {
@@ -1224,7 +1336,7 @@ public sealed class AccountManagementService(
                 ? [AppRoles.Administrator, AppRoles.Issuer]
                 : (isIssuer ? [AppRoles.Issuer] : []);
 
-            IList<string> currentRoles = await userManager.GetRolesAsync(extUser);
+            IReadOnlyList<string> currentRoles = await GetFreshUserRoleNamesCoreAsync(extUser.Id, cancellationToken);
             string[] toRemove = currentRoles
                 .Where(r => !effectiveRoles.Contains(r, StringComparer.OrdinalIgnoreCase))
                 .ToArray();
@@ -1254,69 +1366,77 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
+        var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
+        if (!actorOk)
         {
-            await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
-            var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
-            if (!actorOk)
-            {
-                return (false, actorErr);
-            }
-
-            if (subjectType != PermissionSubjectTypes.User
-                && subjectType != PermissionSubjectTypes.Role
-                && subjectType != PermissionSubjectTypes.ExternalGroup)
-            {
-                return (false, "SubjectType must be 'User', 'Role', or 'ExternalGroup'.");
-            }
-
-            if (string.IsNullOrWhiteSpace(subjectValue))
-            {
-                return (false, "SubjectValue is required.");
-            }
-
-            string canonicalPattern = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(domainPattern);
-            if (string.IsNullOrEmpty(canonicalPattern))
-            {
-                return (false, "Domain pattern is invalid.");
-            }
-
-            if (allowedProfileId != "*" && !CertificateProfiles.All.ContainsKey(allowedProfileId))
-            {
-                return (false, $"Unknown certificate profile '{allowedProfileId}'.");
-            }
-
-            bool exists = await dbContext.DomainPermissionRules.AnyAsync(
-                r => r.SubjectType == subjectType
-                  && r.SubjectValue == subjectValue
-                  && r.DomainPattern == canonicalPattern
-                  && r.AllowedProfileId == allowedProfileId,
-                cancellationToken);
-
-            if (!exists)
-            {
-                dbContext.DomainPermissionRules.Add(new DomainPermissionRule
-                {
-                    SubjectType = subjectType,
-                    SubjectValue = subjectValue,
-                    DomainPattern = canonicalPattern,
-                    AllowedProfileId = allowedProfileId
-                });
-                await dbContext.SaveChangesAsync(cancellationToken);
-            }
-
-            if (subjectType == PermissionSubjectTypes.ExternalGroup)
-            {
-                await MarkConfiguredGroupMappingsSeededCoreAsync(cancellationToken);
-            }
-
-            return (true, null);
+            return (false, actorErr);
         }
-        finally
+
+        if (subjectType != PermissionSubjectTypes.User
+            && subjectType != PermissionSubjectTypes.Role
+            && subjectType != PermissionSubjectTypes.ExternalGroup)
         {
-            AccountMutationLock.Release();
+            return (false, "SubjectType must be 'User', 'Role', or 'ExternalGroup'.");
         }
+
+        if (string.IsNullOrWhiteSpace(subjectValue))
+        {
+            return (false, "SubjectValue is required.");
+        }
+
+        string trimmedSubjectValue = subjectValue.Trim();
+
+        if (subjectType == PermissionSubjectTypes.ExternalGroup)
+        {
+            bool groupExists = await dbContext.ExternalGroupRoleMappings
+                .AsNoTracking()
+                .AnyAsync(m => m.GroupName == trimmedSubjectValue, cancellationToken);
+            if (!groupExists)
+            {
+                return (false, $"External group '{trimmedSubjectValue}' is not mapped. Create the group role mapping first.");
+            }
+        }
+
+        string canonicalPattern = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(domainPattern);
+        if (string.IsNullOrEmpty(canonicalPattern))
+        {
+            return (false, "Domain pattern is invalid.");
+        }
+
+        string profile = string.IsNullOrWhiteSpace(allowedProfileId) ? "*" : allowedProfileId.Trim();
+        if (profile != "*" && !CertificateProfiles.All.ContainsKey(profile))
+        {
+            return (false, $"Unknown certificate profile '{profile}'.");
+        }
+
+        bool exists = await dbContext.DomainPermissionRules.AnyAsync(
+            r => r.SubjectType == subjectType
+              && r.SubjectValue == trimmedSubjectValue
+              && r.DomainPattern == canonicalPattern
+              && r.AllowedProfileId == profile,
+            cancellationToken);
+
+        if (!exists)
+        {
+            dbContext.DomainPermissionRules.Add(new DomainPermissionRule
+            {
+                SubjectType = subjectType,
+                SubjectValue = trimmedSubjectValue,
+                DomainPattern = canonicalPattern,
+                AllowedProfileId = profile
+            });
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+
+        if (subjectType == PermissionSubjectTypes.ExternalGroup)
+        {
+            await MarkConfiguredGroupMappingsSeededCoreAsync(cancellationToken);
+            await SynchronizeExternalUsersForGroupAsync(trimmedSubjectValue, cancellationToken);
+        }
+
+        return (true, null);
     }
 
     public async Task<(bool Succeeded, string? ErrorMessage)> RemoveDomainPermissionAsync(
@@ -1324,52 +1444,46 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
-        await AccountMutationLock.WaitAsync(cancellationToken);
-        try
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
+        var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
+        if (!actorOk)
         {
-            await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
-            var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
-            if (!actorOk)
+            return (false, actorErr);
+        }
+
+        DomainPermissionRule? rule = await dbContext.DomainPermissionRules.FindAsync([ruleId], cancellationToken);
+        if (rule != null)
+        {
+            string subjectType = rule.SubjectType;
+            string subjectValue = rule.SubjectValue;
+            dbContext.DomainPermissionRules.Remove(rule);
+            await dbContext.SaveChangesAsync(cancellationToken);
+
+            if (subjectType == PermissionSubjectTypes.ExternalGroup)
             {
-                return (false, actorErr);
+                await MarkConfiguredGroupMappingsSeededCoreAsync(cancellationToken);
+                await SynchronizeExternalUsersForGroupAsync(subjectValue, cancellationToken);
             }
-
-            DomainPermissionRule? rule = await dbContext.DomainPermissionRules.FindAsync([ruleId], cancellationToken);
-            if (rule != null)
+            else if (subjectType == PermissionSubjectTypes.User)
             {
-                string subjectType = rule.SubjectType;
-                string subjectValue = rule.SubjectValue;
-                dbContext.DomainPermissionRules.Remove(rule);
-                await dbContext.SaveChangesAsync(cancellationToken);
-
-                if (subjectType == PermissionSubjectTypes.ExternalGroup)
+                ApplicationUser? affectedUser = await FindFreshTrackedUserByIdOrNameAsync(subjectValue, cancellationToken);
+                if (affectedUser != null)
                 {
-                    await MarkConfiguredGroupMappingsSeededCoreAsync(cancellationToken);
-                    await SynchronizeExternalUsersForGroupAsync(subjectValue, cancellationToken);
-                }
-                else if (subjectType == PermissionSubjectTypes.User)
-                {
-                    ApplicationUser? affectedUser = await userManager.FindByIdAsync(subjectValue);
-                    if (affectedUser != null)
-                    {
-                        await userManager.UpdateSecurityStampAsync(affectedUser);
-                    }
+                    await userManager.UpdateSecurityStampAsync(affectedUser);
                 }
             }
+        }
 
-            return (true, null);
-        }
-        finally
-        {
-            AccountMutationLock.Release();
-        }
+        return (true, null);
     }
 
     public async Task<IReadOnlyList<UserSummaryDto>> ListUsersAsync(CancellationToken cancellationToken = default)
     {
         await EnsureRolesAndDefaultsAsync(cancellationToken);
 
-        List<ApplicationUser> users = await userManager.Users
+        List<ApplicationUser> users = await dbContext.Users
+            .AsNoTracking()
             .OrderBy(u => u.UserName)
             .ToListAsync(cancellationToken);
 
@@ -1387,7 +1501,7 @@ public sealed class AccountManagementService(
         List<UserSummaryDto> summaries = new(users.Count);
         foreach (ApplicationUser u in users)
         {
-            IList<string> roles = await userManager.GetRolesAsync(u);
+            IReadOnlyList<string> roles = await GetFreshUserRoleNamesCoreAsync(u.Id, cancellationToken);
             List<DomainPermissionRule> directRules = allRules
                 .Where(r => r.SubjectType == PermissionSubjectTypes.User && r.SubjectValue == u.Id)
                 .ToList();
@@ -1447,13 +1561,15 @@ public sealed class AccountManagementService(
         CancellationToken cancellationToken = default,
         ClaimsPrincipal? actingPrincipal = null)
     {
+        await using IAsyncDisposable _ = await AcquireAccountMutationLockAsync(cancellationToken);
+        await EnsureRolesAndDefaultsCoreAsync(cancellationToken);
         var (actorOk, actorErr, _) = await VerifyActingAdministratorIfProvidedAsync(actingPrincipal, cancellationToken);
         if (!actorOk)
         {
             return (false, actorErr);
         }
 
-        SubjectDefaultsConfig existing = await GetSubjectDefaultsAsync(cancellationToken);
+        SubjectDefaultsConfig existing = await dbContext.SubjectDefaults.OrderBy(s => s.Id).FirstAsync(cancellationToken);
         existing.Country = updated.Country.Trim().ToUpperInvariant();
         existing.StateOrProvince = updated.StateOrProvince.Trim();
         existing.Locality = updated.Locality.Trim();

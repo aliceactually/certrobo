@@ -1326,7 +1326,7 @@ public class OidcFederatedLoginTests : IDisposable
             OidcFederationService oidcSvc = scope.ServiceProvider.GetRequiredService<OidcFederationService>();
             UserManager<ApplicationUser> userMgr = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
 
-            await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*");
+            var (_, _, adminUser) = await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*");
             await acct.SetExternalGroupRoleMappingAsync("Only-Issuers", AppRoles.Issuer, ["*.contoso.com"], "*");
 
             ClaimsIdentity forgedIdpClaims = new(
@@ -1355,7 +1355,7 @@ public class OidcFederatedLoginTests : IDisposable
             SetProperty(adminPage, "MigrationService", scope.ServiceProvider.GetRequiredService<LegacySettingsMigrationService>());
             SetProperty(adminPage, "Configuration", scope.ServiceProvider.GetRequiredService<Microsoft.Extensions.Configuration.IConfiguration>());
             SetProperty(adminPage, "HostEnvironment", scope.ServiceProvider.GetRequiredService<IWebHostEnvironment>());
-            SetProperty(adminPage, "AuthenticationStateProvider", scope.ServiceProvider.GetRequiredService<AuthenticationStateProvider>());
+            SetProperty(adminPage, "AuthenticationStateProvider", new ControllableAuthStateProvider(adminUser!.Id, adminUser.UserName!, AppRoles.Administrator, adminUser.SecurityStamp));
             SetProperty(adminPage, "NotificationService", scope.ServiceProvider.GetRequiredService<Radzen.NotificationService>());
 
             await InvokeMethodAsync(adminPage, "OnInitializedAsync");
@@ -1441,7 +1441,8 @@ public class OidcFederatedLoginTests : IDisposable
             envWithConfiguredMappings);
         Assert.True(rmExit == 0, $"Remove failed: {rmOut}\n{rmErr}");
 
-        // 3. Process #3: Change 'dev-issuers' role/domains via CLI and delete one of its domain rules
+        // 3. Process #3: Narrow 'dev-issuers' domains/profile via CLI (--add-oidc-group-mapping)
+        //    and verify the CLI command ITSELF atomically replaces the old '*.dev.contoso.com' and 'dev.contoso.com' rules!
         var (modExit, modOut, modErr) = await RunCliAsync(
             dbPath, caDir,
             ["--add-oidc-group-mapping", "dev-issuers", "Issuer", "*.restricted.contoso.com", "tls-server-ecdsa-256"],
@@ -1450,15 +1451,12 @@ public class OidcFederatedLoginTests : IDisposable
 
         await using (CertRoboDbContext db2 = CreateSqliteContext(dbPath))
         {
-            // Remove the original '*.dev.contoso.com' and 'dev.contoso.com' rules from dev-issuers
-            List<DomainPermissionRule> oldRules = await db2.DomainPermissionRules
-                .Where(r => r.SubjectType == PermissionSubjectTypes.ExternalGroup
-                         && r.SubjectValue == "dev-issuers"
-                         && (r.DomainPattern == "*.dev.contoso.com" || r.DomainPattern == "dev.contoso.com"))
+            List<DomainPermissionRule> currentRules = await db2.DomainPermissionRules
+                .Where(r => r.SubjectType == PermissionSubjectTypes.ExternalGroup && r.SubjectValue == "dev-issuers")
                 .ToListAsync();
-            Assert.Equal(2, oldRules.Count);
-            db2.DomainPermissionRules.RemoveRange(oldRules);
-            await db2.SaveChangesAsync();
+            DomainPermissionRule singleReplacedRule = Assert.Single(currentRules);
+            Assert.Equal("*.restricted.contoso.com", singleReplacedRule.DomainPattern);
+            Assert.Equal(CertificateProfiles.EcdsaP256ServerId, singleReplacedRule.AllowedProfileId);
         }
 
         // 4. Process #4 & #5: Run additional CLI processes with CertRobo__Oidc__GroupMappingsSpec still present in environment
@@ -1676,6 +1674,40 @@ public class OidcFederatedLoginTests : IDisposable
         // 4. Verify CLI break-glass password reset (--reset-admin-password) still works without an interactive actor
         var (cliResetOk, cliResetErr) = await acct.ResetPasswordAsync(admin2.UserName!, "RecoveredViaCli!2026");
         Assert.True(cliResetOk, cliResetErr);
+
+        // 5. Cross-process sole-local-admin serialization:
+        //    Prepare a dedicated SQLite DB with two active local administrators (admin1 and admin2),
+        //    then launch two separate OS CLI processes simultaneously attempting to disable admin1 and admin2.
+        //    Exactly ONE process must exit 0 and the other must exit non-zero!
+        string crossProcDb = Path.Combine(_tempDir, "cross-proc-admins.db");
+        string crossProcCa = Path.Combine(_tempDir, "cross-proc-ca");
+        var (cpBootExit, _, _) = await RunCliAsync(crossProcDb, crossProcCa, ["--bootstrap-admin", "cp-admin1", "AdminOnePass!2026", "*"]);
+        Assert.Equal(0, cpBootExit);
+
+        await using (CertRoboDbContext cpDb = CreateSqliteContext(crossProcDb))
+        {
+            ServiceCollection sc = new();
+            sc.AddLogging();
+            sc.AddDbContext<CertRoboDbContext>(o => o.UseSqlite($"Data Source={crossProcDb}"));
+            sc.AddIdentityCore<ApplicationUser>().AddRoles<IdentityRole>().AddEntityFrameworkStores<CertRoboDbContext>();
+            sc.AddScoped<AccountManagementService>();
+            await using ServiceProvider cpSp = sc.BuildServiceProvider();
+            using IServiceScope cpScope = cpSp.CreateScope();
+            AccountManagementService cpAcct = cpScope.ServiceProvider.GetRequiredService<AccountManagementService>();
+            var (cpCreateOk, cpCreateErr, _) = await cpAcct.CreateUserAsync("cp-admin2", "AdminTwoPass!2026", null, [AppRoles.Administrator, AppRoles.Issuer]);
+            Assert.True(cpCreateOk, cpCreateErr);
+        }
+
+        Task<(int ExitCode, string Stdout, string Stderr)>[] cpDisableProcesses =
+        [
+            RunCliAsync(crossProcDb, crossProcCa, ["--set-user-disabled", "cp-admin1", "true"]),
+            RunCliAsync(crossProcDb, crossProcCa, ["--set-user-disabled", "cp-admin2", "true"])
+        ];
+
+        var cpResults = await Task.WhenAll(cpDisableProcesses);
+        Assert.Equal(1, cpResults.Count(r => r.ExitCode == 0));
+        Assert.Equal(1, cpResults.Count(r => r.ExitCode != 0));
+        Assert.Contains(cpResults.Where(r => r.ExitCode != 0), r => r.Stderr.Contains("last active local Administrator", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -1849,10 +1881,12 @@ public class OidcFederatedLoginTests : IDisposable
     {
         var (factory, _, _) = CreateOidcTestHost();
 
+        ApplicationUser adminUser;
         using (IServiceScope scope = factory.Services.CreateScope())
         {
             AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
-            await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*");
+            var (_, _, createdAdmin) = await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*");
+            adminUser = createdAdmin!;
         }
 
         using HttpClient client = factory.CreateClient(new WebApplicationFactoryClientOptions
@@ -1884,7 +1918,7 @@ public class OidcFederatedLoginTests : IDisposable
             SetProperty(adminPage, "MigrationService", scope.ServiceProvider.GetRequiredService<LegacySettingsMigrationService>());
             SetProperty(adminPage, "Configuration", scope.ServiceProvider.GetRequiredService<IConfiguration>());
             SetProperty(adminPage, "HostEnvironment", scope.ServiceProvider.GetRequiredService<IWebHostEnvironment>());
-            SetProperty(adminPage, "AuthenticationStateProvider", scope.ServiceProvider.GetRequiredService<AuthenticationStateProvider>());
+            SetProperty(adminPage, "AuthenticationStateProvider", new ControllableAuthStateProvider(adminUser.Id, adminUser.UserName!, AppRoles.Administrator, adminUser.SecurityStamp));
             SetProperty(adminPage, "NotificationService", scope.ServiceProvider.GetRequiredService<Radzen.NotificationService>());
 
             await InvokeMethodAsync(adminPage, "OnInitializedAsync");
@@ -1922,9 +1956,264 @@ public class OidcFederatedLoginTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task AdminActionBoundary_FailsClosedOnAnonymousZeroClaim_ThrowingProvider_MissingStamp_RevalidatedAnonymous_AndRotatedActors_WithNoSideEffects()
+    {
+        var (factory, _, _) = CreateOidcTestHost();
+
+        using IServiceScope scope = factory.Services.CreateScope();
+        AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+        CertificateAuthorityService caService = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
+        UserManager<ApplicationUser> userMgr = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+
+        var (_, _, admin1) = await acct.BootstrapFirstAdminAsync("admin1", "AdminOnePass!2026", "admin1@contoso.com", "*");
+        var (_, _, admin2) = await acct.CreateUserAsync("admin2", "AdminTwoPass!2026", "admin2@contoso.com", [AppRoles.Administrator, AppRoles.Issuer], ["*"]);
+        Assert.NotNull(admin1);
+        Assert.NotNull(admin2);
+
+        // Disable admin2 legitimately first
+        var (disOk, disErr) = await acct.SetUserDisabledAsync(admin2!.Id, isDisabled: true);
+        Assert.True(disOk, disErr);
+
+        ControllableAuthStateProvider authProvider = new(admin1!.Id, admin1.UserName!, AppRoles.Administrator, admin1.SecurityStamp);
+
+        CertRobo.Pages.Admin adminPage = new();
+        SetProperty(adminPage, "AccountService", acct);
+        SetProperty(adminPage, "CaService", caService);
+        SetProperty(adminPage, "CesService", scope.ServiceProvider.GetRequiredService<AdCsCesEnrollmentService>());
+        SetProperty(adminPage, "BackupService", scope.ServiceProvider.GetRequiredService<BackupRestoreService>());
+        SetProperty(adminPage, "MigrationService", scope.ServiceProvider.GetRequiredService<LegacySettingsMigrationService>());
+        SetProperty(adminPage, "Configuration", scope.ServiceProvider.GetRequiredService<IConfiguration>());
+        SetProperty(adminPage, "HostEnvironment", scope.ServiceProvider.GetRequiredService<IWebHostEnvironment>());
+        SetProperty(adminPage, "AuthenticationStateProvider", authProvider);
+        SetProperty(adminPage, "NotificationService", scope.ServiceProvider.GetRequiredService<Radzen.NotificationService>());
+
+        await InvokeMethodAsync(adminPage, "OnInitializedAsync");
+
+        UserSummaryDto disabledAdmin2Dto = (await acct.ListUsersAsync()).Single(u => u.Id == admin2.Id);
+        Assert.True(disabledAdmin2Dto.IsDisabled);
+
+        async Task AssertAllPrivilegedActionsDeniedWithNoSideEffectsAsync(string scenarioName)
+        {
+            SetField(adminPage, "statusBannerMessage", null);
+            await InvokeMethodAsync(adminPage, "ToggleUserDisabledClick", disabledAdmin2Dto);
+            Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage") ?? string.Empty);
+
+            SetField(adminPage, "statusBannerMessage", null);
+            SetField(adminPage, "newUserName", "should-not-exist");
+            SetField(adminPage, "newUserPassword", "ShouldNotExist!2026");
+            await InvokeMethodAsync(adminPage, "CreateUserClick");
+            Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage") ?? string.Empty);
+
+            SetField(adminPage, "statusBannerMessage", null);
+            SetField(adminPage, "newGroupMappingName", "Unauthorized-Group");
+            SetField(adminPage, "newGroupMappingRole", AppRoles.Administrator);
+            await InvokeMethodAsync(adminPage, "SaveExternalGroupMappingClick");
+            Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage") ?? string.Empty);
+
+            SetField(adminPage, "statusBannerMessage", null);
+            SetField(adminPage, "oidcPortalProviderDisplayName", "Tampered Label");
+            await InvokeMethodAsync(adminPage, "SaveOidcPortalSettingsClick");
+            Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage") ?? string.Empty);
+
+            SetField(adminPage, "statusBannerMessage", null);
+            SetField(adminPage, "newCaName", "Unauthorized CA");
+            await InvokeMethodAsync(adminPage, "CreateCaClick");
+            Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage") ?? string.Empty);
+
+            SetField(adminPage, "statusBannerMessage", null);
+            await InvokeMethodAsync(adminPage, "DownloadBackupClick");
+            Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage") ?? string.Empty);
+
+            // Verify zero side effects in SQLite or CA state
+            ApplicationUser reloaded2 = (await userMgr.FindByIdAsync(admin2.Id))!;
+            await scope.ServiceProvider.GetRequiredService<CertRoboDbContext>().Entry(reloaded2).ReloadAsync();
+            Assert.True(reloaded2.IsDisabled, $"Scenario '{scenarioName}' re-enabled disabled admin2!");
+            Assert.Null(await userMgr.FindByNameAsync("should-not-exist"));
+            Assert.Empty(await acct.ListExternalGroupMappingsAsync());
+            Assert.Equal("Corporate SSO", (await acct.GetOidcPortalSettingsAsync()).ProviderDisplayName);
+            Assert.Null(await caService.GetActiveAuthorityAsync());
+        }
+
+        // 1. Zero-claim anonymous authentication state (exact reproduction of Review #2 P1.1)
+        authProvider.SetRawPrincipal(new ClaimsPrincipal(new ClaimsIdentity()));
+        await AssertAllPrivilegedActionsDeniedWithNoSideEffectsAsync("zero-claim anonymous principal");
+
+        // 2. Unauthenticated identity that still carries claims
+        authProvider.SetRawPrincipal(new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.NameIdentifier, admin1.Id),
+            new Claim(ClaimTypes.Name, admin1.UserName!),
+            new Claim(ClaimTypes.Role, AppRoles.Administrator),
+            new Claim("AspNet.Identity.SecurityStamp", admin1.SecurityStamp!)
+        ]))); // authenticationType == null -> IsAuthenticated == false
+        await AssertAllPrivilegedActionsDeniedWithNoSideEffectsAsync("unauthenticated identity with claims");
+
+        // 3. AuthenticationStateProvider throwing InvalidOperationException (provider failure)
+        authProvider.SetThrowOnGetState(new InvalidOperationException("Simulated uninitialized circuit provider failure."));
+        await AssertAllPrivilegedActionsDeniedWithNoSideEffectsAsync("provider throwing InvalidOperationException");
+
+        // 4. Authenticated Administrator principal MISSING the SecurityStamp claim (both at component and service boundary)
+        authProvider.SetPrincipal(admin1.Id, admin1.UserName!, AppRoles.Administrator, securityStamp: null);
+        await AssertAllPrivilegedActionsDeniedWithNoSideEffectsAsync("authenticated admin principal missing SecurityStamp");
+
+        ClaimsPrincipal stamplessPrincipal = new(new ClaimsIdentity(
+        [
+            new Claim(ClaimTypes.NameIdentifier, admin1.Id),
+            new Claim(ClaimTypes.Name, admin1.UserName!),
+            new Claim(ClaimTypes.Role, AppRoles.Administrator)
+        ], "TestAuth"));
+        var (svcNoStampOk, svcNoStampErr) = await acct.SetUserDisabledAsync(admin2.Id, false, actingPrincipal: stamplessPrincipal);
+        Assert.False(svcNoStampOk);
+        Assert.Contains("security stamp", svcNoStampErr, StringComparison.OrdinalIgnoreCase);
+
+        // 5. Previously valid circuit whose SecurityStamp was rotated (e.g. via InvalidateUserSessionsAsync)
+        authProvider.SetPrincipal(admin1.Id, admin1.UserName!, AppRoles.Administrator, admin1.SecurityStamp);
+        await acct.InvalidateUserSessionsAsync(admin1.Id);
+        await AssertAllPrivilegedActionsDeniedWithNoSideEffectsAsync("rotated SecurityStamp on admin1");
+    }
+
+    [Fact]
+    public async Task UpdatingExternalGroupMapping_AtomicallyReplacesDomainAndProfileRules_RejectsPartialUpdatesOnInvalidInput_AndSupportsExplicitAdditiveRules_AcrossRestartAndBackupRestore()
+    {
+        var (factory, idp, _) = CreateOidcTestHost();
+
+        using (IServiceScope scope = factory.Services.CreateScope())
+        {
+            AccountManagementService acct = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+            IssuancePolicyService policy = scope.ServiceProvider.GetRequiredService<IssuancePolicyService>();
+            OidcFederationService oidcSvc = scope.ServiceProvider.GetRequiredService<OidcFederationService>();
+
+            var (_, _, admin) = await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*");
+
+            // 1. Initially map 'dev-only' as Issuer for wildcard '*' across all profiles '*'
+            var (initOk, initErr, _) = await acct.SetExternalGroupRoleMappingAsync("dev-only", AppRoles.Issuer, ["*"], "*");
+            Assert.True(initOk, initErr);
+
+            // Provision external user in 'dev-only'
+            OidcLoginOutcome login = await oidcSvc.ProcessValidatedOidcLoginAsync(
+                new ClaimsPrincipal(new ClaimsIdentity(
+                [
+                    new Claim("sub", "sub-dev-narrow-test"),
+                    new Claim("iss", idp.Issuer),
+                    new Claim("groups", "dev-only"),
+                    new Claim("preferred_username", "dev.user")
+                ], "TestOidc")),
+                idp.Issuer,
+                "sub-dev-narrow-test");
+            Assert.True(login.Succeeded);
+            string extUserId = login.User!.Id;
+
+            KeyPair ec256 = _crypto.KeyGen(256);
+            KeyPair rsa2048 = _crypto.KeyGen(2048);
+            string prodEcCsr = _crypto.CSRGen(ec256, "prod.contoso.com", ["prod.contoso.com"], "US", "WA", "Redmond", "Contoso", "IT", "");
+            string devEcCsr = _crypto.CSRGen(ec256, "app.dev.contoso.com", ["app.dev.contoso.com"], "US", "WA", "Redmond", "Contoso", "IT", "");
+            string devRsaCsr = _crypto.CSRGen(rsa2048, "app.dev.contoso.com", ["app.dev.contoso.com"], "US", "WA", "Redmond", "Contoso", "IT", "");
+            string qaEcCsr = _crypto.CSRGen(ec256, "app.qa.contoso.com", ["app.qa.contoso.com"], "US", "WA", "Redmond", "Contoso", "IT", "");
+
+            // Initially, prod.contoso.com is allowed by '*'
+            Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, prodEcCsr)).IsAllowed);
+
+            // 2. Update 'dev-only' to narrower domain patterns ('*.dev.contoso.com', '*.qa.contoso.com') and narrower profile ('tls-server-ecdsa-256')
+            var (narrowOk, narrowErr, _) = await acct.SetExternalGroupRoleMappingAsync(
+                "dev-only",
+                AppRoles.Issuer,
+                ["*.dev.contoso.com", "*.qa.contoso.com"],
+                CertificateProfiles.EcdsaP256ServerId);
+            Assert.True(narrowOk, narrowErr);
+
+            // Verify old '*' rule was atomically removed and replaced by the 2 new rules
+            IReadOnlyList<ExternalGroupMappingSummaryDto> mappingsAfterNarrow = await acct.ListExternalGroupMappingsAsync();
+            ExternalGroupMappingSummaryDto devOnlyMap = Assert.Single(mappingsAfterNarrow);
+            Assert.Equal(2, devOnlyMap.DomainPermissions.Count);
+            Assert.DoesNotContain(devOnlyMap.DomainPermissions, r => r.DomainPattern == "*");
+            Assert.All(devOnlyMap.DomainPermissions, r => Assert.Equal(CertificateProfiles.EcdsaP256ServerId, r.AllowedProfileId));
+
+            // Issuance against old scope (prod.contoso.com) and old profile (RSA-2048) MUST NOW BE DENIED!
+            Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, prodEcCsr)).IsAllowed);
+            Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, devRsaCsr)).IsAllowed);
+
+            // Issuance against new scope (app.dev.contoso.com and app.qa.contoso.com with ECDSA P-256) succeeds
+            Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, devEcCsr)).IsAllowed);
+            Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, qaEcCsr)).IsAllowed);
+
+            // 3. Verify NO partial updates on failure:
+            //    Attempt to update 'dev-only' with Role=Administrator and one valid + one invalid domain pattern ->
+            //    must fail and leave role as 'Issuer' and existing 2 rules untouched!
+            var (badDomainOk, badDomainErr, _) = await acct.SetExternalGroupRoleMappingAsync(
+                "dev-only",
+                AppRoles.Administrator,
+                ["*.valid.contoso.com", "invalid domain with spaces!"],
+                "*");
+            Assert.False(badDomainOk);
+            Assert.Contains("invalid", badDomainErr, StringComparison.OrdinalIgnoreCase);
+
+            var (badProfileOk, badProfileErr, _) = await acct.SetExternalGroupRoleMappingAsync(
+                "dev-only",
+                AppRoles.Administrator,
+                ["*.valid.contoso.com"],
+                "non-existent-profile");
+            Assert.False(badProfileOk);
+            Assert.Contains("profile", badProfileErr, StringComparison.OrdinalIgnoreCase);
+
+            devOnlyMap = Assert.Single(await acct.ListExternalGroupMappingsAsync());
+            Assert.Equal(AppRoles.Issuer, devOnlyMap.RoleName);
+            Assert.Equal(2, devOnlyMap.DomainPermissions.Count);
+            Assert.DoesNotContain(devOnlyMap.DomainPermissions, r => r.DomainPattern == "*.valid.contoso.com");
+
+            // 4. Verify explicit additive rule operation (AddDomainPermissionAsync / UI AddAdditionalGroupRuleClick)
+            //    appends an RSA-2048 rule for '*.dev.contoso.com' without removing the existing ECDSA P-256 rules!
+            CertRobo.Pages.Admin adminPage = new();
+            SetProperty(adminPage, "AccountService", acct);
+            SetProperty(adminPage, "CaService", scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>());
+            SetProperty(adminPage, "CesService", scope.ServiceProvider.GetRequiredService<AdCsCesEnrollmentService>());
+            SetProperty(adminPage, "BackupService", scope.ServiceProvider.GetRequiredService<BackupRestoreService>());
+            SetProperty(adminPage, "MigrationService", scope.ServiceProvider.GetRequiredService<LegacySettingsMigrationService>());
+            SetProperty(adminPage, "Configuration", scope.ServiceProvider.GetRequiredService<IConfiguration>());
+            SetProperty(adminPage, "HostEnvironment", scope.ServiceProvider.GetRequiredService<IWebHostEnvironment>());
+            SetProperty(adminPage, "AuthenticationStateProvider", new ControllableAuthStateProvider(admin!.Id, admin.UserName!, AppRoles.Administrator, admin.SecurityStamp));
+            SetProperty(adminPage, "NotificationService", scope.ServiceProvider.GetRequiredService<Radzen.NotificationService>());
+
+            await InvokeMethodAsync(adminPage, "OnInitializedAsync");
+            SetField(adminPage, "additionalRuleGroupName", "dev-only");
+            SetField(adminPage, "additionalRuleDomainPattern", "*.dev.contoso.com");
+            SetField(adminPage, "additionalRuleProfileId", CertificateProfiles.Rsa2048ServerId);
+            await InvokeMethodAsync(adminPage, "AddAdditionalGroupRuleClick");
+
+            devOnlyMap = Assert.Single(await acct.ListExternalGroupMappingsAsync());
+            Assert.Equal(3, devOnlyMap.DomainPermissions.Count);
+            Assert.True((await policy.EvaluateCsrRequestAsync(extUserId, devRsaCsr)).IsAllowed);
+            Assert.False((await policy.EvaluateCsrRequestAsync(extUserId, prodEcCsr)).IsAllowed);
+
+            // 5. Verify Backup & Restore preserves the narrowed + additive rules and never resurrects '*'
+            BackupRestoreService backupSvc = scope.ServiceProvider.GetRequiredService<BackupRestoreService>();
+            string srcDb = Path.Combine(_tempDir, "narrow-backup-src.db");
+            string srcDp = Path.Combine(_tempDir, "narrow-backup-dp");
+            Directory.CreateDirectory(srcDp);
+            byte[] archive = await backupSvc.CreateConsistentBackupArchiveAsync(srcDb, srcDp);
+
+            string restoredDir = Path.Combine(_tempDir, "narrow-restored");
+            string restoredDb = Path.Combine(restoredDir, "certrobo.db");
+            BackupRestoreService.RestoreBackupArchive(
+                archive,
+                restoredDb,
+                Path.Combine(restoredDir, "ca"),
+                Path.Combine(restoredDir, "dp"));
+
+            await using CertRoboDbContext restoredContext = CreateSqliteContext(restoredDb);
+            await restoredContext.EnsureSchemaUpgradedAsync();
+            List<DomainPermissionRule> restoredRules = await restoredContext.DomainPermissionRules
+                .Where(r => r.SubjectType == PermissionSubjectTypes.ExternalGroup && r.SubjectValue == "dev-only")
+                .ToListAsync();
+            Assert.Equal(3, restoredRules.Count);
+            Assert.DoesNotContain(restoredRules, r => r.DomainPattern == "*");
+        }
+    }
+
     private sealed class ControllableAuthStateProvider : AuthenticationStateProvider
     {
         private ClaimsPrincipal _principal;
+        private Exception? _throwOnGetState;
 
         public ControllableAuthStateProvider(string userId, string userName, string role, string? securityStamp)
         {
@@ -1933,7 +2222,19 @@ public class OidcFederatedLoginTests : IDisposable
 
         public void SetPrincipal(string userId, string userName, string role, string? securityStamp)
         {
+            _throwOnGetState = null;
             _principal = BuildPrincipal(userId, userName, role, securityStamp);
+        }
+
+        public void SetRawPrincipal(ClaimsPrincipal principal)
+        {
+            _throwOnGetState = null;
+            _principal = principal;
+        }
+
+        public void SetThrowOnGetState(Exception ex)
+        {
+            _throwOnGetState = ex;
         }
 
         private static ClaimsPrincipal BuildPrincipal(string userId, string userName, string role, string? securityStamp)
@@ -1951,8 +2252,14 @@ public class OidcFederatedLoginTests : IDisposable
             return new ClaimsPrincipal(new ClaimsIdentity(claims, "TestAuth"));
         }
 
-        public override Task<AuthenticationState> GetAuthenticationStateAsync() =>
-            Task.FromResult(new AuthenticationState(_principal));
+        public override Task<AuthenticationState> GetAuthenticationStateAsync()
+        {
+            if (_throwOnGetState != null)
+            {
+                throw _throwOnGetState;
+            }
+            return Task.FromResult(new AuthenticationState(_principal));
+        }
     }
 
     private static CertRoboDbContext CreateSqliteContext(string dbPath)

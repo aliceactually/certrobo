@@ -1353,12 +1353,23 @@
                             Explicit administrator-controlled mappings from trusted OIDC identity provider groups to CertRobo roles and domain/profile restrictions. Authentication alone never grants access.
                         </p>
                     </div>
-                    <button type="button"
-                            class="btn @(showAddGroupMappingForm ? "btn-outline-secondary" : "btn-primary")"
-                            aria-expanded="@(showAddGroupMappingForm ? "true" : "false")"
-                            @onclick="() => showAddGroupMappingForm = !showAddGroupMappingForm">
-                        @(showAddGroupMappingForm ? "Close Group Mapping Form" : "+ Add / Update Group Mapping")
-                    </button>
+                    <div class="d-flex flex-wrap gap-2">
+                        @if (externalGroupMappings.Count > 0)
+                        {
+                            <button type="button"
+                                    class="btn @(showAddAdditionalGroupRuleForm ? "btn-outline-secondary" : "btn-outline-primary")"
+                                    aria-expanded="@(showAddAdditionalGroupRuleForm ? "true" : "false")"
+                                    @onclick="() => showAddAdditionalGroupRuleForm = !showAddAdditionalGroupRuleForm">
+                                @(showAddAdditionalGroupRuleForm ? "Close Add Rule Form" : "+ Add Additional Rule to Group")
+                            </button>
+                        }
+                        <button type="button"
+                                class="btn @(showAddGroupMappingForm ? "btn-outline-secondary" : "btn-primary")"
+                                aria-expanded="@(showAddGroupMappingForm ? "true" : "false")"
+                                @onclick="() => showAddGroupMappingForm = !showAddGroupMappingForm">
+                            @(showAddGroupMappingForm ? "Close Group Mapping Form" : "+ Add / Replace Group Mapping")
+                        </button>
+                    </div>
                 </div>
 
                 <div class="operation-panel mb-3" style="max-width: 860px;">
@@ -1432,7 +1443,10 @@
                 @if (showAddGroupMappingForm)
                 {
                     <div class="operation-panel mb-4" style="max-width: 860px;">
-                        <h4>Add or Update External Group Mapping</h4>
+                        <h4>Add or Replace External Group Mapping</h4>
+                        <p class="text-muted-theme small mb-3">
+                            Saving a group mapping sets its mapped CertRobo role and <strong>atomically replaces</strong> that group's domain and profile rules with the patterns entered below. To append an extra rule (for example, for a second certificate profile) without replacing existing rules, use <strong>+ Add Additional Rule to Group</strong>.
+                        </p>
                         <div class="row g-3 mb-3">
                             <div class="col-md-5">
                                 <label class="form-label" for="oidc-map-group-name">External Group Claim Value (exact match)</label>
@@ -1461,19 +1475,61 @@
                         </div>
 
                         <div class="mb-3">
-                            <label class="form-label" for="oidc-map-domains">Allowed Domain Patterns (comma-separated)</label>
+                            <label class="form-label" for="oidc-map-domains">Replacement Allowed Domain Patterns (comma-separated)</label>
                             <input id="oidc-map-domains"
                                    class="form-control"
                                    placeholder="e.g. *.contoso.com, contoso.com or *"
                                    @bind="newGroupMappingDomains" />
                             <div class="form-text">
-                                Members of this external group will be authorised to request certificates matching these domain patterns and profile.
+                                Replaces all domain/profile rules for this external group with the specified pattern(s) and profile.
                             </div>
                         </div>
 
                         <div class="d-flex justify-content-end gap-2">
                             <button type="button" class="btn btn-outline-secondary" @onclick="() => showAddGroupMappingForm = false">Cancel</button>
-                            <RadzenButton Text="Save Group Mapping" Click="@SaveExternalGroupMappingClick" />
+                            <RadzenButton Text="Save & Replace Group Mapping" Click="@SaveExternalGroupMappingClick" />
+                        </div>
+                    </div>
+                }
+
+                @if (showAddAdditionalGroupRuleForm && externalGroupMappings.Count > 0)
+                {
+                    <div class="operation-panel mb-4" style="max-width: 860px;">
+                        <h4>Add Additional Domain/Profile Rule to Mapped Group (Additive)</h4>
+                        <p class="text-muted-theme small mb-3">
+                            Appends an additional domain pattern and profile rule to an existing mapped external group without removing its existing rules.
+                        </p>
+                        <div class="row g-3 align-items-end">
+                            <div class="col-md-4">
+                                <label class="form-label" for="oidc-add-rule-group">Mapped External Group</label>
+                                <select id="oidc-add-rule-group" class="form-select" @bind="additionalRuleGroupName">
+                                    @foreach (var gm in externalGroupMappings)
+                                    {
+                                        <option value="@gm.GroupName">@gm.GroupName (@gm.RoleName)</option>
+                                    }
+                                </select>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label" for="oidc-add-rule-domain">Domain Pattern</label>
+                                <input id="oidc-add-rule-domain"
+                                       class="form-control"
+                                       placeholder="e.g. *.app.contoso.com"
+                                       @bind="additionalRuleDomainPattern" />
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label" for="oidc-add-rule-profile">Allowed Profile</label>
+                                <select id="oidc-add-rule-profile" class="form-select" @bind="additionalRuleProfileId">
+                                    <option value="*">All TLS Server Profiles (*)</option>
+                                    @foreach (var prof in CertificateProfiles.All.Values)
+                                    {
+                                        <option value="@prof.ProfileId">@prof.DisplayName</option>
+                                    }
+                                </select>
+                            </div>
+                        </div>
+                        <div class="d-flex justify-content-end gap-2 mt-3">
+                            <button type="button" class="btn btn-outline-secondary" @onclick="() => showAddAdditionalGroupRuleForm = false">Cancel</button>
+                            <RadzenButton Text="Add Rule to Group" Click="@AddAdditionalGroupRuleClick" />
                         </div>
                     </div>
                 }
@@ -1533,11 +1589,18 @@
                                             }
                                         </td>
                                         <td class="text-end">
-                                            <button type="button"
-                                                    class="btn btn-sm btn-outline-danger"
-                                                    @onclick="() => RemoveExternalGroupMappingClick(gm)">
-                                                Remove Group Mapping
-                                            </button>
+                                            <div class="d-inline-flex flex-wrap gap-1 justify-content-end">
+                                                <button type="button"
+                                                        class="btn btn-sm btn-outline-primary"
+                                                        @onclick="() => PopulateEditGroupMappingForm(gm)">
+                                                    Edit / Replace...
+                                                </button>
+                                                <button type="button"
+                                                        class="btn btn-sm btn-outline-danger"
+                                                        @onclick="() => RemoveExternalGroupMappingClick(gm)">
+                                                    Remove Group Mapping
+                                                </button>
+                                            </div>
                                         </td>
                                     </tr>
                                 }
@@ -2073,6 +2136,10 @@
     private string newGroupMappingRole = AppRoles.Issuer;
     private string newGroupMappingProfile = "*";
     private string newGroupMappingDomains = "*.contoso.com";
+    private bool showAddAdditionalGroupRuleForm = false;
+    private string additionalRuleGroupName = "";
+    private string additionalRuleDomainPattern = "";
+    private string additionalRuleProfileId = "*";
 
     // Certificates search/filter & revocation confirmation state
     private string certSearchQuery = "";
@@ -2223,6 +2290,16 @@
         subjectDefaults = await AccountService.GetSubjectDefaultsAsync();
         users = await AccountService.ListUsersAsync();
         externalGroupMappings = await AccountService.ListExternalGroupMappingsAsync();
+        if (externalGroupMappings.Count == 0)
+        {
+            additionalRuleGroupName = "";
+            showAddAdditionalGroupRuleForm = false;
+        }
+        else if (string.IsNullOrWhiteSpace(additionalRuleGroupName)
+                 || !externalGroupMappings.Any(m => m.GroupName == additionalRuleGroupName))
+        {
+            additionalRuleGroupName = externalGroupMappings[0].GroupName;
+        }
         oidcPortalSettings = await AccountService.GetOidcPortalSettingsAsync();
         oidcPortalProviderDisplayName = oidcPortalSettings.ProviderDisplayName;
         oidcPortalDefaultLoginMode = oidcPortalSettings.DefaultLoginMode;
@@ -2276,43 +2353,26 @@
     {
         if (AuthenticationStateProvider == null)
         {
+            Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", "Only an active authenticated Administrator may perform this action.");
             return null;
         }
 
-        ClaimsPrincipal? principal = null;
+        ClaimsPrincipal? principal;
         try
         {
             AuthenticationState authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
-            principal = authState.User;
+            principal = authState?.User;
         }
-        catch (InvalidOperationException)
+        catch
         {
-            // Support direct component unit tests where ServerAuthenticationStateProvider is not initialized with a circuit state
+            Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", "Only an active authenticated Administrator may perform this action.");
+            return null;
         }
 
         if (principal?.Identity?.IsAuthenticated != true)
         {
-            if (principal != null && principal.Claims.Any())
-            {
-                Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", "Only an active authenticated Administrator may perform this action.");
-                return null;
-            }
-
-            IReadOnlyList<UserSummaryDto> currentUsers = await AccountService.ListUsersAsync();
-            UserSummaryDto? fallbackAdmin = currentUsers.FirstOrDefault(u => !u.IsDisabled && u.Roles.Contains(AppRoles.Administrator));
-            if (fallbackAdmin == null)
-            {
-                Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", "Only an active authenticated Administrator may perform this action.");
-                return null;
-            }
-
-            return new ClaimsPrincipal(new ClaimsIdentity(
-                [
-                    new Claim(ClaimTypes.NameIdentifier, fallbackAdmin.Id),
-                    new Claim(ClaimTypes.Name, fallbackAdmin.UserName),
-                    new Claim(ClaimTypes.Role, AppRoles.Administrator)
-                ],
-                "ComponentFallbackAuth"));
+            Notify(Radzen.NotificationSeverity.Error, "Authorisation Error", "Only an active authenticated Administrator may perform this action.");
+            return null;
         }
 
         var (isAuthorized, err, _) = await AccountService.VerifyActiveAdministratorPrincipalAsync(principal);
@@ -2901,6 +2961,48 @@
         showAddGroupMappingForm = false;
         await ReloadAllAsync();
         Notify(Radzen.NotificationSeverity.Success, "Group Mapping Saved", $"Mapped external group '{mapping.GroupName}' to role '{mapping.RoleName}'.");
+    }
+
+    private void PopulateEditGroupMappingForm(ExternalGroupMappingSummaryDto mapping)
+    {
+        newGroupMappingName = mapping.GroupName;
+        newGroupMappingRole = mapping.RoleName;
+        newGroupMappingProfile = mapping.DomainPermissions.FirstOrDefault()?.AllowedProfileId ?? "*";
+        newGroupMappingDomains = string.Join(", ", mapping.DomainPermissions.Select(p => p.DomainPattern));
+        showAddGroupMappingForm = true;
+    }
+
+    private async Task AddAdditionalGroupRuleClick()
+    {
+        if (string.IsNullOrWhiteSpace(additionalRuleGroupName) || string.IsNullOrWhiteSpace(additionalRuleDomainPattern))
+        {
+            Notify(Radzen.NotificationSeverity.Warning, "Group Rule Required", "Select a mapped group and enter a domain pattern to add.");
+            return;
+        }
+
+        ClaimsPrincipal? actor = await VerifyActiveAdminActionAsync();
+        if (actor == null)
+        {
+            return;
+        }
+
+        var (ok, err) = await AccountService.AddDomainPermissionAsync(
+            PermissionSubjectTypes.ExternalGroup,
+            additionalRuleGroupName,
+            additionalRuleDomainPattern,
+            additionalRuleProfileId,
+            actingPrincipal: actor);
+
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Group Rule Error", err ?? "Failed to add domain rule to external group.");
+            return;
+        }
+
+        additionalRuleDomainPattern = "";
+        showAddAdditionalGroupRuleForm = false;
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "Group Rule Added", $"Added domain rule to external group '{additionalRuleGroupName}'.");
     }
 
     private async Task RemoveExternalGroupMappingClick(ExternalGroupMappingSummaryDto mapping)

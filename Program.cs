@@ -39,7 +39,8 @@ string[] cliCommandFlags =
     "--export-issued",
     "--add-oidc-group-mapping",
     "--remove-oidc-group-mapping",
-    "--invalidate-external-sessions"
+    "--invalidate-external-sessions",
+    "--set-user-disabled"
 ];
 bool isCliCommandMode = args.Any(a => cliCommandFlags.Contains(a, StringComparer.OrdinalIgnoreCase));
 bool verboseDiagnostics = args.Contains("--verbose", StringComparer.OrdinalIgnoreCase)
@@ -995,6 +996,31 @@ using (IServiceScope scope = app.Services.CreateScope())
 
         int count = await accountService.InvalidateAllExternalSessionsAsync();
         Console.WriteLine($"Invalidated active sessions for {count} external OpenID Connect account(s).");
+        return;
+    }
+
+    // Handle CLI account enable/disable (enforces sole-local-admin invariant across processes):
+    // dotnet run -- --set-user-disabled <userNameOrId> <true|false>
+    int setUserDisIdx = Array.IndexOf(args, "--set-user-disabled");
+    if (setUserDisIdx >= 0)
+    {
+        if (setUserDisIdx + 2 >= args.Length || !bool.TryParse(args[setUserDisIdx + 2], out bool disableFlag))
+        {
+            Console.Error.WriteLine("Usage: --set-user-disabled <userNameOrId> <true|false>");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        string targetUser = args[setUserDisIdx + 1];
+        var (ok, err) = await accountService.SetUserDisabledAsync(targetUser, disableFlag);
+        if (!ok)
+        {
+            Console.Error.WriteLine($"Account update failed: {err}");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        Console.WriteLine($"Account '{targetUser}' is now {(disableFlag ? "disabled" : "enabled")}.");
         return;
     }
 }

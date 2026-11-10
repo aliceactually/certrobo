@@ -75,7 +75,7 @@ public static class DomainPolicyEvaluator
 
         try
         {
-            IdnMapping idn = new();
+            IdnMapping idn = new() { UseStd3AsciiRules = true };
             hostPart = idn.GetAscii(hostPart);
         }
         catch (ArgumentException)
@@ -84,6 +84,17 @@ public static class DomainPolicyEvaluator
         }
 
         hostPart = hostPart.ToLowerInvariant();
+        if (hostPart.Contains('*') || Uri.CheckHostName(hostPart) != UriHostNameType.Dns)
+        {
+            return string.Empty;
+        }
+
+        string[] labels = hostPart.Split('.');
+        if (labels.Length < 2 || labels.Any(string.IsNullOrWhiteSpace))
+        {
+            return string.Empty;
+        }
+
         return isWildcard ? "*." + hostPart : hostPart;
     }
 
