@@ -73,6 +73,45 @@ public sealed class IssuancePolicyService(
         }
 
         IList<string> userRoles = await userManager.GetRolesAsync(user);
+        List<string> activeMappedExternalGroups = [];
+
+        if (user.IsExternalAccount)
+        {
+            IReadOnlyList<string> syncedGroups = OidcFederationService.ParseSyncedGroupsJson(user.LastSyncedGroupsJson);
+            if (syncedGroups.Count == 0)
+            {
+                return new(false, "External account does not belong to any authorised CertRobo group.", null, user);
+            }
+
+            List<ExternalGroupRoleMapping> matchedMappings = await dbContext.ExternalGroupRoleMappings
+                .AsNoTracking()
+                .Where(m => syncedGroups.Contains(m.GroupName))
+                .ToListAsync(cancellationToken);
+
+            matchedMappings = matchedMappings
+                .Where(m => syncedGroups.Contains(m.GroupName, StringComparer.Ordinal))
+                .ToList();
+
+            if (matchedMappings.Count == 0)
+            {
+                return new(false, "External account does not belong to any currently mapped CertRobo group.", null, user);
+            }
+
+            activeMappedExternalGroups = matchedMappings
+                .Select(m => m.GroupName)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+            bool groupGrantsIssuerOrAdmin = matchedMappings.Any(m =>
+                m.RoleName.Equals(AppRoles.Issuer, StringComparison.OrdinalIgnoreCase)
+                || m.RoleName.Equals(AppRoles.Administrator, StringComparison.OrdinalIgnoreCase));
+
+            if (!groupGrantsIssuerOrAdmin)
+            {
+                return new(false, "User does not have permission to request certificates.", null, user);
+            }
+        }
+
         bool isIssuerOrAdmin = userRoles.Any(r =>
             r.Equals(AppRoles.Issuer, StringComparison.OrdinalIgnoreCase)
             || r.Equals(AppRoles.Administrator, StringComparison.OrdinalIgnoreCase));
@@ -88,12 +127,23 @@ public sealed class IssuancePolicyService(
             return new(false, csrError ?? "CSR validation failed.", null, user);
         }
 
-        // Gather applicable DomainPermissionRules for this user and their roles
+        // Gather applicable DomainPermissionRules for this user, their roles, and their active mapped external groups
         List<DomainPermissionRule> rules = await dbContext.DomainPermissionRules
             .Where(r =>
-                (r.SubjectType == "User" && r.SubjectValue == user.Id)
-                || (r.SubjectType == "Role" && userRoles.Contains(r.SubjectValue)))
+                (r.SubjectType == PermissionSubjectTypes.User && r.SubjectValue == user.Id)
+                || (r.SubjectType == PermissionSubjectTypes.Role && userRoles.Contains(r.SubjectValue))
+                || (user.IsExternalAccount
+                    && r.SubjectType == PermissionSubjectTypes.ExternalGroup
+                    && activeMappedExternalGroups.Contains(r.SubjectValue)))
             .ToListAsync(cancellationToken);
+
+        if (user.IsExternalAccount)
+        {
+            rules = rules
+                .Where(r => r.SubjectType != PermissionSubjectTypes.ExternalGroup
+                         || activeMappedExternalGroups.Contains(r.SubjectValue, StringComparer.Ordinal))
+                .ToList();
+        }
 
         // Filter rules that allow the resolved profile
         List<DomainPermissionRule> profileMatchingRules = rules

@@ -13,11 +13,46 @@ public static class AppRoles
     public const string Issuer = "Issuer";
 }
 
+public static class PermissionSubjectTypes
+{
+    public const string User = "User";
+    public const string Role = "Role";
+    public const string ExternalGroup = "ExternalGroup";
+}
+
 public class ApplicationUser : IdentityUser
 {
     public bool IsDisabled { get; set; }
     public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
     public string? DisplayName { get; set; }
+
+    public bool IsExternalAccount { get; set; }
+
+    [MaxLength(512)]
+    public string? ExternalIssuer { get; set; }
+
+    [MaxLength(256)]
+    public string? ExternalSubject { get; set; }
+
+    public DateTimeOffset? LastExternalLoginAtUtc { get; set; }
+
+    public string? LastSyncedGroupsJson { get; set; }
+}
+
+public class ExternalGroupRoleMapping
+{
+    [Key]
+    public int Id { get; set; }
+
+    [Required]
+    [MaxLength(256)]
+    public string GroupName { get; set; } = string.Empty;
+
+    [Required]
+    [MaxLength(64)]
+    public string RoleName { get; set; } = AppRoles.Issuer; // "Administrator" or "Issuer"
+
+    public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
 }
 
 public class DomainPermissionRule
@@ -27,11 +62,11 @@ public class DomainPermissionRule
 
     [Required]
     [MaxLength(128)]
-    public string SubjectType { get; set; } = "User"; // "User" or "Role"
+    public string SubjectType { get; set; } = PermissionSubjectTypes.User; // "User", "Role", or "ExternalGroup"
 
     [Required]
     [MaxLength(256)]
-    public string SubjectValue { get; set; } = string.Empty; // UserId or RoleName
+    public string SubjectValue { get; set; } = string.Empty; // UserId, RoleName, or ExternalGroupName
 
     [Required]
     [MaxLength(256)]
@@ -402,6 +437,7 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
     : IdentityDbContext<ApplicationUser, IdentityRole, string>(options)
 {
     public DbSet<DomainPermissionRule> DomainPermissionRules => Set<DomainPermissionRule>();
+    public DbSet<ExternalGroupRoleMapping> ExternalGroupRoleMappings => Set<ExternalGroupRoleMapping>();
     public DbSet<SubjectDefaultsConfig> SubjectDefaults => Set<SubjectDefaultsConfig>();
     public DbSet<CaAuthorityRecord> CaAuthorities => Set<CaAuthorityRecord>();
     public DbSet<PendingCaEnrollmentRecord> PendingCaEnrollments => Set<PendingCaEnrollmentRecord>();
@@ -413,6 +449,14 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
     protected override void OnModelCreating(ModelBuilder builder)
     {
         base.OnModelCreating(builder);
+
+        builder.Entity<ApplicationUser>()
+            .HasIndex(u => new { u.ExternalIssuer, u.ExternalSubject })
+            .IsUnique();
+
+        builder.Entity<ExternalGroupRoleMapping>()
+            .HasIndex(m => m.GroupName)
+            .IsUnique();
 
         builder.Entity<DomainPermissionRule>()
             .HasIndex(r => new { r.SubjectType, r.SubjectValue, r.DomainPattern, r.AllowedProfileId })
@@ -674,9 +718,22 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
                 ON "SerialRevocationEvents" ("CaAuthorityId", "CanonicalSerialHex");
             """;
 
+        const string createExternalGroupMappingsTableSql = """
+            CREATE TABLE IF NOT EXISTS "ExternalGroupRoleMappings" (
+                "Id" INTEGER NOT NULL CONSTRAINT "PK_ExternalGroupRoleMappings" PRIMARY KEY AUTOINCREMENT,
+                "GroupName" TEXT NOT NULL,
+                "RoleName" TEXT NOT NULL,
+                "CreatedAtUtc" TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS "IX_ExternalGroupRoleMappings_GroupName"
+                ON "ExternalGroupRoleMappings" ("GroupName");
+            """;
+
         await Database.ExecuteSqlRawAsync(createPendingTableSql, cancellationToken);
         await Database.ExecuteSqlRawAsync(createCesConfigTableSql, cancellationToken);
         await Database.ExecuteSqlRawAsync(createRevocationEventsTableSql, cancellationToken);
+        await Database.ExecuteSqlRawAsync(createExternalGroupMappingsTableSql, cancellationToken);
+        await EnsureAspNetUsersExternalColumnsAsync(cancellationToken);
         await Database.ExecuteSqlRawAsync(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS "IX_CaAuthorities_SingleActive"
@@ -684,6 +741,9 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
             CREATE UNIQUE INDEX IF NOT EXISTS "IX_PendingCaEnrollments_SingleUnfinished"
                 ON "PendingCaEnrollments" ((1))
                 WHERE "Status" NOT IN (5, 6);
+            CREATE UNIQUE INDEX IF NOT EXISTS "IX_AspNetUsers_ExternalIssuer_ExternalSubject"
+                ON "AspNetUsers" ("ExternalIssuer", "ExternalSubject")
+                WHERE "ExternalIssuer" IS NOT NULL AND "ExternalSubject" IS NOT NULL;
             """,
             cancellationToken);
 
@@ -694,6 +754,64 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
         }
         catch
         {
+        }
+    }
+
+    private async Task EnsureAspNetUsersExternalColumnsAsync(CancellationToken cancellationToken)
+    {
+        (string ColumnName, string ColumnDefinition)[] requiredColumns =
+        [
+            ("IsExternalAccount", "INTEGER NOT NULL DEFAULT 0"),
+            ("ExternalIssuer", "TEXT NULL"),
+            ("ExternalSubject", "TEXT NULL"),
+            ("LastExternalLoginAtUtc", "TEXT NULL"),
+            ("LastSyncedGroupsJson", "TEXT NULL")
+        ];
+
+        DbConnection conn = Database.GetDbConnection();
+        bool shouldClose = conn.State != System.Data.ConnectionState.Open;
+        if (shouldClose)
+        {
+            await conn.OpenAsync(cancellationToken);
+        }
+
+        try
+        {
+            HashSet<string> existingColumns = new(StringComparer.OrdinalIgnoreCase);
+            await using (DbCommand pragmaCmd = conn.CreateCommand())
+            {
+                pragmaCmd.CommandText = "PRAGMA table_info(\"AspNetUsers\");";
+                await using DbDataReader reader = await pragmaCmd.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    if (reader.FieldCount > 1 && !reader.IsDBNull(1))
+                    {
+                        existingColumns.Add(reader.GetString(1));
+                    }
+                }
+            }
+
+            if (existingColumns.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var (colName, colDef) in requiredColumns)
+            {
+                if (!existingColumns.Contains(colName))
+                {
+                    await using DbCommand alterCmd = conn.CreateCommand();
+                    alterCmd.CommandText = $"ALTER TABLE \"AspNetUsers\" ADD COLUMN \"{colName}\" {colDef};";
+                    await alterCmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+            }
+        }
+        finally
+        {
+            if (shouldClose)
+            {
+                await conn.CloseAsync();
+            }
         }
     }
 }

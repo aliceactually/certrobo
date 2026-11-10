@@ -986,15 +986,25 @@
             <RadzenCard class="mb-4">
                 <div class="section-card-header">
                     <div>
-                        <h3>Local Accounts</h3>
-                        <p class="text-muted-theme small mb-0">Select an account to manage its domain permissions, account status, or password reset.</p>
+                        <h3>Local &amp; Federated Accounts</h3>
+                        <p class="text-muted-theme small mb-0">Select a local or external OpenID Connect account to manage its domain permissions, account status, session invalidation, or local password reset.</p>
                     </div>
-                    <button type="button"
-                            class="btn @(showCreateUserForm ? "btn-outline-secondary" : "btn-primary")"
-                            aria-expanded="@(showCreateUserForm ? "true" : "false")"
-                            @onclick="() => showCreateUserForm = !showCreateUserForm">
-                        @(showCreateUserForm ? "Close Add User Form" : "+ Add Local Account")
-                    </button>
+                    <div class="d-flex flex-wrap gap-2">
+                        @if (users.Any(u => u.IsExternalAccount))
+                        {
+                            <button type="button"
+                                    class="btn btn-outline-warning"
+                                    @onclick="InvalidateAllExternalSessionsClick">
+                                Invalidate All External Sessions
+                            </button>
+                        }
+                        <button type="button"
+                                class="btn @(showCreateUserForm ? "btn-outline-secondary" : "btn-primary")"
+                                aria-expanded="@(showCreateUserForm ? "true" : "false")"
+                                @onclick="() => showCreateUserForm = !showCreateUserForm">
+                            @(showCreateUserForm ? "Close Add User Form" : "+ Add Local Account")
+                        </button>
+                    </div>
                 </div>
 
                 @if (showCreateUserForm)
@@ -1042,7 +1052,7 @@
                     <table class="table table-hover align-middle mb-0">
                         <thead>
                             <tr>
-                                <th scope="col">Username</th>
+                                <th scope="col">Account &amp; Identity Source</th>
                                 <th scope="col">Roles</th>
                                 <th scope="col">Allowed Domain Rules</th>
                                 <th scope="col">Status</th>
@@ -1053,7 +1063,7 @@
                             @if (users.Count == 0)
                             {
                                 <tr>
-                                    <td colspan="5" class="text-center py-4 text-muted-theme">No local accounts found.</td>
+                                    <td colspan="5" class="text-center py-4 text-muted-theme">No accounts found.</td>
                                 </tr>
                             }
                             else
@@ -1061,17 +1071,42 @@
                                 @foreach (var u in users)
                                 {
                                     bool isSelected = selectedUserId == u.Id;
+                                    IReadOnlyList<DomainPermissionRule> groupPerms = u.EffectiveGroupPermissions ?? [];
                                     <tr class="@(isSelected ? "user-row-selected" : "")">
                                         <td>
-                                            <strong>@u.UserName</strong>
+                                            <div class="d-flex flex-wrap align-items-center gap-1">
+                                                <strong>@u.UserName</strong>
+                                                @if (u.IsExternalAccount)
+                                                {
+                                                    <span class="badge bg-info text-dark">External (OIDC)</span>
+                                                }
+                                                else
+                                                {
+                                                    <span class="badge bg-secondary">Local</span>
+                                                }
+                                            </div>
                                             @if (!string.IsNullOrWhiteSpace(u.Email))
                                             {
                                                 <div class="small text-muted-theme">@u.Email</div>
                                             }
+                                            @if (u.IsExternalAccount)
+                                            {
+                                                <div class="small text-muted-theme">
+                                                    Issuer: <code>@u.ExternalIssuer</code> &middot; Sub: <code>@u.ExternalSubject</code>
+                                                </div>
+                                            }
                                         </td>
-                                        <td>@string.Join(", ", u.Roles)</td>
                                         <td>
-                                            @if (u.DirectPermissions.Count == 0)
+                                            @(u.Roles.Count > 0 ? string.Join(", ", u.Roles) : "None")
+                                            @if (u.IsExternalAccount && u.SyncedExternalGroups is { Count: > 0 })
+                                            {
+                                                <div class="small text-muted-theme">
+                                                    Groups: @string.Join(", ", u.SyncedExternalGroups)
+                                                </div>
+                                            }
+                                        </td>
+                                        <td>
+                                            @if (u.DirectPermissions.Count == 0 && groupPerms.Count == 0)
                                             {
                                                 <span class="text-muted-theme small">None assigned</span>
                                             }
@@ -1081,6 +1116,12 @@
                                                     @foreach (var perm in u.DirectPermissions)
                                                     {
                                                         <span class="badge bg-secondary">@perm.DomainPattern (@perm.AllowedProfileId)</span>
+                                                    }
+                                                    @foreach (var gPerm in groupPerms)
+                                                    {
+                                                        <span class="badge bg-info text-dark" title="@($"Inherited from external group '{gPerm.SubjectValue}'")">
+                                                            @gPerm.DomainPattern (@gPerm.AllowedProfileId via @gPerm.SubjectValue)
+                                                        </span>
                                                     }
                                                 </div>
                                             }
@@ -1114,31 +1155,62 @@
             @if (SelectedUser != null)
             {
                 var u = SelectedUser;
+                IReadOnlyList<DomainPermissionRule> selectedGroupPerms = u.EffectiveGroupPermissions ?? [];
                 <RadzenCard class="mb-4">
                     <div class="section-card-header">
                         <div>
-                            <h3>Manage Account: @u.UserName</h3>
+                            <h3 class="d-flex flex-wrap align-items-center gap-2">
+                                <span>Manage Account: @u.UserName</span>
+                                @if (u.IsExternalAccount)
+                                {
+                                    <span class="badge bg-info text-dark">External OIDC Account</span>
+                                }
+                                else
+                                {
+                                    <span class="badge bg-secondary">Local Account</span>
+                                }
+                            </h3>
                             <p class="text-muted-theme small mb-0">
-                                Roles: <strong>@string.Join(", ", u.Roles)</strong> &middot;
+                                Roles: <strong>@(u.Roles.Count > 0 ? string.Join(", ", u.Roles) : "None")</strong> &middot;
                                 Status: <strong>@(u.IsDisabled ? "Disabled" : "Active")</strong>
+                                @if (u.IsExternalAccount)
+                                {
+                                    <span>
+                                        &middot; Validated Identity: <code>@u.ExternalIssuer</code> / <code>@u.ExternalSubject</code>
+                                    </span>
+                                }
                             </p>
                         </div>
                         <div class="d-flex flex-wrap gap-2">
+                            <button type="button"
+                                    class="btn btn-sm btn-outline-warning"
+                                    @onclick="() => InvalidateUserSessionClick(u)">
+                                Invalidate Active Sessions
+                            </button>
                             <button type="button"
                                     class="btn btn-sm @(u.IsDisabled ? "btn-success" : "btn-warning")"
                                     @onclick="() => ToggleUserDisabledClick(u)">
                                 @(u.IsDisabled ? "Enable Account" : "Disable Account")
                             </button>
-                            <button type="button"
-                                    class="btn btn-sm @(showPasswordResetForSelectedUser ? "btn-secondary" : "btn-outline-secondary")"
-                                    aria-expanded="@(showPasswordResetForSelectedUser ? "true" : "false")"
-                                    @onclick="() => showPasswordResetForSelectedUser = !showPasswordResetForSelectedUser">
-                                @(showPasswordResetForSelectedUser ? "Cancel Password Reset" : "Reset Password...")
-                            </button>
+                            @if (!u.IsExternalAccount)
+                            {
+                                <button type="button"
+                                        class="btn btn-sm @(showPasswordResetForSelectedUser ? "btn-secondary" : "btn-outline-secondary")"
+                                        aria-expanded="@(showPasswordResetForSelectedUser ? "true" : "false")"
+                                        @onclick="() => showPasswordResetForSelectedUser = !showPasswordResetForSelectedUser">
+                                    @(showPasswordResetForSelectedUser ? "Cancel Password Reset" : "Reset Password...")
+                                </button>
+                            }
                         </div>
                     </div>
 
-                    @if (showPasswordResetForSelectedUser)
+                    @if (u.IsExternalAccount)
+                    {
+                        <div class="alert alert-info small mb-3">
+                            <strong>Federated OpenID Connect Identity:</strong> This account is identified strictly by its validated OIDC Issuer (<code>@u.ExternalIssuer</code>) and Subject (<code>@u.ExternalSubject</code>), never by email or display name. Local password sign-in is disabled for external accounts. Roles and group domain rules are derived from trusted external group mappings below.
+                        </div>
+                    }
+                    else if (showPasswordResetForSelectedUser)
                     {
                         <div class="operation-panel mb-4" style="max-width: 600px;">
                             <h4>Reset Password for @u.UserName</h4>
@@ -1160,7 +1232,20 @@
                         </div>
                     }
 
-                    <h4 class="h5 mb-2">Authorised Domain &amp; Profile Rules</h4>
+                    @if (u.IsExternalAccount && selectedGroupPerms.Count > 0)
+                    {
+                        <h4 class="h6 mb-2">Domain &amp; Profile Rules Inherited from Mapped External Groups</h4>
+                        <div class="d-flex flex-wrap gap-2 mb-3">
+                            @foreach (var gPerm in selectedGroupPerms)
+                            {
+                                <span class="badge bg-info text-dark p-2">
+                                    <strong>@gPerm.DomainPattern</strong> (profile: @gPerm.AllowedProfileId, group: @gPerm.SubjectValue)
+                                </span>
+                            }
+                        </div>
+                    }
+
+                    <h4 class="h5 mb-2">Direct Account Domain &amp; Profile Rules</h4>
                     <p class="text-muted-theme small mb-3">
                         <code>*.example.com</code> authorises any subdomain (including wildcard certificates) and the apex <code>example.com</code>.
                         A bare domain <code>example.com</code> authorises only that exact name.
@@ -1168,7 +1253,7 @@
 
                     @if (u.DirectPermissions.Count == 0)
                     {
-                        <p class="text-muted-theme fst-italic mb-3">This account currently has no domain permission rules assigned.</p>
+                        <p class="text-muted-theme fst-italic mb-3">This account currently has no direct user-specific domain permission rules assigned.</p>
                     }
                     else
                     {
@@ -1190,7 +1275,7 @@
                     }
 
                     <div class="operation-panel" style="max-width: 760px;">
-                        <h4>Add Domain Permission Rule</h4>
+                        <h4>Add Direct Domain Permission Rule</h4>
                         <div class="row g-3 align-items-end">
                             <div class="col-md-5">
                                 <label class="form-label" for="add-domain-pattern">Domain Pattern</label>
@@ -1216,6 +1301,195 @@
                     </div>
                 </RadzenCard>
             }
+
+            <!-- OpenID Connect (OIDC) Federated Login & Group Mappings -->
+            <RadzenCard class="mb-4">
+                <div class="section-card-header">
+                    <div>
+                        <h3 class="d-flex flex-wrap align-items-center gap-2">
+                            <span>OpenID Connect (OIDC) Federated Sign-In &amp; Group Mappings</span>
+                            @if (oidcSummaryOptions.Enabled)
+                            {
+                                var (oidcCfgValid, _) = oidcSummaryOptions.Validate();
+                                <span class="badge @(oidcCfgValid ? "bg-success" : "bg-warning text-dark")">
+                                    @(oidcCfgValid ? $"Enabled ({oidcSummaryOptions.DisplayName})" : "Configuration Attention Required")
+                                </span>
+                            }
+                            else
+                            {
+                                <span class="badge bg-secondary">Disabled (Local Auth Only)</span>
+                            }
+                        </h3>
+                        <p class="text-muted-theme small mb-0">
+                            Explicit administrator-controlled mappings from trusted OIDC identity provider groups to CertRobo roles and domain/profile restrictions. Authentication alone never grants access.
+                        </p>
+                    </div>
+                    <button type="button"
+                            class="btn @(showAddGroupMappingForm ? "btn-outline-secondary" : "btn-primary")"
+                            aria-expanded="@(showAddGroupMappingForm ? "true" : "false")"
+                            @onclick="() => showAddGroupMappingForm = !showAddGroupMappingForm">
+                        @(showAddGroupMappingForm ? "Close Group Mapping Form" : "+ Add / Update Group Mapping")
+                    </button>
+                </div>
+
+                @if (oidcSummaryOptions.Enabled)
+                {
+                    var (oidcCfgValid, oidcCfgErr) = oidcSummaryOptions.Validate();
+                    @if (!oidcCfgValid && !string.IsNullOrWhiteSpace(oidcCfgErr))
+                    {
+                        <div class="alert alert-warning small mb-3" role="alert">
+                            <strong>OIDC Configuration Validation Warning:</strong> @oidcCfgErr
+                        </div>
+                    }
+                    <div class="ca-summary-grid mb-3">
+                        <div class="ca-stat-box">
+                            <div class="ca-stat-label">Issuer &amp; Client ID</div>
+                            <div class="ca-stat-value small">
+                                <strong>Issuer:</strong> <code>@(string.IsNullOrWhiteSpace(oidcSummaryOptions.EffectiveIssuer) ? "—" : oidcSummaryOptions.EffectiveIssuer)</code><br />
+                                <strong>Client ID:</strong> <code>@(string.IsNullOrWhiteSpace(oidcSummaryOptions.ClientId) ? "—" : oidcSummaryOptions.ClientId)</code>
+                            </div>
+                        </div>
+                        <div class="ca-stat-box">
+                            <div class="ca-stat-label">Callback &amp; Secret Custody</div>
+                            <div class="ca-stat-value small">
+                                <strong>Callback:</strong> <code>@(string.IsNullOrWhiteSpace(oidcSummaryOptions.PublicCallbackUrl) ? "—" : oidcSummaryOptions.PublicCallbackUrl)</code><br />
+                                <strong>Secret Source:</strong> @oidcSummaryOptions.DescribeSecretSource()
+                            </div>
+                        </div>
+                        <div class="ca-stat-box">
+                            <div class="ca-stat-label">Claim Mapping</div>
+                            <div class="ca-stat-value small">
+                                <strong>Subject:</strong> <code>@oidcSummaryOptions.SubjectClaimType</code> &middot;
+                                <strong>Groups:</strong> <code>@oidcSummaryOptions.GroupClaimType</code>
+                            </div>
+                        </div>
+                        <div class="ca-stat-box">
+                            <div class="ca-stat-label">Session Bounds</div>
+                            <div class="ca-stat-value small">
+                                <strong>Max Session:</strong> @oidcSummaryOptions.MaxSessionLifetimeMinutes min<br />
+                                <strong>Revalidation:</strong> @oidcSummaryOptions.SessionRevalidationSeconds s
+                            </div>
+                        </div>
+                    </div>
+                }
+
+                @if (showAddGroupMappingForm)
+                {
+                    <div class="operation-panel mb-4" style="max-width: 860px;">
+                        <h4>Add or Update External Group Mapping</h4>
+                        <div class="row g-3 mb-3">
+                            <div class="col-md-5">
+                                <label class="form-label" for="oidc-map-group-name">External Group Claim Value (exact match)</label>
+                                <input id="oidc-map-group-name"
+                                       class="form-control"
+                                       placeholder="e.g. CertRobo-Issuers or pki-admins"
+                                       @bind="newGroupMappingName" />
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label" for="oidc-map-role">Mapped CertRobo Role</label>
+                                <select id="oidc-map-role" class="form-select" @bind="newGroupMappingRole">
+                                    <option value="@AppRoles.Issuer">Issuer (request certificates)</option>
+                                    <option value="@AppRoles.Administrator">Administrator (full CA &amp; portal management)</option>
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label" for="oidc-map-profile">Allowed Profile</label>
+                                <select id="oidc-map-profile" class="form-select" @bind="newGroupMappingProfile">
+                                    <option value="*">All TLS Server Profiles (*)</option>
+                                    @foreach (var prof in CertificateProfiles.All.Values)
+                                    {
+                                        <option value="@prof.ProfileId">@prof.DisplayName</option>
+                                    }
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label" for="oidc-map-domains">Allowed Domain Patterns (comma-separated)</label>
+                            <input id="oidc-map-domains"
+                                   class="form-control"
+                                   placeholder="e.g. *.contoso.com, contoso.com or *"
+                                   @bind="newGroupMappingDomains" />
+                            <div class="form-text">
+                                Members of this external group will be authorised to request certificates matching these domain patterns and profile.
+                            </div>
+                        </div>
+
+                        <div class="d-flex justify-content-end gap-2">
+                            <button type="button" class="btn btn-outline-secondary" @onclick="() => showAddGroupMappingForm = false">Cancel</button>
+                            <RadzenButton Text="Save Group Mapping" Click="@SaveExternalGroupMappingClick" />
+                        </div>
+                    </div>
+                }
+
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th scope="col">External Group Claim Value</th>
+                                <th scope="col">Mapped CertRobo Role</th>
+                                <th scope="col">Allowed Domain &amp; Profile Rules</th>
+                                <th scope="col" class="text-end">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @if (externalGroupMappings.Count == 0)
+                            {
+                                <tr>
+                                    <td colspan="4" class="text-center py-4 text-muted-theme">
+                                        No external group mappings are configured. External OIDC logins will be denied until at least one group is mapped.
+                                    </td>
+                                </tr>
+                            }
+                            else
+                            {
+                                @foreach (var gm in externalGroupMappings)
+                                {
+                                    <tr>
+                                        <td><code>@gm.GroupName</code></td>
+                                        <td>
+                                            <span class="badge @(gm.RoleName == AppRoles.Administrator ? "bg-primary" : "bg-secondary")">
+                                                @gm.RoleName
+                                            </span>
+                                        </td>
+                                        <td>
+                                            @if (gm.DomainPermissions.Count == 0)
+                                            {
+                                                <span class="text-muted-theme small">No domain rules assigned</span>
+                                            }
+                                            else
+                                            {
+                                                <div class="d-flex flex-wrap gap-1">
+                                                    @foreach (var perm in gm.DomainPermissions)
+                                                    {
+                                                        <span class="permission-chip">
+                                                            <span><strong>@perm.DomainPattern</strong> <small class="text-muted-theme">(@perm.AllowedProfileId)</small></span>
+                                                            <button type="button"
+                                                                    class="permission-remove-btn"
+                                                                    aria-label="@($"Remove domain permission {perm.DomainPattern} from group {gm.GroupName}")"
+                                                                    title="Remove group domain permission"
+                                                                    @onclick="() => RemovePermissionClick(perm.Id)">
+                                                                &times;
+                                                            </button>
+                                                        </span>
+                                                    }
+                                                </div>
+                                            }
+                                        </td>
+                                        <td class="text-end">
+                                            <button type="button"
+                                                    class="btn btn-sm btn-outline-danger"
+                                                    @onclick="() => RemoveExternalGroupMappingClick(gm)">
+                                                Remove Group Mapping
+                                            </button>
+                                        </td>
+                                    </tr>
+                                }
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            </RadzenCard>
         </section>
     }
 
@@ -1732,6 +2006,15 @@
     private string newUserRole = AppRoles.Issuer;
     private string newUserDomains = "*.contoso.com";
 
+    // OpenID Connect Federation & Group Mappings state
+    private OidcFederationOptions oidcSummaryOptions = new();
+    private IReadOnlyList<ExternalGroupMappingSummaryDto> externalGroupMappings = [];
+    private bool showAddGroupMappingForm = false;
+    private string newGroupMappingName = "";
+    private string newGroupMappingRole = AppRoles.Issuer;
+    private string newGroupMappingProfile = "*";
+    private string newGroupMappingDomains = "*.contoso.com";
+
     // Certificates search/filter & revocation confirmation state
     private string certSearchQuery = "";
     private string certStatusFilterString = "";
@@ -1880,6 +2163,11 @@
         }
         subjectDefaults = await AccountService.GetSubjectDefaultsAsync();
         users = await AccountService.ListUsersAsync();
+        externalGroupMappings = await AccountService.ListExternalGroupMappingsAsync();
+        if (Configuration != null)
+        {
+            oidcSummaryOptions = OidcFederationOptions.FromConfiguration(Configuration);
+        }
         if (selectedUserId == null && users.Count > 0)
         {
             selectedUserId = users[0].Id;
@@ -2285,6 +2573,63 @@
         await AccountService.RemoveDomainPermissionAsync(ruleId);
         await ReloadAllAsync();
         Notify(Radzen.NotificationSeverity.Info, "Permission Removed", "Domain permission rule removed.");
+    }
+
+    private async Task InvalidateUserSessionClick(UserSummaryDto user)
+    {
+        var (ok, err) = await AccountService.InvalidateUserSessionsAsync(user.Id);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Session Error", err ?? "Failed to invalidate user sessions.");
+            return;
+        }
+
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "Sessions Invalidated", $"Rotated security stamp and invalidated active sessions for '{user.UserName}'.");
+    }
+
+    private async Task InvalidateAllExternalSessionsClick()
+    {
+        int count = await AccountService.InvalidateAllExternalSessionsAsync();
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "External Sessions Invalidated", $"Invalidated active sessions for {count} external OpenID Connect account(s).");
+    }
+
+    private async Task SaveExternalGroupMappingClick()
+    {
+        string[] patterns = string.IsNullOrWhiteSpace(newGroupMappingDomains)
+            ? []
+            : newGroupMappingDomains.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        var (ok, err, mapping) = await AccountService.SetExternalGroupRoleMappingAsync(
+            newGroupMappingName,
+            newGroupMappingRole,
+            patterns,
+            newGroupMappingProfile);
+
+        if (!ok || mapping == null)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Group Mapping Error", err ?? "Failed to save external group mapping.");
+            return;
+        }
+
+        newGroupMappingName = "";
+        showAddGroupMappingForm = false;
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Success, "Group Mapping Saved", $"Mapped external group '{mapping.GroupName}' to role '{mapping.RoleName}'.");
+    }
+
+    private async Task RemoveExternalGroupMappingClick(ExternalGroupMappingSummaryDto mapping)
+    {
+        var (ok, err) = await AccountService.RemoveExternalGroupRoleMappingAsync(mapping.Id);
+        if (!ok)
+        {
+            Notify(Radzen.NotificationSeverity.Error, "Group Mapping Error", err ?? "Failed to remove external group mapping.");
+            return;
+        }
+
+        await ReloadAllAsync();
+        Notify(Radzen.NotificationSeverity.Info, "Group Mapping Removed", $"Removed external group mapping '{mapping.GroupName}' and invalidated affected external sessions.");
     }
 
     private Task RevokeCertClick(int certId)
