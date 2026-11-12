@@ -270,7 +270,8 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
         string csr2 = _crypto.CSRGen(kp2, "cert2.contoso.com", ["cert2.contoso.com"], "US", "WA", "Redmond", "Contoso", "IT", "");
         IssuanceOutcome issued2 = await caService.IssueCertificateFromCsrAsync(adminUser.Id, csr2);
 
-        TestAuthStateProvider authProvider = new(adminUser.Id, "admin", AppRoles.Administrator);
+        UserManager<ApplicationUser> userMgr = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+        TestAuthStateProvider authProvider = new(adminUser.Id, "admin", AppRoles.Administrator, adminUser.SecurityStamp);
 
         CertRobo.Pages.Admin adminPage = new();
         SetProperty(adminPage, "AccountService", acct);
@@ -298,20 +299,25 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
 
         // 3. Non-admin principal or disabled admin attempting ConfirmRevokeCertClick is rejected without revoking
         await InvokeMethodAsync(adminPage, "RevokeCertClick", issued1.Record.Id);
-        authProvider.SetPrincipal("issuer-id", "alice-issuer", AppRoles.Issuer);
+        authProvider.SetPrincipal("issuer-id", "alice-issuer", AppRoles.Issuer, "fake-stamp");
         await InvokeMethodAsync(adminPage, "ConfirmRevokeCertClick");
         Assert.Equal(IssuanceStatus.Issued, (await caService.SearchCertificatesAsync("cert1.contoso.com", null)).Single().Status);
         Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage"));
 
-        authProvider.SetPrincipal(adminUser.Id, "admin", AppRoles.Administrator);
-        await acct.SetUserDisabledAsync(adminUser.Id, true);
+        // Create a second local administrator so disabling adminUser is allowed by the last-local-admin invariant
+        await acct.CreateUserAsync("backup-admin", "BackupAdmin!2026", "backup@contoso.com", [AppRoles.Administrator]);
+        authProvider.SetPrincipal(adminUser.Id, "admin", AppRoles.Administrator, adminUser.SecurityStamp);
+        var (disOk, disErr) = await acct.SetUserDisabledAsync(adminUser.Id, true);
+        Assert.True(disOk, disErr);
         await InvokeMethodAsync(adminPage, "ConfirmRevokeCertClick");
         Assert.Equal(IssuanceStatus.Issued, (await caService.SearchCertificatesAsync("cert1.contoso.com", null)).Single().Status);
         Assert.Contains("Authorisation Error", GetField<string?>(adminPage, "statusBannerMessage"));
         await acct.SetUserDisabledAsync(adminUser.Id, false);
 
-        // 4. Restore Administrator principal, select reason 4 (Superseded), and confirm revocation
-        authProvider.SetPrincipal(adminUser.Id, "admin", AppRoles.Administrator);
+        // 4. Restore Administrator principal with fresh SecurityStamp, select reason 4 (Superseded), and confirm revocation
+        ApplicationUser reloadedAdmin = (await userMgr.FindByIdAsync(adminUser.Id))!;
+        await scope.ServiceProvider.GetRequiredService<CertRoboDbContext>().Entry(reloadedAdmin).ReloadAsync();
+        authProvider.SetPrincipal(reloadedAdmin.Id, "admin", AppRoles.Administrator, reloadedAdmin.SecurityStamp);
         SetField(adminPage, "pendingRevokeReasonCode", CrlReason.Superseded);
         await InvokeMethodAsync(adminPage, "ConfirmRevokeCertClick");
 
@@ -654,24 +660,30 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
     {
         private ClaimsPrincipal _principal;
 
-        public TestAuthStateProvider(string userId, string userName, string role)
+        public TestAuthStateProvider(string userId, string userName, string role, string? securityStamp = null)
         {
-            _principal = BuildPrincipal(userId, userName, role);
+            _principal = BuildPrincipal(userId, userName, role, securityStamp);
         }
 
-        public void SetPrincipal(string userId, string userName, string role)
+        public void SetPrincipal(string userId, string userName, string role, string? securityStamp = null)
         {
-            _principal = BuildPrincipal(userId, userName, role);
+            _principal = BuildPrincipal(userId, userName, role, securityStamp);
         }
 
-        private static ClaimsPrincipal BuildPrincipal(string userId, string userName, string role) =>
-            new(new ClaimsIdentity(
-                [
-                    new Claim(ClaimTypes.NameIdentifier, userId),
-                    new Claim(ClaimTypes.Name, userName),
-                    new Claim(ClaimTypes.Role, role)
-                ],
-                "TestAuth"));
+        private static ClaimsPrincipal BuildPrincipal(string userId, string userName, string role, string? securityStamp)
+        {
+            List<Claim> claims =
+            [
+                new Claim(ClaimTypes.NameIdentifier, userId),
+                new Claim(ClaimTypes.Name, userName),
+                new Claim(ClaimTypes.Role, role)
+            ];
+            if (!string.IsNullOrEmpty(securityStamp))
+            {
+                claims.Add(new Claim("AspNet.Identity.SecurityStamp", securityStamp));
+            }
+            return new ClaimsPrincipal(new ClaimsIdentity(claims, "TestAuth"));
+        }
 
         public override Task<AuthenticationState> GetAuthenticationStateAsync() =>
             Task.FromResult(new AuthenticationState(_principal));

@@ -346,6 +346,141 @@ sudo systemctl reload nginx.service
 
 ---
 
+## Optional OpenID Connect (OIDC) Federated Sign-In (Okta & Generic OIDC)
+
+CertRobo supports optional, provider-agnostic **OpenID Connect (OIDC)** federated sign-in using the OAuth 2.0 Authorization Code flow with PKCE (`S256`) while keeping standalone local authentication and a break-glass local `Administrator` account available at all times.
+
+* **Provider-Agnostic Protocol:** Works with any standard OpenID Connect identity provider (Okta, Microsoft Entra ID, Keycloak, Auth0, Google, Pocket ID, etc.) without Active Directory, LDAP, provider-specific management API tokens, or hardcoded vendor assumptions.
+* **Zero Implicit Access:** Valid OIDC authentication never grants CA administration or certificate-issuance rights by itself. An external user is permitted to sign in only when at least one validated group claim from the identity provider matches an explicit administrator-configured mapping in CertRobo (`Administrator` or `Issuer`) and server-side domain/profile policy.
+* **Strict External Identity Resolution:** External accounts are identified strictly by the validated `(Issuer, Subject)` pair (`iss` + standard OIDC `sub` claim from the validated ID token), never by email address, display name, preferred username, or mutable/custom claims. CertRobo never automatically links an external OIDC login to a local account sharing the same email or username.
+
+### 1. Configure Your Identity Provider (Okta Example & Generic OIDC)
+
+#### Okta OIDC Web Application (Org Authorization Server)
+
+Ordinary Okta SSO works directly with the built-in **Okta Org Authorization Server** (`https://<your-okta-domain>`) and does **not** require a paid Okta API Access Management custom authorization server, an Okta API token, or AD/LDAP integration. (A custom authorization server such as `https://<your-okta-domain>/oauth2/default` also works if you choose to use one, provided `CertRobo__Oidc__Issuer` and `CertRobo__Oidc__Authority` match that server's exact `issuer` URI.)
+
+1. **Create the OIDC Web Application:**
+   * In the Okta Admin Console, go to **Applications → Applications → Create App Integration**.
+   * Sign-in method: **OIDC - OpenID Connect**.
+   * Application type: **Web Application**.
+   * Grant type: **Authorization Code** (PKCE `S256` is automatically negotiated by CertRobo).
+   * **Sign-in redirect URIs:** `https://pki.contoso.com/signin-oidc` *(must match `CertRobo__Oidc__PublicCallbackUrl` exactly)*.
+   * **Sign-out redirect URIs:** `https://pki.contoso.com/signout-callback-oidc` *(required only if `CertRobo__Oidc__EnableIdpSignOut=true`)*.
+   * **Assignments:** Assign the application to the specific Okta groups that should be allowed to use CertRobo (for example, `CertRobo-Admins` and `CertRobo-Issuers`).
+2. **Configure the `groups` Claim on the ID Token:**
+   * Open the application's **Sign On** tab → **OpenID Connect ID Token** section → **Edit**.
+   * Set **Groups claim type** to **Filter** (or **Expression**), claim name `groups`, and match your CertRobo groups (for example, `Starts with` `CertRobo-` or `Matches regex` `^(CertRobo-Admins|CertRobo-Issuers)$`).
+   * Save. When using the Okta Org Authorization Server, Okta includes the `groups` claim in the **ID token** (or in the `/userinfo` response when `CertRobo__Oidc__GetClaimsFromUserInfoEndpoint=true`).
+3. **Record the Client Credentials and Issuer:**
+   * Copy the **Client ID** and **Client Secret**.
+   * For the Okta Org Authorization Server, both `Issuer` and `Authority` are your exact Okta org URL without a trailing slash (e.g., `https://contoso.okta.com`). Verify by checking `https://contoso.okta.com/.well-known/openid-configuration` and confirming the `"issuer"` field.
+
+#### Other OpenID Connect Providers
+
+For any other OIDC provider:
+* Configure an Authorization Code + PKCE (`S256`) confidential Web client with redirect URI `https://<certrobo-host>/signin-oidc`.
+* Set `CertRobo__Oidc__Issuer` and `CertRobo__Oidc__Authority` to the exact `"issuer"` URI advertised in `/.well-known/openid-configuration`.
+* If your provider uses a different claim name for groups (for example, `roles` or `directory_groups`), set `CertRobo__Oidc__GroupClaimType`. External account identity is always bound to the standard OIDC `sub` claim in the validated ID token (`CertRobo__Oidc__SubjectClaimType` must be `sub`). If group claims are returned from the UserInfo endpoint instead of the ID token, set `CertRobo__Oidc__GetClaimsFromUserInfoEndpoint=true`.
+
+### 2. Configure CertRobo OIDC Custody and Trusted Reverse Proxy Boundaries
+
+Store the OIDC client secret in a mode-`0600` file owned by `certrobo` (never commit secrets into `appsettings.json`):
+
+```bash
+sudo sh -c 'umask 077 && printf "%s" "<YourOidcClientSecret>" > /etc/certrobo/oidc.secret'
+sudo chown certrobo:certrobo /etc/certrobo/oidc.secret
+sudo chmod 0600 /etc/certrobo/oidc.secret
+```
+
+Add the OIDC and reverse-proxy settings to `/etc/certrobo/certrobo.env`:
+
+```bash
+# Trusted Reverse Proxy Boundary (defaults to loopback 127.0.0.1 and ::1)
+# If Nginx runs on a separate proxy host or container network, list its exact IP or CIDR:
+CertRobo__ReverseProxy__KnownProxies__0=127.0.0.1
+CertRobo__ReverseProxy__KnownProxies__1=::1
+CertRobo__ReverseProxy__ForwardLimit=1
+
+# OpenID Connect Federated Sign-In
+CertRobo__Oidc__Enabled=true
+CertRobo__Oidc__DisplayName=Okta SSO
+CertRobo__Oidc__DefaultLoginMode=Local
+CertRobo__Oidc__Issuer=https://contoso.okta.com
+CertRobo__Oidc__Authority=https://contoso.okta.com
+CertRobo__Oidc__ClientId=<YourOidcClientId>
+CertRobo__Oidc__ClientSecretFile=/etc/certrobo/oidc.secret
+CertRobo__Oidc__PublicCallbackUrl=https://pki.contoso.com/signin-oidc
+CertRobo__Oidc__SignedOutCallbackPath=/signout-callback-oidc
+CertRobo__Oidc__EnableIdpSignOut=false
+CertRobo__Oidc__GetClaimsFromUserInfoEndpoint=false
+CertRobo__Oidc__GroupClaimType=groups
+CertRobo__Oidc__SubjectClaimType=sub
+CertRobo__Oidc__PreferredUsernameClaimType=preferred_username
+CertRobo__Oidc__EmailClaimType=email
+CertRobo__Oidc__DisplayNameClaimType=name
+CertRobo__Oidc__MaxSessionLifetimeMinutes=60
+CertRobo__Oidc__SessionRevalidationSeconds=10
+
+# Optional one-time initial group mappings (imported into SQLite once; live UI/CLI changes are authoritative across restarts):
+# Format: GroupName=Role:DomainPattern1,DomainPattern2@AllowedProfileId;...
+CertRobo__Oidc__GroupMappingsSpec=CertRobo-Admins=Administrator:*;CertRobo-Issuers=Issuer:*.contoso.com,contoso.com@*
+```
+
+> **Reverse Proxy & HTTPS Callback Requirement:** CertRobo requires the OIDC callback (`/signin-oidc`) to arrive over HTTPS (or through an explicitly trusted reverse proxy listed in `CertRobo__ReverseProxy__KnownProxies` / `CertRobo__ReverseProxy__KnownNetworks` that sets `X-Forwarded-Proto: https`). `X-Forwarded-Proto` headers from untrusted client IPs are ignored, and plain-HTTP OIDC callbacks are rejected.
+
+### 3. Granting and Removing Group Access, Policy Precedence, and Login Presentation (UI and CLI)
+
+Administrators control which external IdP groups map to CertRobo roles (`Administrator` or `Issuer`), which DNS domain patterns and certificate profiles each group may request, and how the `/login` page presents local versus federated sign-in:
+
+* **Durable Database Precedence Over Bootstrap Config:** Any `CertRobo__Oidc__GroupMappings` / `CertRobo__Oidc__GroupMappingsSpec` entries in configuration are imported into SQLite **once** (tracked by the persisted `HasSeededConfiguredGroupMappings` marker in `OidcPortalSettings`). Subsequent additions, role changes, domain-rule deletions, or group removals made in `/admin` or via the CLI are authoritative in SQLite and are never overwritten or resurrected across process restarts or backup/restore.
+* **Local vs. External Policy Precedence:** External OIDC users derive their domain and profile permissions exclusively from the explicit union of their currently mapped external group rules (`SubjectType = "ExternalGroup"`) and any direct account rules (`SubjectType = "User"`) assigned to their external user ID. Ordinary local role rules (`SubjectType = "Role"`) apply only to local accounts and never widen an external group's domain or profile restrictions.
+* **Sign-In Page Presentation (`ProviderDisplayName` & `DefaultLoginMode`):** In **Administration → Users and permissions → Sign-In Page Presentation & Default Emphasis**, administrators can customize the OIDC provider button label (e.g., `Okta SSO`) and choose whether **Local Account Primary** (`Local`) or **Federated OIDC Primary** (`Oidc`) is emphasized first on `/login`. Both sign-in methods always remain rendered on `/login` so local break-glass sign-in is reachable during an IdP outage.
+* **In the Web Portal (`/admin`):**
+  1. Sign in as an `Administrator` and open **Administration → Users and permissions**.
+  2. In **OpenID Connect (OIDC) Federated Sign-In & Group Mappings**, click **+ Add / Replace Group Mapping** (or **Edit / Replace...** on an existing row).
+  3. Enter the exact external group claim value (e.g., `CertRobo-Issuers`), choose the role (`Issuer` or `Administrator`), select the allowed certificate profile (`*` or a specific profile such as `tls-server-ecdsa-256`), and enter comma-separated domain patterns (e.g., `*.contoso.com, contoso.com`). Saving atomically replaces that group's domain/profile rule set.
+  4. To append an additional domain/profile rule to an existing mapped group without replacing its current rules (for example, to authorize a second certificate profile on a different subdomain), click **+ Add Additional Rule to Group**.
+  5. To revoke a group's access, click **Remove Group Mapping** (or remove individual domain rules with `×`). Removing a group mapping immediately strips the role from affected external accounts and rotates their `SecurityStamp`.
+* **Via the Host CLI:**
+  ```bash
+  # Grant or update a group mapping:
+  sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --add-oidc-group-mapping "CertRobo-Issuers" Issuer "*.contoso.com,contoso.com" "*"'
+
+  # Remove a group mapping and immediately invalidate affected external sessions:
+  sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --remove-oidc-group-mapping "CertRobo-Issuers"'
+  ```
+
+### 4. Session Lifecycle, Group Removal, Local Kill Switch, and Sign-Out Behavior
+
+* **Architectural Bound on IdP-Side Changes:** Standard OIDC authorization-code login validates the user's ID token and group claims at sign-in time; an external identity provider does not push real-time group-removal events into an already-established local cookie or Blazor WebSocket circuit. To bound this window:
+  1. External OIDC sessions enforce an explicit, non-sliding maximum lifetime (`CertRobo__Oidc__MaxSessionLifetimeMinutes`, default `60` minutes). Once this window elapses, both HTTP requests and active Blazor Server circuits require a fresh OIDC authentication round-trip.
+  2. Both the HTTP cookie validator (`SecurityStampValidator`) and the Blazor Server circuit revalidator (`RevalidatingIdentityAuthenticationStateProvider`) re-check the user's `SecurityStamp`, disabled status, session expiry, and active CertRobo group mappings every `CertRobo__Oidc__SessionRevalidationSeconds` (default `10` seconds).
+  3. Every certificate issuance request (`IssuancePolicyService`) and administrative action re-verifies the database account status, `SecurityStamp`, and active group/domain mappings on the server at the moment of the action.
+* **Administrator-Initiated Local Kill Switch (Immediate Revocation of Access):**
+  When an operator removes a user from an IdP group or suspends them in the IdP and needs to terminate their CertRobo session immediately without waiting for `MaxSessionLifetimeMinutes`:
+  * **Disable the account in `/admin`:** Click **Disable Account** on the user's row in **Administration → Users and permissions**. This immediately blocks certificate issuance, invalidates active HTTP cookies and Blazor circuits within seconds, and prevents future OIDC sign-ins for that `(issuer, sub)`.
+  * **Invalidate active sessions without disabling:** Click **Invalidate Active Sessions** on a specific user or **Invalidate All External Sessions** in **Administration → Users and permissions**, or run from the CLI:
+    ```bash
+    # Invalidate all active external OIDC sessions:
+    sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --invalidate-external-sessions'
+
+    # Invalidate a specific user's active sessions:
+    sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --invalidate-external-sessions <userNameOrId>'
+    ```
+* **Sign-Out Behavior (`EnableIdpSignOut`):**
+  * Clicking **Sign Out** in CertRobo (`POST /account/logout`) always terminates the local CertRobo session cookie (`CertRobo.Auth`).
+  * By default (`CertRobo__Oidc__EnableIdpSignOut=false`), signing out ends only the local CertRobo session and returns to `/login`, leaving the user's separate browser session at the upstream IdP (e.g., Okta dashboard) intact.
+  * If you want CertRobo sign-out to also trigger OIDC RP-Initiated Logout at the identity provider's `end_session_endpoint`, set `CertRobo__Oidc__EnableIdpSignOut=true` and register `https://<certrobo-host>/signout-callback-oidc` as a Sign-out Redirect URI in your IdP application.
+
+### 5. Migration, Rollback, and Break-Glass Local Administrator Recovery
+
+* **Sole Local Administrator Invariant & Password Recovery:** CertRobo enforces at the service boundary that at least one enabled local `Administrator` account with a local password hash remains active at all times (attempts to disable, demote, or delete the last active local `Administrator` are refused even if external OIDC administrators exist). Note that having an enabled local administrator account in the database does not prove an operator knows its current password: if the password is lost or locked out, an OS-authorized operator with host access can always reset it via the CLI (`./CertRobo --reset-admin-password <username> "<newPassword>"`).
+* **Rollback to Local-Only Authentication:** To disable federated login at any time, set `CertRobo__Oidc__Enabled=false` in `/etc/certrobo/certrobo.env` and restart `certrobo.service`. Existing external sessions are immediately rejected upon disablement, while local accounts, CA keys, issued certificates, and CRLs continue operating normally.
+* **Verification Scope:** This repository's automated test suite (`Tests/CertRobo.Tests/OidcFederatedLoginTests.cs`) exercises the complete ASP.NET Core OpenID Connect authorization-code + PKCE (`S256`) flow against a local RSA-signed OIDC discovery/JWKS/token/userinfo fixture (covering valid sign-in, signature/issuer/audience/lifetime/nonce/state rejection, strict `(issuer, sub)` identity binding and non-`sub` claim collision isolation, durable group-mapping precedence across CLI restarts and backup/restore, sole-local-admin protection and stale circuit actor rejection, local role-rule isolation from external accounts, group removal, account disablement, session/circuit revalidation, local kill switch, login presentation/emphasis settings, safe redirects, trusted proxy boundaries, and secret/token non-exposure in logs). Live enrollment and testing against a production or preview Okta tenant require separate operator authorization and credentials.
+
+---
+
 ## Reference: Profiles, Policy, Recovery, and Cutover
 
 1. **Supported TLS Server Leaf Profiles**

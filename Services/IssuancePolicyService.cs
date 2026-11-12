@@ -73,6 +73,45 @@ public sealed class IssuancePolicyService(
         }
 
         IList<string> userRoles = await userManager.GetRolesAsync(user);
+        List<string> activeMappedExternalGroups = [];
+
+        if (user.IsExternalAccount)
+        {
+            IReadOnlyList<string> syncedGroups = OidcFederationService.ParseSyncedGroupsJson(user.LastSyncedGroupsJson);
+            if (syncedGroups.Count == 0)
+            {
+                return new(false, "External account does not belong to any authorised CertRobo group.", null, user);
+            }
+
+            List<ExternalGroupRoleMapping> matchedMappings = await dbContext.ExternalGroupRoleMappings
+                .AsNoTracking()
+                .Where(m => syncedGroups.Contains(m.GroupName))
+                .ToListAsync(cancellationToken);
+
+            matchedMappings = matchedMappings
+                .Where(m => syncedGroups.Contains(m.GroupName, StringComparer.Ordinal))
+                .ToList();
+
+            if (matchedMappings.Count == 0)
+            {
+                return new(false, "External account does not belong to any currently mapped CertRobo group.", null, user);
+            }
+
+            activeMappedExternalGroups = matchedMappings
+                .Select(m => m.GroupName)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+            bool groupGrantsIssuerOrAdmin = matchedMappings.Any(m =>
+                m.RoleName.Equals(AppRoles.Issuer, StringComparison.OrdinalIgnoreCase)
+                || m.RoleName.Equals(AppRoles.Administrator, StringComparison.OrdinalIgnoreCase));
+
+            if (!groupGrantsIssuerOrAdmin)
+            {
+                return new(false, "User does not have permission to request certificates.", null, user);
+            }
+        }
+
         bool isIssuerOrAdmin = userRoles.Any(r =>
             r.Equals(AppRoles.Issuer, StringComparison.OrdinalIgnoreCase)
             || r.Equals(AppRoles.Administrator, StringComparison.OrdinalIgnoreCase));
@@ -88,12 +127,36 @@ public sealed class IssuancePolicyService(
             return new(false, csrError ?? "CSR validation failed.", null, user);
         }
 
-        // Gather applicable DomainPermissionRules for this user and their roles
-        List<DomainPermissionRule> rules = await dbContext.DomainPermissionRules
-            .Where(r =>
-                (r.SubjectType == "User" && r.SubjectValue == user.Id)
-                || (r.SubjectType == "Role" && userRoles.Contains(r.SubjectValue)))
-            .ToListAsync(cancellationToken);
+        // Gather applicable DomainPermissionRules with explicit local vs. external precedence:
+        // - External OIDC accounts: union of their currently mapped ExternalGroup rules and any explicit direct User rules for this account ID.
+        //   Ordinary local Role rules (SubjectType == "Role") NEVER apply to external OIDC accounts so a broad local role rule
+        //   cannot widen a narrower external group restriction.
+        // - Local accounts: union of their direct User rules and local Role rules.
+        List<DomainPermissionRule> rules;
+        if (user.IsExternalAccount)
+        {
+            rules = await dbContext.DomainPermissionRules
+                .AsNoTracking()
+                .Where(r =>
+                    (r.SubjectType == PermissionSubjectTypes.User && r.SubjectValue == user.Id)
+                    || (r.SubjectType == PermissionSubjectTypes.ExternalGroup && activeMappedExternalGroups.Contains(r.SubjectValue)))
+                .ToListAsync(cancellationToken);
+
+            rules = rules
+                .Where(r => r.SubjectType == PermissionSubjectTypes.User
+                         || (r.SubjectType == PermissionSubjectTypes.ExternalGroup
+                             && activeMappedExternalGroups.Contains(r.SubjectValue, StringComparer.Ordinal)))
+                .ToList();
+        }
+        else
+        {
+            rules = await dbContext.DomainPermissionRules
+                .AsNoTracking()
+                .Where(r =>
+                    (r.SubjectType == PermissionSubjectTypes.User && r.SubjectValue == user.Id)
+                    || (r.SubjectType == PermissionSubjectTypes.Role && userRoles.Contains(r.SubjectValue)))
+                .ToListAsync(cancellationToken);
+        }
 
         // Filter rules that allow the resolved profile
         List<DomainPermissionRule> profileMatchingRules = rules

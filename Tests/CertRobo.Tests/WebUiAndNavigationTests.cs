@@ -308,7 +308,7 @@ public class WebUiAndNavigationTests : IDisposable
         var (_, _, adminUser) = await acct.BootstrapFirstAdminAsync("admin", "AdminPass!2026", "admin@contoso.com", "*.contoso.com");
         Assert.NotNull(adminUser);
 
-        // Instantiate Pages.Admin with real services from the DI container
+        // Instantiate Pages.Admin with real services from the DI container and an authenticated Admin state provider
         CertRobo.Pages.Admin adminPage = new();
         Type adminType = typeof(CertRobo.Pages.Admin);
         SetProperty(adminPage, "AccountService", acct);
@@ -318,7 +318,7 @@ public class WebUiAndNavigationTests : IDisposable
         SetProperty(adminPage, "MigrationService", scope.ServiceProvider.GetRequiredService<LegacySettingsMigrationService>());
         SetProperty(adminPage, "Configuration", scope.ServiceProvider.GetRequiredService<IConfiguration>());
         SetProperty(adminPage, "HostEnvironment", scope.ServiceProvider.GetRequiredService<Microsoft.AspNetCore.Hosting.IWebHostEnvironment>());
-        SetProperty(adminPage, "AuthenticationStateProvider", scope.ServiceProvider.GetRequiredService<Microsoft.AspNetCore.Components.Authorization.AuthenticationStateProvider>());
+        SetProperty(adminPage, "AuthenticationStateProvider", new StaticAdminAuthStateProvider(adminUser.Id, adminUser.UserName!, adminUser.SecurityStamp!));
         SetProperty(adminPage, "NotificationService", scope.ServiceProvider.GetRequiredService<Radzen.NotificationService>());
 
         await InvokeMethodAsync(adminPage, "OnInitializedAsync");
@@ -364,6 +364,23 @@ public class WebUiAndNavigationTests : IDisposable
 
         await InvokeMethodAsync(adminPage, "OnTabKeyDownAsync", new Microsoft.AspNetCore.Components.Web.KeyboardEventArgs { Key = "Home" });
         Assert.Equal("CertificateAuthority", GetField<object>(adminPage, "activeSection").ToString());
+    }
+
+    private sealed class StaticAdminAuthStateProvider(string userId, string userName, string securityStamp)
+        : Microsoft.AspNetCore.Components.Authorization.AuthenticationStateProvider
+    {
+        public override Task<Microsoft.AspNetCore.Components.Authorization.AuthenticationState> GetAuthenticationStateAsync()
+        {
+            var identity = new System.Security.Claims.ClaimsIdentity(
+            [
+                new System.Security.Claims.Claim(System.Security.Claims.ClaimTypes.NameIdentifier, userId),
+                new System.Security.Claims.Claim(System.Security.Claims.ClaimTypes.Name, userName),
+                new System.Security.Claims.Claim(System.Security.Claims.ClaimTypes.Role, AppRoles.Administrator),
+                new System.Security.Claims.Claim("AspNet.Identity.SecurityStamp", securityStamp)
+            ], "TestAuth");
+            return Task.FromResult(new Microsoft.AspNetCore.Components.Authorization.AuthenticationState(
+                new System.Security.Claims.ClaimsPrincipal(identity)));
+        }
     }
 
     private static void SetProperty(object instance, string name, object value)

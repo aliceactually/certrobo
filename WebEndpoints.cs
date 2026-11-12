@@ -1,6 +1,7 @@
 using CertRobo.Data;
 using CertRobo.Services;
 using Microsoft.AspNetCore.Antiforgery;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Identity;
 using System.Net;
 
@@ -10,7 +11,11 @@ public static class WebEndpoints
 {
     public static void MapCertRoboEndpoints(this WebApplication app)
     {
-        app.MapGet("/login", async (HttpContext ctx, AccountManagementService accountService, IAntiforgery antiforgery) =>
+        app.MapGet("/login", async (
+            HttpContext ctx,
+            AccountManagementService accountService,
+            OidcFederationOptions oidcOptions,
+            IAntiforgery antiforgery) =>
         {
             if (await accountService.IsBootstrapRequiredAsync())
             {
@@ -20,15 +25,81 @@ public static class WebEndpoints
 
             AntiforgeryTokenSet tokens = antiforgery.GetAndStoreTokens(ctx);
             string? error = ctx.Request.Query["error"];
-            string? returnUrl = ctx.Request.Query["ReturnUrl"];
-            if (string.IsNullOrWhiteSpace(returnUrl) || !Uri.IsWellFormedUriString(returnUrl, UriKind.Relative))
-            {
-                returnUrl = "/";
-            }
+            string returnUrl = OidcFederationService.NormalizeReturnUrl(ctx.Request.Query["ReturnUrl"]);
 
             string errorHtml = string.IsNullOrWhiteSpace(error)
                 ? string.Empty
                 : $"<div class=\"alert alert-danger\">{WebUtility.HtmlEncode(error)}</div>";
+
+            OidcPortalSettingsConfig portalSettings = await accountService.GetOidcPortalSettingsAsync(ctx.RequestAborted);
+            string providerLabel = !string.IsNullOrWhiteSpace(portalSettings.ProviderDisplayName)
+                ? portalSettings.ProviderDisplayName
+                : oidcOptions.DisplayName;
+            string effectiveDefaultMode = LoginEmphasisModes.Normalize(portalSettings.DefaultLoginMode);
+            bool oidcIsPrimary = oidcOptions.Enabled
+                && string.Equals(effectiveDefaultMode, LoginEmphasisModes.OidcPrimary, StringComparison.OrdinalIgnoreCase);
+
+            string localFormHtml = $$"""
+                <form method="post" action="/account/login" id="local-login-form" data-emphasis="{{(oidcIsPrimary ? "secondary" : "primary")}}">
+                    <input type="hidden" name="{{tokens.FormFieldName}}" value="{{tokens.RequestToken}}" />
+                    <input type="hidden" name="returnUrl" value="{{WebUtility.HtmlEncode(returnUrl)}}" />
+                    <div class="mb-3">
+                        <label class="form-label" for="userName">Username</label>
+                        <input class="form-control" id="userName" name="userName" type="text" required autocomplete="username" />
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="password">Password</label>
+                        <input class="form-control" id="password" name="password" type="password" required autocomplete="current-password" />
+                    </div>
+                    <button type="submit" id="local-login-submit" class="btn {{(oidcIsPrimary ? "btn-outline-primary" : "btn-primary")}} w-100">Sign In</button>
+                </form>
+                """;
+
+            string loginBodyHtml;
+            if (oidcOptions.Enabled)
+            {
+                var (oidcValid, oidcConfigErr) = oidcOptions.Validate();
+                if (oidcValid)
+                {
+                    string oidcFormHtml = $$"""
+                        <form method="post" action="/account/external-login" id="oidc-login-form" data-emphasis="{{(oidcIsPrimary ? "primary" : "secondary")}}">
+                            <input type="hidden" name="{{tokens.FormFieldName}}" value="{{tokens.RequestToken}}" />
+                            <input type="hidden" name="returnUrl" value="{{WebUtility.HtmlEncode(returnUrl)}}" />
+                            <button type="submit" id="oidc-login-submit" class="btn {{(oidcIsPrimary ? "btn-primary" : "btn-outline-primary")}} w-100">
+                                Sign in with {{WebUtility.HtmlEncode(providerLabel)}}
+                            </button>
+                        </form>
+                        """;
+
+                    if (oidcIsPrimary)
+                    {
+                        loginBodyHtml = $$"""
+                            {{oidcFormHtml}}
+                            <div class="text-center text-muted small my-3">&mdash; or sign in with a local account &mdash;</div>
+                            {{localFormHtml}}
+                            """;
+                    }
+                    else
+                    {
+                        loginBodyHtml = $$"""
+                            {{localFormHtml}}
+                            <div class="text-center text-muted small my-3">&mdash; or sign in with {{WebUtility.HtmlEncode(providerLabel)}} &mdash;</div>
+                            {{oidcFormHtml}}
+                            """;
+                    }
+                }
+                else
+                {
+                    string warnHtml = !string.IsNullOrWhiteSpace(oidcConfigErr)
+                        ? $"<div class=\"alert alert-warning small mb-3\">{WebUtility.HtmlEncode(oidcConfigErr)}</div>"
+                        : string.Empty;
+                    loginBodyHtml = warnHtml + localFormHtml;
+                }
+            }
+            else
+            {
+                loginBodyHtml = localFormHtml;
+            }
 
             string html = $$"""
                 <!DOCTYPE html>
@@ -43,22 +114,10 @@ public static class WebEndpoints
                 </head>
                 <body>
                     <div class="container" style="max-width: 460px; margin-top: 4rem;">
-                        <div class="card rz-card p-4">
+                        <div class="card rz-card p-4" data-default-login-mode="{{WebUtility.HtmlEncode(effectiveDefaultMode)}}">
                             <h3 class="mb-3">Sign in to CertRobo</h3>
                             {{errorHtml}}
-                            <form method="post" action="/account/login">
-                                <input type="hidden" name="{{tokens.FormFieldName}}" value="{{tokens.RequestToken}}" />
-                                <input type="hidden" name="returnUrl" value="{{WebUtility.HtmlEncode(returnUrl)}}" />
-                                <div class="mb-3">
-                                    <label class="form-label" for="userName">Username</label>
-                                    <input class="form-control" id="userName" name="userName" type="text" required autocomplete="username" />
-                                </div>
-                                <div class="mb-3">
-                                    <label class="form-label" for="password">Password</label>
-                                    <input class="form-control" id="password" name="password" type="password" required autocomplete="current-password" />
-                                </div>
-                                <button type="submit" class="btn btn-primary w-100">Sign In</button>
-                            </form>
+                            {{loginBodyHtml}}
                         </div>
                     </div>
                 </body>
@@ -88,14 +147,10 @@ public static class WebEndpoints
             IFormCollection form = await ctx.Request.ReadFormAsync();
             string userName = form["userName"].ToString().Trim();
             string password = form["password"].ToString();
-            string returnUrl = form["returnUrl"].ToString();
-            if (string.IsNullOrWhiteSpace(returnUrl) || !Uri.IsWellFormedUriString(returnUrl, UriKind.Relative))
-            {
-                returnUrl = "/";
-            }
+            string returnUrl = OidcFederationService.NormalizeReturnUrl(form["returnUrl"].ToString());
 
             ApplicationUser? user = await userManager.FindByNameAsync(userName);
-            if (user == null || user.IsDisabled)
+            if (user == null || user.IsDisabled || user.IsExternalAccount)
             {
                 ctx.Response.Redirect("/login?error=" + Uri.EscapeDataString("Invalid credentials or disabled account."));
                 return;
@@ -122,9 +177,59 @@ public static class WebEndpoints
             ctx.Response.Redirect("/login?error=" + Uri.EscapeDataString("Invalid username or password."));
         }).AllowAnonymous();
 
+        app.MapMethods("/account/external-login", ["POST", "GET"], async (
+            HttpContext ctx,
+            AccountManagementService accountService,
+            OidcFederationOptions oidcOptions,
+            IAntiforgery antiforgery) =>
+        {
+            if (await accountService.IsBootstrapRequiredAsync())
+            {
+                ctx.Response.Redirect("/setup");
+                return;
+            }
+
+            string? rawReturnUrl = null;
+            if (HttpMethods.IsPost(ctx.Request.Method))
+            {
+                try
+                {
+                    await antiforgery.ValidateRequestAsync(ctx);
+                }
+                catch (AntiforgeryValidationException)
+                {
+                    ctx.Response.Redirect("/login?error=" + Uri.EscapeDataString("Session token expired. Please try signing in again."));
+                    return;
+                }
+
+                IFormCollection form = await ctx.Request.ReadFormAsync();
+                rawReturnUrl = form["returnUrl"].ToString();
+            }
+            else
+            {
+                rawReturnUrl = ctx.Request.Query["returnUrl"];
+            }
+
+            var (valid, err) = oidcOptions.Validate();
+            if (!oidcOptions.Enabled || !valid)
+            {
+                ctx.Response.Redirect("/login?error=" + Uri.EscapeDataString(err ?? "OpenID Connect federated login is not enabled."));
+                return;
+            }
+
+            string returnUrl = OidcFederationService.NormalizeReturnUrl(rawReturnUrl);
+            await ctx.ChallengeAsync(
+                OidcConstants.AuthenticationScheme,
+                new AuthenticationProperties
+                {
+                    RedirectUri = returnUrl
+                });
+        }).AllowAnonymous();
+
         app.MapPost("/account/logout", async (
             HttpContext ctx,
             IAntiforgery antiforgery,
+            OidcFederationOptions oidcOptions,
             SignInManager<ApplicationUser> signInManager) =>
         {
             bool tokenValid = false;
@@ -148,9 +253,21 @@ public static class WebEndpoints
                 }
             }
 
+            bool wasOidcSession = ctx.User.HasClaim(OidcClaimTypes.AuthMethod, OidcClaimTypes.AuthMethodOidc);
             if (tokenValid)
             {
                 await signInManager.SignOutAsync();
+                await ctx.SignOutAsync(IdentityConstants.ApplicationScheme);
+                if (wasOidcSession && oidcOptions.Enabled && oidcOptions.EnableIdpSignOut)
+                {
+                    await ctx.SignOutAsync(
+                        OidcConstants.AuthenticationScheme,
+                        new AuthenticationProperties
+                        {
+                            RedirectUri = "/login"
+                        });
+                    return;
+                }
             }
             ctx.Response.Redirect("/login");
         });

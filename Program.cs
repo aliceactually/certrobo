@@ -3,12 +3,22 @@ using CertRobo.Data;
 using CertRobo.Models;
 using CertRobo.Services;
 using CertRobo.Shared;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.AspNetCore.Components.Authorization;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.JsonWebTokens;
+using Microsoft.IdentityModel.Logging;
+using Microsoft.IdentityModel.Protocols.OpenIdConnect;
+using Microsoft.IdentityModel.Tokens;
 using Radzen;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+
+IdentityModelEventSource.ShowPII = false;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -26,7 +36,11 @@ string[] cliCommandFlags =
     "--reprotect-ca-keys",
     "--refresh-crls",
     "--issue-csr",
-    "--export-issued"
+    "--export-issued",
+    "--add-oidc-group-mapping",
+    "--remove-oidc-group-mapping",
+    "--invalidate-external-sessions",
+    "--set-user-disabled"
 ];
 bool isCliCommandMode = args.Any(a => cliCommandFlags.Contains(a, StringComparer.OrdinalIgnoreCase));
 bool verboseDiagnostics = args.Contains("--verbose", StringComparer.OrdinalIgnoreCase)
@@ -85,6 +99,10 @@ builder.Services.AddIdentity<ApplicationUser, IdentityRole>(options =>
 .AddEntityFrameworkStores<CertRoboDbContext>()
 .AddDefaultTokenProviders();
 
+OidcFederationOptions oidcOptions = OidcFederationOptions.FromConfiguration(builder.Configuration);
+builder.Services.AddSingleton(oidcOptions);
+builder.Services.AddScoped<OidcFederationService>();
+
 builder.Services.ConfigureApplicationCookie(options =>
 {
     options.Cookie.Name = "CertRobo.Auth";
@@ -94,12 +112,28 @@ builder.Services.ConfigureApplicationCookie(options =>
     options.AccessDeniedPath = "/login";
     options.ExpireTimeSpan = TimeSpan.FromHours(8);
     options.SlidingExpiration = true;
+    options.Events.OnValidatePrincipal = async context =>
+    {
+        OidcFederationService oidcService = context.HttpContext.RequestServices.GetRequiredService<OidcFederationService>();
+        bool isValid = await oidcService.ValidateSessionPrincipalAsync(context.Principal, context.HttpContext.RequestAborted);
+        if (!isValid)
+        {
+            context.RejectPrincipal();
+            await context.HttpContext.SignOutAsync(IdentityConstants.ApplicationScheme);
+        }
+    };
 });
 
 builder.Services.Configure<SecurityStampValidatorOptions>(options =>
 {
-    options.ValidationInterval = TimeSpan.FromSeconds(10);
+    options.ValidationInterval = TimeSpan.FromSeconds(Math.Max(0, oidcOptions.SessionRevalidationSeconds));
 });
+
+builder.Services.AddAuthentication()
+    .AddOpenIdConnect(OidcConstants.AuthenticationScheme, _ => { });
+
+builder.Services.AddOptions<OpenIdConnectOptions>(OidcConstants.AuthenticationScheme)
+    .Configure<OidcFederationOptions>(ConfigureOidcHandlerOptions);
 
 CaKeyCustodyOptions caOptions = new()
 {
@@ -115,11 +149,32 @@ CaKeyCustodyOptions caOptions = new()
 };
 builder.Services.AddSingleton(caOptions);
 
+ReverseProxyOptions reverseProxyOptions = ReverseProxyOptions.FromConfiguration(builder.Configuration);
+builder.Services.AddSingleton(reverseProxyOptions);
+
 builder.Services.Configure<ForwardedHeadersOptions>(options =>
 {
     options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    options.ForwardLimit = Math.Max(1, reverseProxyOptions.ForwardLimit);
+    options.RequireHeaderSymmetry = false;
     options.KnownIPNetworks.Clear();
     options.KnownProxies.Clear();
+
+    foreach (string rawProxy in reverseProxyOptions.KnownProxies)
+    {
+        if (System.Net.IPAddress.TryParse(rawProxy, out System.Net.IPAddress? proxyIp))
+        {
+            options.KnownProxies.Add(proxyIp);
+        }
+    }
+
+    foreach (string rawNet in reverseProxyOptions.KnownNetworks)
+    {
+        if (System.Net.IPNetwork.TryParse(rawNet, out System.Net.IPNetwork network))
+        {
+            options.KnownIPNetworks.Add(network);
+        }
+    }
 });
 
 builder.Services.AddAntiforgery();
@@ -851,6 +906,123 @@ using (IServiceScope scope = app.Services.CreateScope())
         Console.WriteLine($"Exported issued certificate serial {record.SerialNumberHex} for '{record.CommonName}' -> {outCertPath}");
         return;
     }
+
+    // Handle CLI external group mapping creation/update:
+    // dotnet run -- --add-oidc-group-mapping <groupName> <Administrator|Issuer> [<commaSeparatedDomains>] [<allowedProfileId>]
+    int addOidcMapIdx = Array.IndexOf(args, "--add-oidc-group-mapping");
+    if (addOidcMapIdx >= 0)
+    {
+        if (addOidcMapIdx + 2 >= args.Length)
+        {
+            Console.Error.WriteLine("Usage: --add-oidc-group-mapping <groupName> <Administrator|Issuer> [<commaSeparatedDomains>] [<allowedProfileId>]");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        string groupName = args[addOidcMapIdx + 1];
+        string roleName = args[addOidcMapIdx + 2];
+        string? domainsCsv = addOidcMapIdx + 3 < args.Length && !args[addOidcMapIdx + 3].StartsWith("--", StringComparison.Ordinal)
+            ? args[addOidcMapIdx + 3]
+            : null;
+        string allowedProfile = addOidcMapIdx + 4 < args.Length && !args[addOidcMapIdx + 4].StartsWith("--", StringComparison.Ordinal)
+            ? args[addOidcMapIdx + 4]
+            : "*";
+
+        string[] domainPatterns = string.IsNullOrWhiteSpace(domainsCsv)
+            ? []
+            : domainsCsv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        var (ok, err, _) = await accountService.SetExternalGroupRoleMappingAsync(
+            groupName,
+            roleName,
+            domainPatterns,
+            allowedProfile);
+        if (!ok)
+        {
+            Console.Error.WriteLine($"OIDC group mapping failed: {err}");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        Console.WriteLine($"Configured external group mapping '{groupName}' -> role '{roleName}' (domains: {(domainPatterns.Length > 0 ? string.Join(", ", domainPatterns) : "none")}, profile: {allowedProfile}).");
+        return;
+    }
+
+    // Handle CLI external group mapping removal:
+    // dotnet run -- --remove-oidc-group-mapping <groupName>
+    int rmOidcMapIdx = Array.IndexOf(args, "--remove-oidc-group-mapping");
+    if (rmOidcMapIdx >= 0)
+    {
+        if (rmOidcMapIdx + 1 >= args.Length)
+        {
+            Console.Error.WriteLine("Usage: --remove-oidc-group-mapping <groupName>");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        string groupName = args[rmOidcMapIdx + 1];
+        var (ok, err) = await accountService.RemoveExternalGroupRoleMappingByNameAsync(groupName);
+        if (!ok)
+        {
+            Console.Error.WriteLine($"Removing OIDC group mapping failed: {err}");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        Console.WriteLine($"Removed external group mapping '{groupName}' and invalidated affected external sessions.");
+        return;
+    }
+
+    // Handle CLI session kill switch for external (or specific) accounts:
+    // dotnet run -- --invalidate-external-sessions [<userNameOrId>]
+    int invalidateExtIdx = Array.IndexOf(args, "--invalidate-external-sessions");
+    if (invalidateExtIdx >= 0)
+    {
+        string? targetUser = invalidateExtIdx + 1 < args.Length && !args[invalidateExtIdx + 1].StartsWith("--", StringComparison.Ordinal)
+            ? args[invalidateExtIdx + 1]
+            : null;
+        if (!string.IsNullOrWhiteSpace(targetUser))
+        {
+            var (ok, err) = await accountService.InvalidateUserSessionsAsync(targetUser);
+            if (!ok)
+            {
+                Console.Error.WriteLine($"Session invalidation failed: {err}");
+                Environment.ExitCode = 1;
+                return;
+            }
+            Console.WriteLine($"Invalidated active sessions for user '{targetUser}'.");
+            return;
+        }
+
+        int count = await accountService.InvalidateAllExternalSessionsAsync();
+        Console.WriteLine($"Invalidated active sessions for {count} external OpenID Connect account(s).");
+        return;
+    }
+
+    // Handle CLI account enable/disable (enforces sole-local-admin invariant across processes):
+    // dotnet run -- --set-user-disabled <userNameOrId> <true|false>
+    int setUserDisIdx = Array.IndexOf(args, "--set-user-disabled");
+    if (setUserDisIdx >= 0)
+    {
+        if (setUserDisIdx + 2 >= args.Length || !bool.TryParse(args[setUserDisIdx + 2], out bool disableFlag))
+        {
+            Console.Error.WriteLine("Usage: --set-user-disabled <userNameOrId> <true|false>");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        string targetUser = args[setUserDisIdx + 1];
+        var (ok, err) = await accountService.SetUserDisabledAsync(targetUser, disableFlag);
+        if (!ok)
+        {
+            Console.Error.WriteLine($"Account update failed: {err}");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        Console.WriteLine($"Account '{targetUser}' is now {(disableFlag ? "disabled" : "enabled")}.");
+        return;
+    }
 }
 
 app.UseForwardedHeaders();
@@ -1102,6 +1274,274 @@ static async Task<IssuanceOutcome?> TryRecoverExistingIssuedCertificateForCsrAsy
     }
 
     return null;
+}
+
+static void ConfigureOidcHandlerOptions(OpenIdConnectOptions options, OidcFederationOptions oidcOptions)
+{
+    options.SignInScheme = IdentityConstants.ApplicationScheme;
+    options.Authority = !string.IsNullOrWhiteSpace(oidcOptions.EffectiveAuthority)
+        ? oidcOptions.EffectiveAuthority
+        : "https://disabled.oidc.invalid";
+    if (!string.IsNullOrWhiteSpace(oidcOptions.MetadataAddress))
+    {
+        options.MetadataAddress = oidcOptions.MetadataAddress;
+    }
+
+    options.ClientId = !string.IsNullOrWhiteSpace(oidcOptions.ClientId)
+        ? oidcOptions.ClientId
+        : "disabled";
+    options.ClientSecret = oidcOptions.ResolveEffectiveClientSecret() ?? "disabled";
+    options.ResponseType = OpenIdConnectResponseType.Code;
+    options.ResponseMode = OpenIdConnectResponseMode.Query;
+    options.UsePkce = true;
+    options.SaveTokens = false;
+    options.GetClaimsFromUserInfoEndpoint = oidcOptions.GetClaimsFromUserInfoEndpoint;
+    options.MapInboundClaims = false;
+    options.RequireHttpsMetadata = true;
+    options.DisableTelemetry = true;
+    options.CallbackPath = new PathString(oidcOptions.EffectiveCallbackPath);
+    options.SignedOutCallbackPath = new PathString(oidcOptions.SignedOutCallbackPath);
+
+    options.CorrelationCookie.Name = "CertRobo.Oidc.Correlation.";
+    options.CorrelationCookie.HttpOnly = true;
+    options.CorrelationCookie.SecurePolicy = CookieSecurePolicy.Always;
+    options.CorrelationCookie.SameSite = SameSiteMode.Lax;
+
+    options.NonceCookie.Name = "CertRobo.Oidc.Nonce.";
+    options.NonceCookie.HttpOnly = true;
+    options.NonceCookie.SecurePolicy = CookieSecurePolicy.Always;
+    options.NonceCookie.SameSite = SameSiteMode.Lax;
+
+    options.Scope.Clear();
+    options.Scope.Add("openid");
+    foreach (string scope in oidcOptions.Scopes)
+    {
+        if (!string.IsNullOrWhiteSpace(scope) && !options.Scope.Contains(scope))
+        {
+            options.Scope.Add(scope);
+        }
+    }
+
+    string[] mappedClaimTypes =
+    [
+        oidcOptions.GroupClaimType,
+        oidcOptions.PreferredUsernameClaimType,
+        oidcOptions.EmailClaimType,
+        oidcOptions.DisplayNameClaimType
+    ];
+    foreach (string claimType in mappedClaimTypes
+        .Where(c => !string.IsNullOrWhiteSpace(c)
+                 && !string.Equals(c.Trim(), "sub", StringComparison.OrdinalIgnoreCase)
+                 && !string.Equals(c.Trim(), "iss", StringComparison.OrdinalIgnoreCase))
+        .Distinct(StringComparer.Ordinal))
+    {
+        options.ClaimActions.Add(new MultiValueJsonClaimAction(claimType));
+    }
+
+    options.ProtocolValidator.RequireNonce = true;
+
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuer = true,
+        ValidIssuer = !string.IsNullOrWhiteSpace(oidcOptions.EffectiveIssuer)
+            ? oidcOptions.EffectiveIssuer
+            : null,
+        ValidateAudience = true,
+        ValidAudience = oidcOptions.ClientId,
+        ValidateIssuerSigningKey = true,
+        RequireSignedTokens = true,
+        ValidateLifetime = true,
+        RequireExpirationTime = true,
+        ClockSkew = TimeSpan.FromMinutes(2),
+        NameClaimType = oidcOptions.PreferredUsernameClaimType,
+        RoleClaimType = ClaimTypes.Role
+    };
+
+    if (oidcOptions.BackchannelHttpHandler != null)
+    {
+        options.BackchannelHttpHandler = oidcOptions.BackchannelHttpHandler;
+    }
+
+    options.Events = new OpenIdConnectEvents
+    {
+        OnRedirectToIdentityProvider = context =>
+        {
+            var (valid, err) = oidcOptions.Validate();
+            if (!oidcOptions.Enabled || !valid)
+            {
+                context.HandleResponse();
+                context.Response.Redirect("/login?error=" + Uri.EscapeDataString(err ?? "OpenID Connect federated login is not enabled."));
+                return Task.CompletedTask;
+            }
+
+            context.ProtocolMessage.RedirectUri = oidcOptions.PublicCallbackUrl.Trim();
+            return Task.CompletedTask;
+        },
+        OnRedirectToIdentityProviderForSignOut = context =>
+        {
+            if (!oidcOptions.Enabled || !oidcOptions.EnableIdpSignOut)
+            {
+                context.HandleResponse();
+                context.Response.Redirect("/login");
+                return Task.CompletedTask;
+            }
+
+            if (Uri.TryCreate(oidcOptions.PublicCallbackUrl.Trim(), UriKind.Absolute, out Uri? callbackUri))
+            {
+                UriBuilder postLogoutBuilder = new(callbackUri.Scheme, callbackUri.Host, callbackUri.Port, oidcOptions.SignedOutCallbackPath);
+                context.ProtocolMessage.PostLogoutRedirectUri = postLogoutBuilder.Uri.ToString();
+            }
+
+            return Task.CompletedTask;
+        },
+        OnMessageReceived = context =>
+        {
+            var (valid, err) = oidcOptions.Validate();
+            if (!oidcOptions.Enabled || !valid)
+            {
+                context.HandleResponse();
+                context.Response.Redirect("/login?error=" + Uri.EscapeDataString(err ?? "OpenID Connect federated login is not enabled."));
+                return Task.CompletedTask;
+            }
+
+            if (!context.Request.IsHttps)
+            {
+                context.HandleResponse();
+                context.Response.Redirect("/login?error=" + Uri.EscapeDataString("OpenID Connect callback requires HTTPS (or a trusted reverse proxy forwarding X-Forwarded-Proto: https)."));
+                return Task.CompletedTask;
+            }
+
+            return Task.CompletedTask;
+        },
+        OnAuthorizationCodeReceived = context =>
+        {
+            if (context.TokenEndpointRequest != null && !string.IsNullOrWhiteSpace(oidcOptions.PublicCallbackUrl))
+            {
+                context.TokenEndpointRequest.RedirectUri = oidcOptions.PublicCallbackUrl.Trim();
+            }
+            return Task.CompletedTask;
+        },
+        OnTokenValidated = context =>
+        {
+            string? alg = context.SecurityToken?.SignatureAlgorithm;
+            if (string.IsNullOrWhiteSpace(alg) || string.Equals(alg, "none", StringComparison.OrdinalIgnoreCase))
+            {
+                context.Fail("Unsigned OIDC tokens are not permitted.");
+                return Task.CompletedTask;
+            }
+
+            string? idTokenSub = context.SecurityToken?.Subject;
+            if (string.IsNullOrWhiteSpace(idTokenSub))
+            {
+                context.Fail("OIDC ID token is missing required 'sub' claim.");
+                return Task.CompletedTask;
+            }
+
+            context.HttpContext.Items["certrobo:validated_token_issuer"] = context.SecurityToken?.Issuer;
+            context.HttpContext.Items["certrobo:validated_token_subject"] = idTokenSub;
+            return Task.CompletedTask;
+        },
+        OnTicketReceived = async context =>
+        {
+            OidcFederationService oidcService = context.HttpContext.RequestServices.GetRequiredService<OidcFederationService>();
+            string? validatedIssuer = context.HttpContext.Items.TryGetValue("certrobo:validated_token_issuer", out object? rawIssuer)
+                ? rawIssuer as string
+                : null;
+            string? validatedSubject = context.HttpContext.Items.TryGetValue("certrobo:validated_token_subject", out object? rawSub)
+                ? rawSub as string
+                : null;
+
+            if (context.Principal == null)
+            {
+                context.HandleResponse();
+                context.Response.Redirect("/login?error=" + Uri.EscapeDataString("OpenID Connect authentication did not produce a valid principal."));
+                return;
+            }
+
+            OidcLoginOutcome outcome = await oidcService.ProcessValidatedOidcLoginAsync(
+                context.Principal,
+                validatedIssuer,
+                validatedSubject,
+                context.HttpContext.RequestAborted);
+
+            if (!outcome.Succeeded || outcome.ApplicationPrincipal == null)
+            {
+                context.HandleResponse();
+                context.Response.Redirect("/login?error=" + Uri.EscapeDataString(outcome.ErrorMessage ?? "OpenID Connect sign-in was denied."));
+                return;
+            }
+
+            context.Principal = outcome.ApplicationPrincipal;
+            context.Properties ??= new AuthenticationProperties();
+            context.Properties.IsPersistent = false;
+            context.Properties.AllowRefresh = false;
+            context.Properties.ExpiresUtc = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(oidcOptions.MaxSessionLifetimeMinutes, 1, 1440));
+            context.ReturnUri = OidcFederationService.NormalizeReturnUrl(context.ReturnUri);
+        },
+        OnRemoteFailure = context =>
+        {
+            string safeMessage = ClassifyOidcFailureMessage(context.Failure);
+            context.HandleResponse();
+            context.Response.Redirect("/login?error=" + Uri.EscapeDataString(safeMessage));
+            return Task.CompletedTask;
+        }
+    };
+}
+
+static string ClassifyOidcFailureMessage(Exception? failure)
+{
+    if (failure == null)
+    {
+        return "OpenID Connect authentication failed or was cancelled.";
+    }
+
+    for (Exception? ex = failure; ex != null; ex = ex.InnerException)
+    {
+        if (ex is SecurityTokenExpiredException or SecurityTokenNoExpirationException or SecurityTokenInvalidLifetimeException)
+        {
+            return "OpenID Connect authentication failed: token has expired or lifetime is invalid.";
+        }
+        if (ex is SecurityTokenInvalidIssuerException)
+        {
+            return "OpenID Connect authentication failed: token issuer is invalid.";
+        }
+        if (ex is SecurityTokenInvalidAudienceException)
+        {
+            return "OpenID Connect authentication failed: token audience is invalid.";
+        }
+        if (ex is SecurityTokenInvalidSignatureException or SecurityTokenNotYetValidException)
+        {
+            return "OpenID Connect authentication failed: token signature or validity check failed.";
+        }
+        if (ex is OpenIdConnectProtocolInvalidNonceException)
+        {
+            return "OpenID Connect authentication failed: invalid or missing nonce.";
+        }
+        if (ex is OpenIdConnectProtocolInvalidStateException)
+        {
+            return "OpenID Connect authentication failed: invalid or expired state parameter.";
+        }
+        if (ex.Message.Contains("Correlation failed", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("state", StringComparison.OrdinalIgnoreCase))
+        {
+            return "OpenID Connect authentication failed: invalid or expired state correlation.";
+        }
+        if (ex.Message.Contains("nonce", StringComparison.OrdinalIgnoreCase))
+        {
+            return "OpenID Connect authentication failed: invalid or missing nonce.";
+        }
+        if (ex.Message.Contains("Unsigned OIDC tokens", StringComparison.OrdinalIgnoreCase))
+        {
+            return "OpenID Connect authentication failed: token signature or validity check failed.";
+        }
+        if (ex.Message.Contains("'sub'", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("IDX21314", StringComparison.OrdinalIgnoreCase))
+        {
+            return "OpenID Connect authentication failed: token is missing a required subject ('sub') claim.";
+        }
+    }
+
+    return "OpenID Connect authentication failed or was rejected by the identity provider.";
 }
 
 public partial class Program { }

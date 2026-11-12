@@ -36,8 +36,12 @@
             <div class="top-row-right">
                 <AuthorizeView>
                     <Authorized>
-                        <span class="user-greeting" title="Signed-in local account">
+                        <span class="user-greeting" title="@(context.User.HasClaim(CertRobo.Services.OidcClaimTypes.AuthMethod, CertRobo.Services.OidcClaimTypes.AuthMethodOidc) ? "Signed-in federated (OIDC) account" : "Signed-in local account")">
                             Signed in as <strong>@context.User.Identity?.Name</strong>
+                            @if (context.User.HasClaim(CertRobo.Services.OidcClaimTypes.AuthMethod, CertRobo.Services.OidcClaimTypes.AuthMethodOidc))
+                            {
+                                <span class="badge bg-info text-dark ms-1">OIDC</span>
+                            }
                         </span>
                         <form method="post" action="/account/logout" class="logout-form">
                             <input type="hidden" name="__RequestVerificationToken" value="@AntiforgeryToken" />

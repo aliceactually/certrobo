@@ -54,10 +54,16 @@ public static class DomainPolicyEvaluator
             return string.Empty;
         }
 
-        string trimmed = input.Trim().TrimEnd('.');
-        if (trimmed == "*")
+        string rawTrimmed = input.Trim();
+        if (rawTrimmed == "*")
         {
             return "*";
+        }
+
+        string trimmed = rawTrimmed.TrimEnd('.');
+        if (trimmed == "*")
+        {
+            return string.Empty;
         }
 
         bool isWildcard = false;
@@ -75,7 +81,7 @@ public static class DomainPolicyEvaluator
 
         try
         {
-            IdnMapping idn = new();
+            IdnMapping idn = new() { UseStd3AsciiRules = true };
             hostPart = idn.GetAscii(hostPart);
         }
         catch (ArgumentException)
@@ -84,6 +90,19 @@ public static class DomainPolicyEvaluator
         }
 
         hostPart = hostPart.ToLowerInvariant();
+        if (hostPart.Contains('*') || Uri.CheckHostName(hostPart) != UriHostNameType.Dns)
+        {
+            return string.Empty;
+        }
+
+        string[] labels = hostPart.Split('.');
+        int minLabels = isWildcard ? 1 : 2;
+        if (labels.Length < minLabels
+            || labels.Any(l => string.IsNullOrWhiteSpace(l) || l.StartsWith('-') || l.EndsWith('-')))
+        {
+            return string.Empty;
+        }
+
         return isWildcard ? "*." + hostPart : hostPart;
     }
 
