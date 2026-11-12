@@ -196,11 +196,11 @@ public class WebUiAndNavigationTests : IDisposable
         Assert.Contains("Import Existing Issuing CA", adminHtml);
         Assert.Contains("Request Issuing CA from External CA", adminHtml);
 
-        PendingCaEnrollmentRecord pending;
+        PendingCaEnrolmentRecord pending;
         using (IServiceScope scope = _factory.Services.CreateScope())
         {
             CertificateAuthorityService ca = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
-            pending = await ca.CreatePendingCaEnrollmentAsync(
+            pending = await ca.CreatePendingCaEnrolmentAsync(
                 "External Issuing CA",
                 "issuing-ca.contoso.com",
                 "US",

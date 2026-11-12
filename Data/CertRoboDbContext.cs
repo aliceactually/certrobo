@@ -117,7 +117,7 @@ public class CaAuthorityRecord
     public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
 }
 
-public enum PendingCaEnrollmentStatus
+public enum PendingCaEnrolmentStatus
 {
     AwaitingSubmission = 0,
     SubmissionUncertain = 1,
@@ -128,7 +128,7 @@ public enum PendingCaEnrollmentStatus
     Cancelled = 6
 }
 
-public class PendingCaEnrollmentRecord
+public class PendingCaEnrolmentRecord
 {
     [Key]
     public int Id { get; set; }
@@ -180,7 +180,7 @@ public class PendingCaEnrollmentRecord
     public long InitialSerialFloor { get; set; } = 1000;
     public long InitialCrlNumberFloor { get; set; } = 0;
 
-    public PendingCaEnrollmentStatus Status { get; set; } = PendingCaEnrollmentStatus.AwaitingSubmission;
+    public PendingCaEnrolmentStatus Status { get; set; } = PendingCaEnrolmentStatus.AwaitingSubmission;
 
     [MaxLength(128)]
     public string? LastOutcomeCategory { get; set; }
@@ -404,7 +404,7 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
     public DbSet<DomainPermissionRule> DomainPermissionRules => Set<DomainPermissionRule>();
     public DbSet<SubjectDefaultsConfig> SubjectDefaults => Set<SubjectDefaultsConfig>();
     public DbSet<CaAuthorityRecord> CaAuthorities => Set<CaAuthorityRecord>();
-    public DbSet<PendingCaEnrollmentRecord> PendingCaEnrollments => Set<PendingCaEnrollmentRecord>();
+    public DbSet<PendingCaEnrolmentRecord> PendingCaEnrolments => Set<PendingCaEnrolmentRecord>();
     public DbSet<AdCsCesConnectorConfig> AdCsCesConfigs => Set<AdCsCesConnectorConfig>();
     public DbSet<IssuedCertificateRecord> IssuedCertificates => Set<IssuedCertificateRecord>();
     public DbSet<PublishedCrlRecord> PublishedCrls => Set<PublishedCrlRecord>();
@@ -432,7 +432,8 @@ public class CertRoboDbContext(DbContextOptions<CertRoboDbContext> options)
         builder.Entity<SerialRevocationEventRecord>()
             .HasIndex(e => new { e.CaAuthorityId, e.CanonicalSerialHex });
 
-        builder.Entity<PendingCaEnrollmentRecord>()
+        builder.Entity<PendingCaEnrolmentRecord>()
+            .ToTable("PendingCaEnrollments")
             .HasIndex(p => p.Status);
     }
 

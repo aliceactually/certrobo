@@ -40,8 +40,8 @@ public class BaselineCryptoAndPolicyTests
             countryCode: "US",
             stateOrProvinceName: "Washington",
             localityName: "Redmond",
-            organization: "Contoso Corporation",
-            organizationalUnit: "IT",
+            organisation: "Contoso Corporation",
+            organisationalUnit: "IT",
             emailAddress: "it@contoso.com");
 
         Pkcs10CertificationRequest decoded = Assert.IsType<Pkcs10CertificationRequest>(

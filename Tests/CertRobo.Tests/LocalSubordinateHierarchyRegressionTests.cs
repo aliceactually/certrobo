@@ -353,7 +353,7 @@ public sealed class LocalSubordinateHierarchyRegressionTests : IDisposable
             extRootReq.CertificateExtensions.Add(X509AuthorityKeyIdentifierExtension.CreateFromSubjectKeyIdentifier(extRootSki));
             using X509Certificate2 extRootCert = extRootReq.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(3650));
 
-            PendingCaEnrollmentRecord pendingExt = await caService.CreatePendingCaEnrollmentAsync(
+            PendingCaEnrolmentRecord pendingExt = await caService.CreatePendingCaEnrolmentAsync(
                 "Externally Signed CA",
                 "ext-issuing.contoso.com",
                 "US", "WA", "Redmond", "Contoso", "PKI",
@@ -383,7 +383,7 @@ public sealed class LocalSubordinateHierarchyRegressionTests : IDisposable
                 null,
                 extRootCert.ExportCertificatePem());
             Assert.True(staged.IsValid, staged.ErrorMessage);
-            CaAuthorityRecord activeExtCa = await caService.ActivatePendingCaEnrollmentAsync(pendingExt.Id);
+            CaAuthorityRecord activeExtCa = await caService.ActivatePendingCaEnrolmentAsync(pendingExt.Id);
 
             // Mark Tier 1, Tier 2, and their issued certificates as expired in SQLite -> Root (#1) now has no unexpired subordinates or leaf certs
             using (IServiceScope scope = postRestartSp.CreateScope())

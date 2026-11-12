@@ -4,10 +4,10 @@ window.theme = {
     STORAGE_KEY: 'certrobo-theme-preference',
 
     /**
-     * Initialize theme based on user preference or OS setting
+     * Initialise theme based on user preference or OS setting
      * @returns {string} The current theme ('light' or 'dark')
      */
-    initialize: function() {
+    initialise: function() {
         const savedTheme = localStorage.getItem(this.STORAGE_KEY);
         
         let theme;
@@ -25,7 +25,7 @@ window.theme = {
     },
 
     /**
-     * Get the user's OS color scheme preference
+     * Get the user's OS colour scheme preference
      * @returns {string} 'dark' or 'light'
      */
     getOSPreference: function() {
@@ -68,7 +68,7 @@ window.theme = {
         const root = document.documentElement;
         root.setAttribute('data-theme', theme);
         localStorage.setItem(this.STORAGE_KEY, theme);
-        this.updateMetaThemeColor(theme);
+        this.updateMetaThemeColour(theme);
     },
 
     /**
@@ -78,21 +78,21 @@ window.theme = {
     applyTheme: function(theme) {
         const root = document.documentElement;
         root.setAttribute('data-theme', theme);
-        this.updateMetaThemeColor(theme);
+        this.updateMetaThemeColour(theme);
     },
 
     /**
      * Update the meta theme-color tag for browser UI
      * @param {string} theme - 'light' or 'dark'
      */
-    updateMetaThemeColor: function(theme) {
-        let metaThemeColor = document.querySelector('meta[name="theme-color"]');
-        if (!metaThemeColor) {
-            metaThemeColor = document.createElement('meta');
-            metaThemeColor.name = 'theme-color';
-            document.head.appendChild(metaThemeColor);
+    updateMetaThemeColour: function(theme) {
+        let metaThemeColour = document.querySelector('meta[name="theme-color"]');
+        if (!metaThemeColour) {
+            metaThemeColour = document.createElement('meta');
+            metaThemeColour.name = 'theme-color';
+            document.head.appendChild(metaThemeColour);
         }
-        metaThemeColor.content = theme === this.DARK ? '#1a1a1a' : '#ffffff';
+        metaThemeColour.content = theme === this.DARK ? '#1a1a1a' : '#ffffff';
     },
 
     /**
@@ -112,8 +112,8 @@ window.theme = {
     }
 };
 
-// Initialize theme on script load
+// Initialise theme on script load
 document.addEventListener('DOMContentLoaded', function() {
-    window.theme.initialize();
+    window.theme.initialise();
     window.theme.watchOSPreference();
 });

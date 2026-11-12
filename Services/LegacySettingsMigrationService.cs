@@ -121,7 +121,7 @@ public sealed class LegacySettingsMigrationService(AccountManagementService acco
                             continue;
                         }
                         raw.Add(rawDomain);
-                        string canon = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(rawDomain);
+                        string canon = DomainPolicyEvaluator.CanonicaliseDomainPatternOrIdentity(rawDomain);
                         if (!string.IsNullOrEmpty(canon))
                         {
                             canonical.Add(canon);

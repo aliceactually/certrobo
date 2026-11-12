@@ -94,7 +94,7 @@ public sealed record CaAuthorityKeyCustodyStatus(
     string? FailureReason);
 
 public sealed record PendingCaKeyCustodyStatus(
-    int PendingEnrollmentId,
+    int PendingEnrolmentId,
     string CaName,
     string EncryptedPrivateKeyPath,
     bool KeyFileExists,
@@ -112,12 +112,12 @@ public sealed record CaKeyCustodyReport(
     bool IsCustodyHealthy,
     bool ActiveAuthorityDecryptable,
     IReadOnlyList<CaAuthorityKeyCustodyStatus> Authorities,
-    PendingCaKeyCustodyStatus? PendingEnrollment);
+    PendingCaKeyCustodyStatus? PendingEnrolment);
 
 public sealed record CaKeyReprotectionResult(
     bool Succeeded,
     int ReprotectedAuthorityCount,
-    bool ReprotectedPendingEnrollment,
+    bool ReprotectedPendingEnrolment,
     IReadOnlyList<int> ReprotectedAuthorityIds,
     string SummaryMessage);
 
@@ -388,9 +388,9 @@ public sealed class CertificateAuthorityService
             .OrderBy(c => c.Id)
             .ToListAsync(cancellationToken);
 
-        PendingCaEnrollmentRecord? pending = await db.PendingCaEnrollments
-            .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
-                     && p.Status != PendingCaEnrollmentStatus.Cancelled)
+        PendingCaEnrolmentRecord? pending = await db.PendingCaEnrolments
+            .Where(p => p.Status != PendingCaEnrolmentStatus.Activated
+                     && p.Status != PendingCaEnrolmentStatus.Cancelled)
             .OrderByDescending(p => p.Id)
             .FirstOrDefaultAsync(cancellationToken);
 
@@ -614,15 +614,15 @@ public sealed class CertificateAuthorityService
                 throw new InvalidOperationException($"CA authority #{targetAuthorityId.Value} was not found.");
             }
 
-            List<PendingCaEnrollmentRecord> pendingEnrollments = targetAuthorityId.HasValue
+            List<PendingCaEnrolmentRecord> pendingEnrolments = targetAuthorityId.HasValue
                 ? []
-                : await db.PendingCaEnrollments
-                    .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
-                             && p.Status != PendingCaEnrollmentStatus.Cancelled)
+                : await db.PendingCaEnrolments
+                    .Where(p => p.Status != PendingCaEnrolmentStatus.Activated
+                             && p.Status != PendingCaEnrolmentStatus.Cancelled)
                     .OrderBy(p => p.Id)
                     .ToListAsync(cancellationToken);
 
-            if (authorities.Count == 0 && pendingEnrollments.Count == 0)
+            if (authorities.Count == 0 && pendingEnrolments.Count == 0)
             {
                 throw new InvalidOperationException("No stored CA keys were found to re-protect.");
             }
@@ -658,8 +658,8 @@ public sealed class CertificateAuthorityService
                 authoritiesToReprotect.Add((authority, matchedSource));
             }
 
-            List<(PendingCaEnrollmentRecord Pending, string SourcePassphrase)> pendingToReprotect = [];
-            foreach (PendingCaEnrollmentRecord pending in pendingEnrollments)
+            List<(PendingCaEnrolmentRecord Pending, string SourcePassphrase)> pendingToReprotect = [];
+            foreach (PendingCaEnrolmentRecord pending in pendingEnrolments)
             {
                 if (!File.Exists(pending.EncryptedPrivateKeyPath))
                 {
@@ -701,7 +701,7 @@ public sealed class CertificateAuthorityService
             List<string> createdKeyPaths = [];
             List<string> createdBackupPaths = [];
             List<(CaAuthorityRecord Authority, string NewKeyPath)> stagedAuthorityUpdates = [];
-            List<(PendingCaEnrollmentRecord Pending, string NewKeyPath)> stagedPendingUpdates = [];
+            List<(PendingCaEnrolmentRecord Pending, string NewKeyPath)> stagedPendingUpdates = [];
 
             try
             {
@@ -745,7 +745,7 @@ public sealed class CertificateAuthorityService
                     stagedAuthorityUpdates.Add((authority, newKeyFilePath));
                 }
 
-                foreach ((PendingCaEnrollmentRecord pending, string srcPass) in pendingToReprotect)
+                foreach ((PendingCaEnrolmentRecord pending, string srcPass) in pendingToReprotect)
                 {
                     string backupFileName = $"{Path.GetFileName(pending.EncryptedPrivateKeyPath)}.bak-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}"[..Math.Min(96, Path.GetFileName(pending.EncryptedPrivateKeyPath).Length + 28)];
                     string backupFilePath = Path.Combine(backupDir, backupFileName);
@@ -800,7 +800,7 @@ public sealed class CertificateAuthorityService
                 {
                     authority.EncryptedPrivateKeyPath = newKeyPath;
                 }
-                foreach ((PendingCaEnrollmentRecord pending, string newKeyPath) in stagedPendingUpdates)
+                foreach ((PendingCaEnrolmentRecord pending, string newKeyPath) in stagedPendingUpdates)
                 {
                     pending.EncryptedPrivateKeyPath = newKeyPath;
                 }
@@ -827,7 +827,7 @@ public sealed class CertificateAuthorityService
             }
 
             bool allNowUnified = authorities.All(a => TryVerifyAuthorityKey(a, targetStoragePassphrase, out _))
-                && pendingEnrollments.All(p => TryVerifyPendingKey(p, targetStoragePassphrase, out _));
+                && pendingEnrolments.All(p => TryVerifyPendingKey(p, targetStoragePassphrase, out _));
             if (allNowUnified && !_isExplicitlyLocked)
             {
                 _runtimeUnlockedPassphrase = targetStoragePassphrase;
@@ -871,26 +871,26 @@ public sealed class CertificateAuthorityService
             .ToListAsync(cancellationToken);
     }
 
-    public async Task<PendingCaEnrollmentRecord?> GetActivePendingEnrollmentAsync(CancellationToken cancellationToken = default)
+    public async Task<PendingCaEnrolmentRecord?> GetActivePendingEnrolmentAsync(CancellationToken cancellationToken = default)
     {
         await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
         await db.EnsureSchemaUpgradedAsync(cancellationToken);
-        return await db.PendingCaEnrollments
-            .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
-                     && p.Status != PendingCaEnrollmentStatus.Cancelled)
+        return await db.PendingCaEnrolments
+            .Where(p => p.Status != PendingCaEnrolmentStatus.Activated
+                     && p.Status != PendingCaEnrolmentStatus.Cancelled)
             .OrderByDescending(p => p.Id)
             .FirstOrDefaultAsync(cancellationToken);
     }
 
-    public async Task<PendingCaEnrollmentRecord?> GetPendingEnrollmentByIdAsync(int id, CancellationToken cancellationToken = default)
+    public async Task<PendingCaEnrolmentRecord?> GetPendingEnrolmentByIdAsync(int id, CancellationToken cancellationToken = default)
     {
         await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
         await db.EnsureSchemaUpgradedAsync(cancellationToken);
-        return await db.PendingCaEnrollments
+        return await db.PendingCaEnrolments
             .FirstOrDefaultAsync(p => p.Id == id, cancellationToken);
     }
 
-    public static CaActivationPreviewSummary? DeserializeActivationSummary(PendingCaEnrollmentRecord? pending)
+    public static CaActivationPreviewSummary? DeserialiseActivationSummary(PendingCaEnrolmentRecord? pending)
     {
         if (pending == null || string.IsNullOrWhiteSpace(pending.ActivationSummaryJson))
         {
@@ -912,14 +912,14 @@ public sealed class CertificateAuthorityService
     /// generates a signed PKCS #10 CSR requesting CA capabilities (BasicConstraints CA=true, KeyCertSign|CrlSign|DigitalSignature),
     /// and persists the pending request across restarts without affecting any active CA.
     /// </summary>
-    public async Task<PendingCaEnrollmentRecord> CreatePendingCaEnrollmentAsync(
+    public async Task<PendingCaEnrolmentRecord> CreatePendingCaEnrolmentAsync(
         string caName,
         string subjectCommonName,
         string country,
         string stateOrProvince,
         string locality,
-        string organization,
-        string organizationalUnit,
+        string organisation,
+        string organisationalUnit,
         CertificateKeyFamily keyFamily,
         int keyBits,
         string passphrase,
@@ -957,9 +957,9 @@ public sealed class CertificateAuthorityService
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
             await db.EnsureSchemaUpgradedAsync(cancellationToken);
 
-            PendingCaEnrollmentRecord? existingPending = await db.PendingCaEnrollments
-                .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
-                         && p.Status != PendingCaEnrollmentStatus.Cancelled)
+            PendingCaEnrolmentRecord? existingPending = await db.PendingCaEnrolments
+                .Where(p => p.Status != PendingCaEnrolmentStatus.Activated
+                         && p.Status != PendingCaEnrolmentStatus.Cancelled)
                 .OrderByDescending(p => p.Id)
                 .FirstOrDefaultAsync(cancellationToken);
 
@@ -982,8 +982,8 @@ public sealed class CertificateAuthorityService
                 country,
                 stateOrProvince,
                 locality,
-                organization,
-                organizationalUnit,
+                organisation,
+                organisationalUnit,
                 emailAddress);
 
             CertificateRequest certReq = CreateCertificateRequestForKey(subjectDn, subjectKey);
@@ -1032,7 +1032,7 @@ public sealed class CertificateAuthorityService
             string keyFilePath = Path.Combine(_options.StorageDirectory, keyFileName);
             await BackupRestoreService.WritePrivateFileBytesAsync(keyFilePath, encryptedPkcs8, cancellationToken);
 
-            PendingCaEnrollmentRecord record = new()
+            PendingCaEnrolmentRecord record = new()
             {
                 CaName = caName.Trim(),
                 SubjectCommonName = subjectCommonName.Trim(),
@@ -1048,13 +1048,13 @@ public sealed class CertificateAuthorityService
                 AuthorityIssuerCertUrl = string.IsNullOrWhiteSpace(authorityIssuerCertUrl) ? "/ca.crt" : authorityIssuerCertUrl.Trim(),
                 InitialSerialFloor = Math.Max(1000L, initialSerialFloor),
                 InitialCrlNumberFloor = Math.Max(0L, initialCrlNumberFloor),
-                Status = PendingCaEnrollmentStatus.AwaitingSubmission,
+                Status = PendingCaEnrolmentStatus.AwaitingSubmission,
                 LastOutcomeCategory = "None",
                 StatusDetailMessage = "PKCS #10 CSR generated locally. Download the CSR for external signing or submit to Microsoft AD CS CES.",
                 CreatedAtUtc = DateTimeOffset.UtcNow
             };
 
-            db.PendingCaEnrollments.Add(record);
+            db.PendingCaEnrolments.Add(record);
             await db.SaveChangesAsync(cancellationToken);
 
             _runtimeUnlockedPassphrase = passphrase;
@@ -1069,18 +1069,18 @@ public sealed class CertificateAuthorityService
     }
 
     /// <summary>
-    /// Returns the persisted PKCS #10 CSR for the current (or specified) pending CA enrollment request
+    /// Returns the persisted PKCS #10 CSR for the current (or specified) pending CA enrolment request
     /// without regenerating the key or exporting private key material.
     /// </summary>
     public async Task<(int PendingId, string FileName, string CsrPem)?> GetPendingCaCsrForDownloadAsync(
         int? pendingId = null,
         CancellationToken cancellationToken = default)
     {
-        PendingCaEnrollmentRecord? pending = pendingId.HasValue
-            ? await GetPendingEnrollmentByIdAsync(pendingId.Value, cancellationToken)
-            : await GetActivePendingEnrollmentAsync(cancellationToken);
+        PendingCaEnrolmentRecord? pending = pendingId.HasValue
+            ? await GetPendingEnrolmentByIdAsync(pendingId.Value, cancellationToken)
+            : await GetActivePendingEnrolmentAsync(cancellationToken);
 
-        if (pending == null || pending.Status == PendingCaEnrollmentStatus.Cancelled)
+        if (pending == null || pending.Status == PendingCaEnrolmentStatus.Cancelled)
         {
             return null;
         }
@@ -1102,7 +1102,7 @@ public sealed class CertificateAuthorityService
     /// On failure, preserves the pending request and any active CA intact.
     /// </summary>
     public async Task<CaBundleValidationResult> ValidateAndStageSignedCaBundleAsync(
-        int pendingEnrollmentId,
+        int pendingEnrolmentId,
         byte[]? signedCertBytes,
         string? signedCertText,
         byte[]? chainCertBytes = null,
@@ -1116,15 +1116,15 @@ public sealed class CertificateAuthorityService
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
             await db.EnsureSchemaUpgradedAsync(cancellationToken);
 
-            PendingCaEnrollmentRecord? pending = await db.PendingCaEnrollments
-                .FirstOrDefaultAsync(p => p.Id == pendingEnrollmentId, cancellationToken);
+            PendingCaEnrolmentRecord? pending = await db.PendingCaEnrolments
+                .FirstOrDefaultAsync(p => p.Id == pendingEnrolmentId, cancellationToken);
 
             if (pending == null)
             {
                 return new(false, "Pending CA enrolment request was not found.", null, null, null);
             }
 
-            if (pending.Status == PendingCaEnrollmentStatus.Activated || pending.Status == PendingCaEnrollmentStatus.Cancelled)
+            if (pending.Status == PendingCaEnrolmentStatus.Activated || pending.Status == PendingCaEnrolmentStatus.Cancelled)
             {
                 return new(false, $"Pending CA enrolment request is already in terminal state '{pending.Status}'.", null, null, null);
             }
@@ -1231,7 +1231,7 @@ public sealed class CertificateAuthorityService
                             }
                         }
 
-                        pending.Status = PendingCaEnrollmentStatus.Failed;
+                        pending.Status = PendingCaEnrolmentStatus.Failed;
                         pending.LastOutcomeCategory = "ValidationFailure";
                         pending.StatusDetailMessage = validation.ErrorMessage ?? "Certificate or chain validation failed.";
                         pending.ValidatedIssuerCertificatePem = null;
@@ -1247,7 +1247,7 @@ public sealed class CertificateAuthorityService
                     pending.ValidatedIssuerCertificatePem = validation.ValidatedIssuerCertificatePem;
                     pending.ValidatedChainCertificatesPem = validation.ValidatedOrderedChainPem;
                     pending.ActivationSummaryJson = JsonSerializer.Serialize(validation.Summary);
-                    pending.Status = PendingCaEnrollmentStatus.ReadyForActivation;
+                    pending.Status = PendingCaEnrolmentStatus.ReadyForActivation;
                     pending.LastOutcomeCategory = "Validated";
                     pending.StatusDetailMessage = "Signed CA certificate and chain validated. Review the activation summary and activate when ready.";
                     pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
@@ -1260,7 +1260,7 @@ public sealed class CertificateAuthorityService
                 }
                 catch (ArgumentException ex)
                 {
-                    pending.Status = PendingCaEnrollmentStatus.Failed;
+                    pending.Status = PendingCaEnrolmentStatus.Failed;
                     pending.LastOutcomeCategory = "ValidationFailure";
                     pending.StatusDetailMessage = ex.Message;
                     pending.ValidatedIssuerCertificatePem = null;
@@ -1284,11 +1284,11 @@ public sealed class CertificateAuthorityService
     }
 
     /// <summary>
-    /// Atomically activates a validated pending external CA enrollment request, preserving any previous CA authority
+    /// Atomically activates a validated pending external CA enrolment request, preserving any previous CA authority
     /// and its historical issued certificate records, and publishes initial CRL #1 for the new issuing CA.
     /// </summary>
-    public async Task<CaAuthorityRecord> ActivatePendingCaEnrollmentAsync(
-        int pendingEnrollmentId,
+    public async Task<CaAuthorityRecord> ActivatePendingCaEnrolmentAsync(
+        int pendingEnrolmentId,
         string? passphraseOverride = null,
         CancellationToken cancellationToken = default)
     {
@@ -1298,11 +1298,11 @@ public sealed class CertificateAuthorityService
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
             await db.EnsureSchemaUpgradedAsync(cancellationToken);
 
-            PendingCaEnrollmentRecord? pending = await db.PendingCaEnrollments
-                .FirstOrDefaultAsync(p => p.Id == pendingEnrollmentId, cancellationToken)
+            PendingCaEnrolmentRecord? pending = await db.PendingCaEnrolments
+                .FirstOrDefaultAsync(p => p.Id == pendingEnrolmentId, cancellationToken)
                 ?? throw new InvalidOperationException("Pending CA enrolment request was not found.");
 
-            if (pending.Status != PendingCaEnrollmentStatus.ReadyForActivation
+            if (pending.Status != PendingCaEnrolmentStatus.ReadyForActivation
                 || string.IsNullOrWhiteSpace(pending.ValidatedIssuerCertificatePem)
                 || string.IsNullOrWhiteSpace(pending.ValidatedChainCertificatesPem))
             {
@@ -1343,7 +1343,7 @@ public sealed class CertificateAuthorityService
 
                 if (!recheck.IsValid || recheck.Summary == null)
                 {
-                    pending.Status = PendingCaEnrollmentStatus.Failed;
+                    pending.Status = PendingCaEnrolmentStatus.Failed;
                     pending.LastOutcomeCategory = "ValidationFailure";
                     pending.StatusDetailMessage = recheck.ErrorMessage ?? "Activation validation check failed.";
                     await db.SaveChangesAsync(cancellationToken);
@@ -1389,7 +1389,7 @@ public sealed class CertificateAuthorityService
                 ApplyStableIssuerPublicationUrls(newAuthority);
                 await db.SaveChangesAsync(cancellationToken);
 
-                pending.Status = PendingCaEnrollmentStatus.Activated;
+                pending.Status = PendingCaEnrolmentStatus.Activated;
                 pending.LastOutcomeCategory = "Activated";
                 pending.StatusDetailMessage = $"Activated as Issuing CA #{newAuthority.Id}.";
                 pending.ActivatedAtUtc = DateTimeOffset.UtcNow;
@@ -1419,11 +1419,11 @@ public sealed class CertificateAuthorityService
     }
 
     /// <summary>
-    /// Cancels an unactivated pending external CA enrollment request without affecting any active CA.
+    /// Cancels an unactivated pending external CA enrolment request without affecting any active CA.
     /// Removes the unactivated pending private key file if it is not referenced by any activated authority.
     /// </summary>
-    public async Task<(bool Succeeded, string? ErrorMessage)> CancelPendingCaEnrollmentAsync(
-        int pendingEnrollmentId,
+    public async Task<(bool Succeeded, string? ErrorMessage)> CancelPendingCaEnrolmentAsync(
+        int pendingEnrolmentId,
         CancellationToken cancellationToken = default)
     {
         IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
@@ -1432,20 +1432,20 @@ public sealed class CertificateAuthorityService
             await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
             await db.EnsureSchemaUpgradedAsync(cancellationToken);
 
-            PendingCaEnrollmentRecord? pending = await db.PendingCaEnrollments
-                .FirstOrDefaultAsync(p => p.Id == pendingEnrollmentId, cancellationToken);
+            PendingCaEnrolmentRecord? pending = await db.PendingCaEnrolments
+                .FirstOrDefaultAsync(p => p.Id == pendingEnrolmentId, cancellationToken);
 
             if (pending == null)
             {
                 return (false, "Pending CA enrolment request was not found.");
             }
 
-            if (pending.Status == PendingCaEnrollmentStatus.Activated)
+            if (pending.Status == PendingCaEnrolmentStatus.Activated)
             {
                 return (false, "Cannot cancel an enrolment request that has already been activated.");
             }
 
-            pending.Status = PendingCaEnrollmentStatus.Cancelled;
+            pending.Status = PendingCaEnrolmentStatus.Cancelled;
             pending.LastOutcomeCategory = "Cancelled";
             pending.StatusDetailMessage = "Cancelled by administrator.";
             pending.ValidatedIssuerCertificatePem = null;
@@ -1574,8 +1574,8 @@ public sealed class CertificateAuthorityService
         string country,
         string stateOrProvince,
         string locality,
-        string organization,
-        string organizationalUnit,
+        string organisation,
+        string organisationalUnit,
         CertificateKeyFamily keyFamily,
         int keyBits,
         int validityDays,
@@ -1600,7 +1600,7 @@ public sealed class CertificateAuthorityService
         IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
-            await ThrowIfUnfinishedPendingEnrollmentExistsAsync(cancellationToken);
+            await ThrowIfUnfinishedPendingEnrolmentExistsAsync(cancellationToken);
             CaAuthorityRecord? effectiveParent = null;
             long? allocatedParentSerial = null;
             byte[]? allocatedParentSerialBytes = null;
@@ -1636,7 +1636,7 @@ public sealed class CertificateAuthorityService
 
             using AsymmetricAlgorithm subjectKey = CreateDotNetAsymmetricKey(keyFamily, keyBits);
             X500DistinguishedName subjectDn = BuildX500DistinguishedName(
-                subjectCommonName, country, stateOrProvince, locality, organization, organizationalUnit);
+                subjectCommonName, country, stateOrProvince, locality, organisation, organisationalUnit);
 
             CertificateRequest certReq = CreateCertificateRequestForKey(subjectDn, subjectKey);
 
@@ -1747,7 +1747,7 @@ public sealed class CertificateAuthorityService
             using (issuedCaCert)
             {
                 bool validatedIsIntermediate;
-                string normalizedChainPem;
+                string normalisedChainPem;
                 try
                 {
                     ValidateCaCertificateAndKeyMatch(
@@ -1755,7 +1755,7 @@ public sealed class CertificateAuthorityService
                         subjectKey,
                         string.IsNullOrWhiteSpace(chainPem) ? null : chainPem,
                         out validatedIsIntermediate,
-                        out normalizedChainPem);
+                        out normalisedChainPem);
                 }
                 catch (ArgumentException ex)
                 {
@@ -1792,7 +1792,7 @@ public sealed class CertificateAuthorityService
                     caName,
                     validatedIsIntermediate,
                     certPem,
-                    normalizedChainPem,
+                    normalisedChainPem,
                     encryptedPkcs8,
                     passphrase,
                     crlDistributionPointUrl,
@@ -1848,7 +1848,7 @@ public sealed class CertificateAuthorityService
         IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
-            await ThrowIfUnfinishedPendingEnrollmentExistsAsync(cancellationToken);
+            await ThrowIfUnfinishedPendingEnrolmentExistsAsync(cancellationToken);
             List<X509Certificate2> parsedIssuerCerts = CaChainAndConstraintValidator.ParseCertificatesFromAnyInput(
                 null,
                 issuerCertPem,
@@ -1862,7 +1862,7 @@ public sealed class CertificateAuthorityService
             using X509Certificate2 cert = parsedIssuerCerts[0];
             using AsymmetricAlgorithm key = ImportPrivateKeyFromPem(cert, privateKeyPem, inputKeyPassphrase);
 
-            ValidateCaCertificateAndKeyMatch(cert, key, chainCertsPem, out bool isIntermediate, out string normalizedChainPem);
+            ValidateCaCertificateAndKeyMatch(cert, key, chainCertsPem, out bool isIntermediate, out string normalisedChainPem);
 
             await using (CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken))
             {
@@ -1886,7 +1886,7 @@ public sealed class CertificateAuthorityService
                 caName,
                 isIntermediate,
                 cert.ExportCertificatePem() + "\n",
-                normalizedChainPem,
+                normalisedChainPem,
                 encryptedPkcs8,
                 storagePassphrase,
                 crlDistributionPointUrl,
@@ -1935,7 +1935,7 @@ public sealed class CertificateAuthorityService
         IAsyncDisposable lifecycleLock = await AcquireInstanceLifecycleLockAsync(cancellationToken);
         try
         {
-            await ThrowIfUnfinishedPendingEnrollmentExistsAsync(cancellationToken);
+            await ThrowIfUnfinishedPendingEnrolmentExistsAsync(cancellationToken);
             X509Certificate2Collection collection;
             try
             {
@@ -1976,15 +1976,15 @@ public sealed class CertificateAuthorityService
                 X509Certificate2 caCertWithKey;
                 if (!string.IsNullOrWhiteSpace(selectedCertificateThumbprintSha256))
                 {
-                    string normalizedSelectedThumbprint = selectedCertificateThumbprintSha256
+                    string normalisedSelectedThumbprint = selectedCertificateThumbprintSha256
                         .Trim()
                         .Replace(":", "")
                         .Replace(" ", "");
                     caCertWithKey = distinctCertsWithKey.FirstOrDefault(c =>
                             c.GetCertHashString(HashAlgorithmName.SHA256)
-                                .Equals(normalizedSelectedThumbprint, StringComparison.OrdinalIgnoreCase))
+                                .Equals(normalisedSelectedThumbprint, StringComparison.OrdinalIgnoreCase))
                         ?? throw new ArgumentException(
-                            $"PKCS#12 archive does not contain a private-key certificate matching SHA-256 thumbprint '{normalizedSelectedThumbprint}'.",
+                            $"PKCS#12 archive does not contain a private-key certificate matching SHA-256 thumbprint '{normalisedSelectedThumbprint}'.",
                             nameof(selectedCertificateThumbprintSha256));
                 }
                 else if (distinctCertsWithKey.Count > 1)
@@ -2022,7 +2022,7 @@ public sealed class CertificateAuthorityService
                     key,
                     extraChainBuilder.ToString(),
                     out bool isIntermediate,
-                    out string normalizedChainPem);
+                    out string normalisedChainPem);
 
                 await using (CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken))
                 {
@@ -2046,7 +2046,7 @@ public sealed class CertificateAuthorityService
                     caName,
                     isIntermediate,
                     caCertWithKey.ExportCertificatePem() + "\n",
-                    normalizedChainPem,
+                    normalisedChainPem,
                     encryptedPkcs8,
                     storagePassphrase,
                     crlDistributionPointUrl,
@@ -2070,7 +2070,7 @@ public sealed class CertificateAuthorityService
     }
 
     /// <summary>
-    /// Evaluates user/policy authorization and CSR validity at the service boundary, allocates a unique positive serial,
+    /// Evaluates user/policy authorisation and CSR validity at the service boundary, allocates a unique positive serial,
     /// signs a leaf certificate using the active CA, validates the resulting certificate and chain, and records it in the ledger.
     /// </summary>
     public async Task<IssuanceOutcome> IssueCertificateFromCsrAsync(
@@ -2478,14 +2478,14 @@ public sealed class CertificateAuthorityService
                 }
 
                 if (certRecord.CaAuthorityId.HasValue
-                    && TryNormalizePositiveSerialHex(certRecord.SerialNumberHex, out BigInteger certSerialBi, out string canonicalCertHex, out _))
+                    && TryNormalisePositiveSerialHex(certRecord.SerialNumberHex, out BigInteger certSerialBi, out string canonicalCertHex, out _))
                 {
                     List<IssuedCertificateRecord> sameIssuerRecords = await db.IssuedCertificates
                         .Where(c => c.CaAuthorityId == certRecord.CaAuthorityId.Value && c.Id != certRecord.Id)
                         .ToListAsync(cancellationToken);
 
                     List<IssuedCertificateRecord> siblingSerialRecords = sameIssuerRecords
-                        .Where(c => TryNormalizePositiveSerialHex(c.SerialNumberHex, out BigInteger otherBi, out _, out _)
+                        .Where(c => TryNormalisePositiveSerialHex(c.SerialNumberHex, out BigInteger otherBi, out _, out _)
                                  && otherBi.Equals(certSerialBi))
                         .ToList();
 
@@ -2564,7 +2564,7 @@ public sealed class CertificateAuthorityService
                 $"Unsupported X.509 CRL revocation reason code '{revocationReasonCode}'.");
         }
 
-        if (!TryNormalizePositiveSerialHex(
+        if (!TryNormalisePositiveSerialHex(
                 serialNumberHex,
                 out BigInteger serialBigInt,
                 out string canonicalHex,
@@ -2607,7 +2607,7 @@ public sealed class CertificateAuthorityService
                 .ToListAsync(cancellationToken);
 
             List<IssuedCertificateRecord> matchingRecords = caCertificates
-                .Where(c => TryNormalizePositiveSerialHex(c.SerialNumberHex, out BigInteger existingBi, out _, out _)
+                .Where(c => TryNormalisePositiveSerialHex(c.SerialNumberHex, out BigInteger existingBi, out _, out _)
                          && existingBi.Equals(serialBigInt))
                 .ToList();
 
@@ -2682,7 +2682,7 @@ public sealed class CertificateAuthorityService
                             {
                                 using X509Certificate2 subCert = X509Certificate2.CreateFromPem(sub.IssuerCertificatePem);
                                 string subSerialHex = Convert.ToHexString(subCert.GetSerialNumber().Reverse().ToArray());
-                                if (TryNormalizePositiveSerialHex(subSerialHex, out BigInteger subBi, out _, out _)
+                                if (TryNormalisePositiveSerialHex(subSerialHex, out BigInteger subBi, out _, out _)
                                     && subBi.Equals(serialBigInt))
                                 {
                                     matchedLocalSubordinate = sub;
@@ -2828,7 +2828,7 @@ public sealed class CertificateAuthorityService
             await using var tx = await crlDb.Database.BeginTransactionAsync(cancellationToken);
             PublishedCrlRecord publishedCrl = await GenerateAndPersistCrlInternalAsync(crlDb, ca, passphrase, cancellationToken);
 
-            if (!TryNormalizePositiveSerialHex(certRecord.SerialNumberHex, out BigInteger expectedSerialBi, out _, out _))
+            if (!TryNormalisePositiveSerialHex(certRecord.SerialNumberHex, out BigInteger expectedSerialBi, out _, out _))
             {
                 throw new InvalidOperationException(
                     $"Revoked serial '{certRecord.SerialNumberHex}' is not a valid positive integer.");
@@ -3156,7 +3156,7 @@ public sealed class CertificateAuthorityService
         {
             List<IssuedCertificateRecord> groupRecords = group.ToList();
             List<SerialRevocationEventRecord>? authorityEvents = eventsByAuthority.GetValueOrDefault(group.Key);
-            var (canonicalEntries, conflictingIds, _) = AnalyzeRevokedSerialGroups(groupRecords, now, authorityEvents);
+            var (canonicalEntries, conflictingIds, _) = AnalyseRevokedSerialGroups(groupRecords, now, authorityEvents);
             foreach (int conflictId in conflictingIds)
             {
                 unpublishedIds.Add(conflictId);
@@ -3225,7 +3225,7 @@ public sealed class CertificateAuthorityService
             return false;
         }
 
-        var (canonicalEntries, conflictingIds, _) = AnalyzeRevokedSerialGroups(
+        var (canonicalEntries, conflictingIds, _) = AnalyseRevokedSerialGroups(
             revokedCertificates,
             DateTimeOffset.UtcNow,
             serialEvents);
@@ -3285,7 +3285,7 @@ public sealed class CertificateAuthorityService
         return false;
     }
 
-    public static bool TryNormalizePositiveSerialHex(
+    public static bool TryNormalisePositiveSerialHex(
         string? rawHex,
         out BigInteger serialBigInt,
         out string canonicalHex,
@@ -3391,7 +3391,7 @@ public sealed class CertificateAuthorityService
         IReadOnlyList<CanonicalCrlRevocationEntry> Entries,
         HashSet<int> ConflictingRecordIds,
         IReadOnlyList<string> ConflictMessages)
-        AnalyzeRevokedSerialGroups(
+        AnalyseRevokedSerialGroups(
             IReadOnlyList<IssuedCertificateRecord> revokedCerts,
             DateTimeOffset fallbackNow,
             IReadOnlyList<SerialRevocationEventRecord>? serialEvents = null)
@@ -3405,7 +3405,7 @@ public sealed class CertificateAuthorityService
         {
             foreach (SerialRevocationEventRecord evt in serialEvents.OrderBy(e => e.Id))
             {
-                if (TryNormalizePositiveSerialHex(evt.CanonicalSerialHex, out _, out string normEvtHex, out _))
+                if (TryNormalisePositiveSerialHex(evt.CanonicalSerialHex, out _, out string normEvtHex, out _))
                 {
                     latestEventBySerial[normEvtHex] = evt;
                 }
@@ -3417,7 +3417,7 @@ public sealed class CertificateAuthorityService
 
         foreach (IssuedCertificateRecord revoked in revokedCerts)
         {
-            if (!TryNormalizePositiveSerialHex(
+            if (!TryNormalisePositiveSerialHex(
                     revoked.SerialNumberHex,
                     out BigInteger serialBigInt,
                     out string canonicalHex,
@@ -3679,13 +3679,13 @@ public sealed class CertificateAuthorityService
         }
     }
 
-    private async Task ThrowIfUnfinishedPendingEnrollmentExistsAsync(CancellationToken cancellationToken)
+    private async Task ThrowIfUnfinishedPendingEnrolmentExistsAsync(CancellationToken cancellationToken)
     {
         await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
         await db.EnsureSchemaUpgradedAsync(cancellationToken);
-        PendingCaEnrollmentRecord? pending = await db.PendingCaEnrollments
-            .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
-                     && p.Status != PendingCaEnrollmentStatus.Cancelled)
+        PendingCaEnrolmentRecord? pending = await db.PendingCaEnrolments
+            .Where(p => p.Status != PendingCaEnrolmentStatus.Activated
+                     && p.Status != PendingCaEnrolmentStatus.Cancelled)
             .OrderByDescending(p => p.Id)
             .FirstOrDefaultAsync(cancellationToken);
         if (pending != null)
@@ -3765,7 +3765,7 @@ public sealed class CertificateAuthorityService
             .OrderBy(e => e.Id)
             .ToListAsync(cancellationToken);
 
-        var (canonicalRevocationEntries, _, conflictMessages) = AnalyzeRevokedSerialGroups(revokedCerts, now, serialEvents);
+        var (canonicalRevocationEntries, _, conflictMessages) = AnalyseRevokedSerialGroups(revokedCerts, now, serialEvents);
         if (conflictMessages.Count > 0)
         {
             throw new InvalidOperationException(string.Join(" ", conflictMessages));
@@ -3781,7 +3781,7 @@ public sealed class CertificateAuthorityService
 
             foreach (IssuedCertificateRecord issuedRow in issuedForAuthority)
             {
-                if (TryNormalizePositiveSerialHex(issuedRow.SerialNumberHex, out _, out string issuedCanonicalHex, out _)
+                if (TryNormalisePositiveSerialHex(issuedRow.SerialNumberHex, out _, out string issuedCanonicalHex, out _)
                     && entryByCanonicalHex.TryGetValue(issuedCanonicalHex, out CanonicalCrlRevocationEntry? revEntry))
                 {
                     issuedRow.Status = IssuanceStatus.Revoked;
@@ -4145,7 +4145,7 @@ public sealed class CertificateAuthorityService
                 maxCounterFloor = rec.SerialNumberValue;
             }
 
-            if (TryNormalizePositiveSerialHex(rec.SerialNumberHex, out BigInteger bi, out string canonHex, out _))
+            if (TryNormalisePositiveSerialHex(rec.SerialNumberHex, out BigInteger bi, out string canonHex, out _))
             {
                 usedSerialValues.Add(bi);
                 usedCanonicalHexes.Add(canonHex);
@@ -4158,7 +4158,7 @@ public sealed class CertificateAuthorityService
 
         foreach (SerialRevocationEventRecord evt in existingEvents)
         {
-            if (TryNormalizePositiveSerialHex(evt.CanonicalSerialHex, out BigInteger bi, out string canonHex, out _))
+            if (TryNormalisePositiveSerialHex(evt.CanonicalSerialHex, out BigInteger bi, out string canonHex, out _))
             {
                 usedSerialValues.Add(bi);
                 usedCanonicalHexes.Add(canonHex);
@@ -4175,7 +4175,7 @@ public sealed class CertificateAuthorityService
             {
                 using X509Certificate2 subCert = X509Certificate2.CreateFromPem(sub.IssuerCertificatePem);
                 string subSerialHex = Convert.ToHexString(subCert.GetSerialNumber().Reverse().ToArray());
-                if (TryNormalizePositiveSerialHex(subSerialHex, out BigInteger bi, out string canonHex, out _))
+                if (TryNormalisePositiveSerialHex(subSerialHex, out BigInteger bi, out string canonHex, out _))
                 {
                     usedSerialValues.Add(bi);
                     usedCanonicalHexes.Add(canonHex);
@@ -4195,7 +4195,7 @@ public sealed class CertificateAuthorityService
         {
             byte[] serialBytes = AllocatePositiveSerialBytes(nextSerial);
             string serialHex = Convert.ToHexString(serialBytes);
-            if (TryNormalizePositiveSerialHex(serialHex, out BigInteger candidateBi, out string canonicalHex, out _)
+            if (TryNormalisePositiveSerialHex(serialHex, out BigInteger candidateBi, out string canonicalHex, out _)
                 && !usedSerialValues.Contains(candidateBi)
                 && !usedCanonicalHexes.Contains(canonicalHex))
             {
@@ -4569,7 +4569,7 @@ public sealed class CertificateAuthorityService
         AsymmetricAlgorithm privateKey,
         string? chainCertsPem,
         out bool isIntermediate,
-        out string normalizedChainPem)
+        out string normalisedChainPem)
     {
         // Verify CA BasicConstraints
         X509BasicConstraintsExtension? bc = caCert.Extensions.OfType<X509BasicConstraintsExtension>().FirstOrDefault()
@@ -4619,7 +4619,7 @@ public sealed class CertificateAuthorityService
 
         bool isSelfSignedRoot = CaChainAndConstraintValidator.IsSelfSignedCryptographically(caCert);
         isIntermediate = !isSelfSignedRoot;
-        normalizedChainPem = string.Empty;
+        normalisedChainPem = string.Empty;
 
         if (isIntermediate)
         {
@@ -4678,7 +4678,7 @@ public sealed class CertificateAuthorityService
                     ordered.AppendLine(orderedChain[i].ExportCertificatePem().Trim());
                 }
 
-                normalizedChainPem = ordered.ToString();
+                normalisedChainPem = ordered.ToString();
             }
             finally
             {
@@ -4789,13 +4789,13 @@ public sealed class CertificateAuthorityService
             .OrderBy(c => c.Id)
             .ToListAsync(cancellationToken);
 
-        List<PendingCaEnrollmentRecord> pendingEnrollments = await db.PendingCaEnrollments
-            .Where(p => p.Status != PendingCaEnrollmentStatus.Activated
-                     && p.Status != PendingCaEnrollmentStatus.Cancelled)
+        List<PendingCaEnrolmentRecord> pendingEnrolments = await db.PendingCaEnrolments
+            .Where(p => p.Status != PendingCaEnrolmentStatus.Activated
+                     && p.Status != PendingCaEnrolmentStatus.Cancelled)
             .OrderBy(p => p.Id)
             .ToListAsync(cancellationToken);
 
-        EvictStaleRuntimeUnlockIfIncompatible(authorities, pendingEnrollments);
+        EvictStaleRuntimeUnlockIfIncompatible(authorities, pendingEnrolments);
 
         if (!requireExistingKeyForUnlock
             && !_isExplicitlyLocked
@@ -4806,7 +4806,7 @@ public sealed class CertificateAuthorityService
                 "The supplied CA storage passphrase does not match the currently unlocked runtime CA passphrase. All active and historical CA keys must share one storage passphrase.");
         }
 
-        if (requireExistingKeyForUnlock && authorities.Count == 0 && pendingEnrollments.Count == 0)
+        if (requireExistingKeyForUnlock && authorities.Count == 0 && pendingEnrolments.Count == 0)
         {
             throw new InvalidOperationException(
                 "No CA signing key is configured to unlock. Provision, import, or request a CA first.");
@@ -4848,7 +4848,7 @@ public sealed class CertificateAuthorityService
             }
         }
 
-        foreach (PendingCaEnrollmentRecord pending in pendingEnrollments)
+        foreach (PendingCaEnrolmentRecord pending in pendingEnrolments)
         {
             if (!TryVerifyPendingKey(pending, candidatePassphrase, out string? pendingErr))
             {
@@ -4860,7 +4860,7 @@ public sealed class CertificateAuthorityService
 
     private void EvictStaleRuntimeUnlockIfIncompatible(
         IReadOnlyCollection<CaAuthorityRecord> authorities,
-        IReadOnlyCollection<PendingCaEnrollmentRecord> pendingEnrollments)
+        IReadOnlyCollection<PendingCaEnrolmentRecord> pendingEnrolments)
     {
         if (string.IsNullOrEmpty(_runtimeUnlockedPassphrase))
         {
@@ -4887,7 +4887,7 @@ public sealed class CertificateAuthorityService
         bool anyAuthorityIncompatible = authorities.Any(a =>
             File.Exists(a.EncryptedPrivateKeyPath)
             && !TryVerifyAuthorityKey(a, _runtimeUnlockedPassphrase, out _));
-        bool anyPendingIncompatible = pendingEnrollments.Any(p =>
+        bool anyPendingIncompatible = pendingEnrolments.Any(p =>
             File.Exists(p.EncryptedPrivateKeyPath)
             && !TryVerifyPendingKey(p, _runtimeUnlockedPassphrase, out _));
 
@@ -4937,7 +4937,7 @@ public sealed class CertificateAuthorityService
     }
 
     private static bool TryVerifyPendingKey(
-        PendingCaEnrollmentRecord pending,
+        PendingCaEnrolmentRecord pending,
         string? passphrase,
         out string? error)
     {
@@ -5149,8 +5149,8 @@ public sealed class CertificateAuthorityService
         string country,
         string stateOrProvince,
         string locality,
-        string organization,
-        string organizationalUnit,
+        string organisation,
+        string organisationalUnit,
         string? emailAddress = null)
     {
         X500DistinguishedNameBuilder builder = new();
@@ -5166,13 +5166,13 @@ public sealed class CertificateAuthorityService
         {
             builder.AddLocalityName(locality.Trim());
         }
-        if (!string.IsNullOrWhiteSpace(organization))
+        if (!string.IsNullOrWhiteSpace(organisation))
         {
-            builder.AddOrganizationName(organization.Trim());
+            builder.AddOrganizationName(organisation.Trim());
         }
-        if (!string.IsNullOrWhiteSpace(organizationalUnit))
+        if (!string.IsNullOrWhiteSpace(organisationalUnit))
         {
-            builder.AddOrganizationalUnitName(organizationalUnit.Trim());
+            builder.AddOrganizationalUnitName(organisationalUnit.Trim());
         }
         if (!string.IsNullOrWhiteSpace(commonName))
         {

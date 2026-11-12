@@ -101,7 +101,7 @@ public sealed class AccountManagementService(
 
             if (!string.IsNullOrWhiteSpace(initialAllowedDomainPattern))
             {
-                string canonical = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(initialAllowedDomainPattern);
+                string canonical = DomainPolicyEvaluator.CanonicaliseDomainPatternOrIdentity(initialAllowedDomainPattern);
                 if (!string.IsNullOrEmpty(canonical))
                 {
                     dbContext.DomainPermissionRules.Add(new DomainPermissionRule
@@ -162,7 +162,7 @@ public sealed class AccountManagementService(
         {
             foreach (string rawPattern in allowedDomainPatterns)
             {
-                string canonical = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(rawPattern);
+                string canonical = DomainPolicyEvaluator.CanonicaliseDomainPatternOrIdentity(rawPattern);
                 if (!string.IsNullOrEmpty(canonical))
                 {
                     dbContext.DomainPermissionRules.Add(new DomainPermissionRule
@@ -253,7 +253,7 @@ public sealed class AccountManagementService(
             return (false, "SubjectType must be 'User' or 'Role'.");
         }
 
-        string canonicalPattern = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(domainPattern);
+        string canonicalPattern = DomainPolicyEvaluator.CanonicaliseDomainPatternOrIdentity(domainPattern);
         if (string.IsNullOrEmpty(canonicalPattern))
         {
             return (false, "Domain pattern is invalid.");

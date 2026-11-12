@@ -117,9 +117,9 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
             _ => new HttpResponseMessage(HttpStatusCode.Unauthorized));
         AdCsCesEnrollmentService ces = CreateCesService(transport);
         await ConfigureUsernamePasswordAsync(ces);
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync();
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync();
 
-        AdCsCesOperationResult submitted = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        AdCsCesOperationResult submitted = await ces.SubmitPendingEnrolmentAsync(pending.Id);
         Assert.True(submitted.Succeeded);
         Assert.Equal(AdCsCesOutcomeKind.PendingApproval, submitted.OutcomeKind);
         Assert.Equal("65", submitted.UpstreamRequestId);
@@ -139,7 +139,7 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
 
         AdCsCesOperationResult failedQuery = await restartedCes.QueryPendingStatusAsync(pending.Id);
         Assert.Equal(AdCsCesOutcomeKind.AuthenticationFailure, failedQuery.OutcomeKind);
-        Assert.Equal(PendingCaEnrollmentStatus.AwaitingApproval, failedQuery.UpdatedRecord!.Status);
+        Assert.Equal(PendingCaEnrolmentStatus.AwaitingApproval, failedQuery.UpdatedRecord!.Status);
         Assert.Equal(3, transport.Requests.Count);
     }
 
@@ -155,7 +155,7 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
     public async Task IssuedCesResponse_UsesSharedValidator_AndBecomesReadyForActivation(
         string charset, bool includeBom, bool includeCharset)
     {
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync();
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync();
         using RSA rootKey = RSA.Create(2048);
         using X509Certificate2 rootCert = CreateRoot(rootKey, pathLen: 1);
         using X509Certificate2 issuingCert = SignPending(pending.CsrPem, rootCert, rootKey);
@@ -182,15 +182,15 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
         AdCsCesEnrollmentService ces = CreateCesService(transport);
         await ConfigureUsernamePasswordAsync(ces, rootCert.ExportCertificatePem());
 
-        AdCsCesOperationResult result = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        AdCsCesOperationResult result = await ces.SubmitPendingEnrolmentAsync(pending.Id);
         Assert.True(result.Succeeded, result.SummaryMessage);
         Assert.Equal(AdCsCesOutcomeKind.IssuedReadyForActivation, result.OutcomeKind);
-        Assert.Equal(PendingCaEnrollmentStatus.ReadyForActivation, result.UpdatedRecord!.Status);
-        Assert.NotNull(CertificateAuthorityService.DeserializeActivationSummary(result.UpdatedRecord));
+        Assert.Equal(PendingCaEnrolmentStatus.ReadyForActivation, result.UpdatedRecord!.Status);
+        Assert.NotNull(CertificateAuthorityService.DeserialiseActivationSummary(result.UpdatedRecord));
 
         CaAuthorityRecord activated = await _services
             .GetRequiredService<CertificateAuthorityService>()
-            .ActivatePendingCaEnrollmentAsync(pending.Id);
+            .ActivatePendingCaEnrolmentAsync(pending.Id);
         Assert.True(activated.IsIntermediate);
         Assert.Contains(rootCert.ExportCertificatePem().Trim(), activated.ChainCertificatesPem);
     }
@@ -201,11 +201,11 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
         ScriptedTransport transport = new(_ => SoapResponse(PendingRstr("72", "Taken Under Submission")));
         AdCsCesEnrollmentService ces = CreateCesService(transport);
         await ConfigureUsernamePasswordAsync(ces);
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync();
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync();
 
         AdCsCesOperationResult[] outcomes = await Task.WhenAll(
-            ces.SubmitPendingEnrollmentAsync(pending.Id),
-            ces.SubmitPendingEnrollmentAsync(pending.Id));
+            ces.SubmitPendingEnrolmentAsync(pending.Id),
+            ces.SubmitPendingEnrolmentAsync(pending.Id));
 
         Assert.Single(transport.Requests);
         Assert.All(outcomes, outcome => Assert.Equal(AdCsCesOutcomeKind.PendingApproval, outcome.OutcomeKind));
@@ -220,7 +220,7 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
     public async Task ConnectorDistinguishesDenialAuthenticationTlsAndAmbiguousSubmission_WithoutBlindRetry()
     {
         // Denial SOAP fault
-        PendingCaEnrollmentRecord deniedPending = await CreatePendingAsync();
+        PendingCaEnrolmentRecord deniedPending = await CreatePendingAsync();
         ScriptedTransport deniedTransport = new(_ => SoapResponse(
             SoapFault(
                 "The requested certificate template is not supported by this CA.",
@@ -230,45 +230,45 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
             HttpStatusCode.InternalServerError));
         AdCsCesEnrollmentService deniedCes = CreateCesService(deniedTransport);
         await ConfigureUsernamePasswordAsync(deniedCes);
-        AdCsCesOperationResult denied = await deniedCes.SubmitPendingEnrollmentAsync(deniedPending.Id);
+        AdCsCesOperationResult denied = await deniedCes.SubmitPendingEnrolmentAsync(deniedPending.Id);
         Assert.Equal(AdCsCesOutcomeKind.Denied, denied.OutcomeKind);
         Assert.Equal("91", denied.UpstreamRequestId);
         await _services.GetRequiredService<CertificateAuthorityService>()
-            .CancelPendingCaEnrollmentAsync(deniedPending.Id);
+            .CancelPendingCaEnrolmentAsync(deniedPending.Id);
 
         // HTTP authentication failure
-        PendingCaEnrollmentRecord authPending = await CreatePendingAsync();
+        PendingCaEnrolmentRecord authPending = await CreatePendingAsync();
         ScriptedTransport authTransport = new(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized));
         AdCsCesEnrollmentService authCes = CreateCesService(authTransport);
         await ConfigureUsernamePasswordAsync(authCes);
-        AdCsCesOperationResult auth = await authCes.SubmitPendingEnrollmentAsync(authPending.Id);
+        AdCsCesOperationResult auth = await authCes.SubmitPendingEnrolmentAsync(authPending.Id);
         Assert.Equal(AdCsCesOutcomeKind.AuthenticationFailure, auth.OutcomeKind);
         await _services.GetRequiredService<CertificateAuthorityService>()
-            .CancelPendingCaEnrollmentAsync(authPending.Id);
+            .CancelPendingCaEnrolmentAsync(authPending.Id);
 
         // TLS certificate validation failure
-        PendingCaEnrollmentRecord tlsPending = await CreatePendingAsync();
+        PendingCaEnrolmentRecord tlsPending = await CreatePendingAsync();
         ScriptedTransport tlsTransport = new(_ =>
             throw new HttpRequestException("TLS failed", new AuthenticationException("Untrusted test root")));
         AdCsCesEnrollmentService tlsCes = CreateCesService(tlsTransport);
         await ConfigureUsernamePasswordAsync(tlsCes);
-        AdCsCesOperationResult tls = await tlsCes.SubmitPendingEnrollmentAsync(tlsPending.Id);
+        AdCsCesOperationResult tls = await tlsCes.SubmitPendingEnrolmentAsync(tlsPending.Id);
         Assert.Equal(AdCsCesOutcomeKind.TlsOrTrustFailure, tls.OutcomeKind);
         Assert.DoesNotContain("Secret1234", tls.SummaryMessage);
         await _services.GetRequiredService<CertificateAuthorityService>()
-            .CancelPendingCaEnrollmentAsync(tlsPending.Id);
+            .CancelPendingCaEnrolmentAsync(tlsPending.Id);
 
-        // Connection loss after content serialization: uncertain, and a normal retry is blocked.
-        PendingCaEnrollmentRecord uncertainPending = await CreatePendingAsync();
+        // Connection loss after content serialisation: uncertain, and a normal retry is blocked.
+        PendingCaEnrolmentRecord uncertainPending = await CreatePendingAsync();
         ScriptedTransport uncertainTransport = new(_ =>
             throw new HttpRequestException(HttpRequestError.ConnectionError, "Connection dropped after send"));
         AdCsCesEnrollmentService uncertainCes = CreateCesService(uncertainTransport);
         await ConfigureUsernamePasswordAsync(uncertainCes);
-        AdCsCesOperationResult uncertain = await uncertainCes.SubmitPendingEnrollmentAsync(uncertainPending.Id);
+        AdCsCesOperationResult uncertain = await uncertainCes.SubmitPendingEnrolmentAsync(uncertainPending.Id);
         Assert.Equal(AdCsCesOutcomeKind.SubmissionUncertain, uncertain.OutcomeKind);
         int requestCountAfterFailure = uncertainTransport.Requests.Count;
 
-        AdCsCesOperationResult blockedRetry = await uncertainCes.SubmitPendingEnrollmentAsync(uncertainPending.Id);
+        AdCsCesOperationResult blockedRetry = await uncertainCes.SubmitPendingEnrolmentAsync(uncertainPending.Id);
         Assert.Equal(AdCsCesOutcomeKind.SubmissionUncertain, blockedRetry.OutcomeKind);
         Assert.Equal(requestCountAfterFailure, uncertainTransport.Requests.Count);
     }
@@ -276,12 +276,12 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
     [Fact]
     public async Task ManualCompletionRemainsUsableAfterConnectorFailure()
     {
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync();
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync();
         ScriptedTransport transport = new(_ => new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
         AdCsCesEnrollmentService ces = CreateCesService(transport);
         await ConfigureUsernamePasswordAsync(ces);
 
-        AdCsCesOperationResult connectorFailure = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        AdCsCesOperationResult connectorFailure = await ces.SubmitPendingEnrolmentAsync(pending.Id);
         Assert.Equal(AdCsCesOutcomeKind.SubmissionUncertain, connectorFailure.OutcomeKind);
 
         using RSA rootKey = RSA.Create(2048);
@@ -301,7 +301,7 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
     [Fact]
     public async Task IssuedCertificateWithoutChain_IsRetained_AndCannotBeBlindlyResubmitted()
     {
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync();
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync();
         using RSA rootKey = RSA.Create(2048);
         using X509Certificate2 rootCert = CreateRoot(rootKey, pathLen: 1);
         using X509Certificate2 issuingCert = SignPending(pending.CsrPem, rootCert, rootKey);
@@ -311,12 +311,12 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
         AdCsCesEnrollmentService ces = CreateCesService(transport);
         await ConfigureUsernamePasswordAsync(ces);
 
-        AdCsCesOperationResult issuedWithoutChain = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        AdCsCesOperationResult issuedWithoutChain = await ces.SubmitPendingEnrolmentAsync(pending.Id);
         Assert.Equal(AdCsCesOutcomeKind.IssuedAwaitingChainAnchor, issuedWithoutChain.OutcomeKind);
         Assert.NotNull(issuedWithoutChain.UpdatedRecord!.ReceivedIssuerCertificatePem);
         Assert.Single(transport.Requests);
 
-        AdCsCesOperationResult blocked = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        AdCsCesOperationResult blocked = await ces.SubmitPendingEnrolmentAsync(pending.Id);
         Assert.Equal(AdCsCesOutcomeKind.IssuedAwaitingChainAnchor, blocked.OutcomeKind);
         Assert.Single(transport.Requests);
 
@@ -426,7 +426,7 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
     public async Task Review_UnreadableOrAmbiguousInitialResponses_PreserveSubmissionUncertain_AndBlockDuplicateSubmit(
         string ambiguousBody)
     {
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync();
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync();
         ScriptedTransport transport = new(
             _ => new HttpResponseMessage(HttpStatusCode.OK)
             {
@@ -440,27 +440,27 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
         AdCsCesEnrollmentService ces = CreateCesService(transport);
         await ConfigureUsernamePasswordAsync(ces);
 
-        AdCsCesOperationResult first = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        AdCsCesOperationResult first = await ces.SubmitPendingEnrolmentAsync(pending.Id);
         Assert.False(first.Succeeded);
         Assert.Equal(AdCsCesOutcomeKind.SubmissionUncertain, first.OutcomeKind);
-        Assert.Equal(PendingCaEnrollmentStatus.SubmissionUncertain, first.UpdatedRecord!.Status);
+        Assert.Equal(PendingCaEnrolmentStatus.SubmissionUncertain, first.UpdatedRecord!.Status);
         Assert.Single(transport.Requests);
 
         // Second ordinary submit without forceResubmit must not send the CSR a second time
-        AdCsCesOperationResult second = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        AdCsCesOperationResult second = await ces.SubmitPendingEnrolmentAsync(pending.Id);
         Assert.False(second.Succeeded);
         Assert.Equal(AdCsCesOutcomeKind.SubmissionUncertain, second.OutcomeKind);
-        Assert.Equal(PendingCaEnrollmentStatus.SubmissionUncertain, second.UpdatedRecord!.Status);
+        Assert.Equal(PendingCaEnrolmentStatus.SubmissionUncertain, second.UpdatedRecord!.Status);
         Assert.Single(transport.Requests);
 
         await _services.GetRequiredService<CertificateAuthorityService>()
-            .CancelPendingCaEnrollmentAsync(pending.Id);
+            .CancelPendingCaEnrolmentAsync(pending.Id);
     }
 
     [Fact]
     public async Task Review_UnreadableStatusQueryResponses_KeepAwaitingApproval_AndBlockOrdinaryResubmit()
     {
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync();
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync();
         ScriptedTransport transport = new(
             _ => SoapResponse(PendingRstr("99", "Taken Under Submission")),
             _ => new HttpResponseMessage(HttpStatusCode.OK)
@@ -471,17 +471,17 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
         AdCsCesEnrollmentService ces = CreateCesService(transport);
         await ConfigureUsernamePasswordAsync(ces);
 
-        AdCsCesOperationResult submitted = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        AdCsCesOperationResult submitted = await ces.SubmitPendingEnrolmentAsync(pending.Id);
         Assert.Equal(AdCsCesOutcomeKind.PendingApproval, submitted.OutcomeKind);
-        Assert.Equal(PendingCaEnrollmentStatus.AwaitingApproval, submitted.UpdatedRecord!.Status);
+        Assert.Equal(PendingCaEnrolmentStatus.AwaitingApproval, submitted.UpdatedRecord!.Status);
         Assert.Single(transport.Requests);
 
         AdCsCesOperationResult queryFailed = await ces.QueryPendingStatusAsync(pending.Id);
         Assert.False(queryFailed.Succeeded);
-        Assert.Equal(PendingCaEnrollmentStatus.AwaitingApproval, queryFailed.UpdatedRecord!.Status);
+        Assert.Equal(PendingCaEnrolmentStatus.AwaitingApproval, queryFailed.UpdatedRecord!.Status);
         Assert.Equal(2, transport.Requests.Count);
 
-        AdCsCesOperationResult blockedSubmit = await ces.SubmitPendingEnrollmentAsync(pending.Id);
+        AdCsCesOperationResult blockedSubmit = await ces.SubmitPendingEnrolmentAsync(pending.Id);
         Assert.False(blockedSubmit.Succeeded);
         Assert.Equal(AdCsCesOutcomeKind.PendingApproval, blockedSubmit.OutcomeKind);
         Assert.Equal(2, transport.Requests.Count);
@@ -517,10 +517,10 @@ public sealed class AdCsCesEnrollmentTests : IDisposable
         Assert.True(ok, error);
     }
 
-    private async Task<PendingCaEnrollmentRecord> CreatePendingAsync()
+    private async Task<PendingCaEnrolmentRecord> CreatePendingAsync()
     {
         return await _services.GetRequiredService<CertificateAuthorityService>()
-            .CreatePendingCaEnrollmentAsync(
+            .CreatePendingCaEnrolmentAsync(
                 "CES External Issuing CA",
                 "ces-issuing.contoso.com",
                 "US",

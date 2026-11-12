@@ -36,7 +36,7 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
         string passFile = Path.Combine(_tempRoot, "cli-issue.pass");
         await File.WriteAllTextAsync(passFile, secret + "\n");
 
-        // 1. Bootstrap admin & initialize Root CA + Subordinate Intermediate CA via CLI, verifying concise default output (#24)
+        // 1. Bootstrap admin & initialise Root CA + Subordinate Intermediate CA via CLI, verifying concise default output (#24)
         var (bootExit, bootStdout, bootStderr) = await RunCliAsync(dbPath, caDir, passFile, ["--bootstrap-admin", "admin", "AdminSecret!2026", "*"]);
         Assert.Equal(0, bootExit);
         Assert.Contains("Bootstrapped initial administrator 'admin'", bootStdout);
@@ -50,14 +50,14 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
             ["--init-ca", "Contoso Root CA", "root-ca.contoso.com", "RSA-2048", "3650", "http://pki.contoso.com/ca.crl", "http://pki.contoso.com/ca.crt", "--verbose"]);
         Assert.Equal(0, rootExit);
         Assert.Contains("Executed DbCommand", rootStdout);
-        Assert.Contains("Initialized and activated Root CA", rootStdout);
+        Assert.Contains("Initialised and activated Root CA", rootStdout);
         Assert.DoesNotContain(secret, rootStdout);
 
         var (subExit, subStdout, _) = await RunCliAsync(
             dbPath, caDir, passFile,
             ["--init-ca", "Contoso Issuing Intermediate CA", "issuing-ca.contoso.com", "ECDSA-256", "1825", "http://pki.contoso.com/ca.crl", "http://pki.contoso.com/ca.crt", "--subordinate"]);
         Assert.Equal(0, subExit);
-        Assert.Contains("Initialized and activated Intermediate CA", subStdout);
+        Assert.Contains("Initialised and activated Intermediate CA", subStdout);
         Assert.DoesNotContain("Executed DbCommand", subStdout);
 
         // 2. Generate CSR for leaf1
@@ -133,7 +133,7 @@ public sealed class CliUiAndFilePermissionsTests : IDisposable
             Assert.Equal(1001L, (await caService.GetActiveAuthorityAsync())!.LastAllocatedSerial);
 
             // 2d. Concurrent retry/issuance race for a fresh CSR (leaf-concurrent.contoso.com):
-            //     Multiple concurrent --issue-csr / recoverExistingForSameCsr calls for the same CSR must serialize
+            //     Multiple concurrent --issue-csr / recoverExistingForSameCsr calls for the same CSR must serialise
             //     under the lifecycle lock and produce only ONE issued certificate (serial 1002), never duplicates.
             UserManager<ApplicationUser> userMgr = checkSp.GetRequiredService<UserManager<ApplicationUser>>();
             ApplicationUser admin = (await userMgr.FindByNameAsync("admin"))!;

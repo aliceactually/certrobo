@@ -1740,7 +1740,7 @@ public static class CaChainAndConstraintValidator
         {
             return (
                 false,
-                $"Certificate '{certSubject}' contains a malformed internationalized dNSName subtree '{rawDns}' in NameConstraints.",
+                $"Certificate '{certSubject}' contains a malformed internationalised dNSName subtree '{rawDns}' in NameConstraints.",
                 null);
         }
 
@@ -1834,7 +1834,7 @@ public static class CaChainAndConstraintValidator
         List<string> diffs = [];
         CertificationRequestInfo info = csr.GetCertificationRequestInfo();
 
-        // 1. Compare Subject DN (canonicalized RDN comparison)
+        // 1. Compare Subject DN (canonicalised RDN comparison)
         BcX509Certificate bcCert = new X509CertificateParser().ReadCertificate(issuedCaCert.RawData);
         if (!info.Subject.Equivalent(bcCert.SubjectDN, inOrder: false))
         {

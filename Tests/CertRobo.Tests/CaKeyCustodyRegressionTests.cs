@@ -41,7 +41,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
         CertificateAuthorityService caService = sp.GetRequiredService<CertificateAuthorityService>();
         ApplicationUser admin = await BootstrapAdminAsync(sp);
 
-        // 1. First-CA mismatches (create, PEM import, PKCS#12 import, pending external enrollment) against configured persistent custody (secretA)
+        // 1. First-CA mismatches (create, PEM import, PKCS#12 import, pending external enrolment) against configured persistent custody (secretA)
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             caService.CreateSelfSignedOrIntermediateCaAsync(
                 "Mismatched First Root CA",
@@ -76,7 +76,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
                 storagePassphrase: secretB));
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            caService.CreatePendingCaEnrollmentAsync(
+            caService.CreatePendingCaEnrolmentAsync(
                 "Mismatched First Pending CA",
                 "mismatched-pending.contoso.com",
                 "US", "WA", "Redmond", "Contoso", "PKI",
@@ -86,7 +86,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
 
         Assert.Null(await caService.GetActiveAuthorityAsync());
         Assert.Empty(await caService.ListAuthoritiesAsync());
-        Assert.Null(await caService.GetActivePendingEnrollmentAsync());
+        Assert.Null(await caService.GetActivePendingEnrolmentAsync());
         Assert.True(!Directory.Exists(caDir) || Directory.GetFiles(caDir, "*.p8.enc").Length == 0);
 
         // 2. Create valid Issuer A using configured secretA and issue an unexpired leaf certificate
@@ -147,7 +147,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
                 storagePassphrase: secretB));
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            caService.CreatePendingCaEnrollmentAsync(
+            caService.CreatePendingCaEnrolmentAsync(
                 "Mismatched Pending Replacement",
                 "pending-b.contoso.com",
                 "US", "WA", "Redmond", "Contoso", "PKI",
@@ -324,7 +324,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
             Assert.True(issuedB.Succeeded, issuedB.ErrorMessage);
 
             // 3. Replace with Externally Signed Issuing CA C using the same sharedCustodySecret
-            PendingCaEnrollmentRecord pendingC = await caService.CreatePendingCaEnrollmentAsync(
+            PendingCaEnrolmentRecord pendingC = await caService.CreatePendingCaEnrolmentAsync(
                 "Contoso External Issuing CA C",
                 "ext-c.contoso.com",
                 "US", "WA", "Redmond", "Contoso", "PKI",
@@ -365,7 +365,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
                 extParentCert.ExportCertificatePem());
             Assert.True(staged.IsValid, staged.ErrorMessage);
 
-            CaAuthorityRecord issuerC = await caService.ActivatePendingCaEnrollmentAsync(pendingC.Id);
+            CaAuthorityRecord issuerC = await caService.ActivatePendingCaEnrolmentAsync(pendingC.Id);
             issuerCId = issuerC.Id;
         }
 
@@ -692,7 +692,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
             issuerId = issuer.Id;
             originalIssuerKeyPath = issuer.EncryptedPrivateKeyPath;
 
-            PendingCaEnrollmentRecord pending = await caService.CreatePendingCaEnrollmentAsync(
+            PendingCaEnrolmentRecord pending = await caService.CreatePendingCaEnrolmentAsync(
                 "Legacy Pending CA",
                 "legacy-pending.contoso.com",
                 "US", "WA", "Redmond", "Contoso", "PKI",
@@ -779,7 +779,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
             Assert.True(!Directory.Exists(backupDir) || Directory.GetFiles(backupDir).Length == 0);
 
             CaAuthorityRecord unchangedIssuer = (await faultCa.GetAuthorityByIdAsync(issuerId))!;
-            PendingCaEnrollmentRecord unchangedPending = (await faultCa.GetPendingEnrollmentByIdAsync(pendingId))!;
+            PendingCaEnrolmentRecord unchangedPending = (await faultCa.GetPendingEnrolmentByIdAsync(pendingId))!;
             Assert.Equal(originalIssuerKeyPath, unchangedIssuer.EncryptedPrivateKeyPath);
             Assert.Equal(originalPendingKeyPath, unchangedPending.EncryptedPrivateKeyPath);
         }
@@ -804,7 +804,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
     }
 
     [Fact]
-    public async Task CrossProcessLifecycleLock_SerializesConcurrentCliAndServiceOperations_And_EvictsStaleInMemoryPassphrase()
+    public async Task CrossProcessLifecycleLock_SerialisesConcurrentCliAndServiceOperations_And_EvictsStaleInMemoryPassphrase()
     {
         const string secretA = "CrossProcessSecret-Alpha!2026";
         const string secretB = "CrossProcessSecret-Bravo!2026";
@@ -832,7 +832,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
             365,
             secretA);
 
-        PendingCaEnrollmentRecord pending = await runningServiceCa.CreatePendingCaEnrollmentAsync(
+        PendingCaEnrolmentRecord pending = await runningServiceCa.CreatePendingCaEnrolmentAsync(
             "Cross-Process Pending CA",
             "cross-proc-pending.contoso.com",
             "US", "WA", "Redmond", "Contoso", "PKI",
@@ -859,8 +859,8 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
         }
 
         // 2. When Process 1 holds the cross-process lock briefly (350ms) and then releases it,
-        //    a concurrent child process running --backup and a concurrent CancelPendingCaEnrollmentAsync
-        //    are serialized so the backup archive never captures a pending DB record whose key file was deleted.
+        //    a concurrent child process running --backup and a concurrent CancelPendingCaEnrolmentAsync
+        //    are serialised so the backup archive never captures a pending DB record whose key file was deleted.
         Task<(int ExitCode, string CombinedOutput)> delayedBackupTask;
         await using (IAsyncDisposable briefLock = await CertificateAuthorityService.AcquireLifecycleLockAsync(caDir))
         {
@@ -873,7 +873,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
         }
 
         Task<(bool Succeeded, string? ErrorMessage)> concurrentCancelTask =
-            runningServiceCa.CancelPendingCaEnrollmentAsync(pending.Id);
+            runningServiceCa.CancelPendingCaEnrolmentAsync(pending.Id);
 
         var (backupExit, backupOut) = await delayedBackupTask;
         var (cancelOk, cancelErr) = await concurrentCancelTask;
@@ -896,10 +896,10 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
             CertificateAuthorityService restoredCaService = restoredSp.GetRequiredService<CertificateAuthorityService>();
             CaKeyCustodyReport restoredReport = await restoredCaService.InspectKeyCustodyAsync();
             Assert.True(restoredReport.IsCustodyHealthy);
-            if (restoredReport.PendingEnrollment != null)
+            if (restoredReport.PendingEnrolment != null)
             {
-                Assert.True(restoredReport.PendingEnrollment.KeyFileExists);
-                Assert.True(restoredReport.PendingEnrollment.CanDecryptWithConfiguredPassphrase);
+                Assert.True(restoredReport.PendingEnrolment.KeyFileExists);
+                Assert.True(restoredReport.PendingEnrolment.CanDecryptWithConfiguredPassphrase);
             }
         }
 
@@ -994,7 +994,7 @@ public sealed class CaKeyCustodyRegressionTests : IDisposable
             ["systemctl:stop:certrobo.service", "certrobo:--backup"],
             backupFailCalls);
 
-        // 3. Expected initial --verify-ca-custody failure (nonzero) does NOT abort migration;
+        // 3. Expected initial --verify-ca-custody failure (non-zero) does NOT abort migration;
         //    successful --reprotect-ca-keys and post-migration --verify-ca-custody proceed to start the service
         var (happyExit, happyOut, happyCalls) = await RunStubbedRecoveryShellBlockAsync(
             recoveryBlock,

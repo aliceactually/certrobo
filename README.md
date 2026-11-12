@@ -8,7 +8,7 @@ It manages local users, roles, and domain issuance policies internally, protects
 
 * Linux (Rocky Linux 10 / RHEL 10 or Ubuntu 26.04 LTS, `x86_64` or `aarch64`), macOS, or Windows Server
   *(Note: Linux deployment procedures below were live-verified on Rocky Linux 10.2 and Ubuntu 26.04.1 LTS on both `x86_64` and `aarch64`; standalone Debian was not separately validated.)*
-* ASP.NET Core 10.0 Runtime (`aspnetcore-runtime-10.0`) and ICU globalization libraries (`libicu` on Rocky/RHEL; installed automatically as a runtime dependency on Ubuntu 26.04)
+* ASP.NET Core 10.0 Runtime (`aspnetcore-runtime-10.0`) and ICU globalisation libraries (`libicu` on Rocky/RHEL; installed automatically as a runtime dependency on Ubuntu 26.04)
 * Reverse proxy such as `nginx` (recommended for Linux production deployments)
 
 ---
@@ -23,7 +23,7 @@ It manages local users, roles, and domain issuance policies internally, protects
 sudo dnf install -y aspnetcore-runtime-10.0 libicu nginx unzip openssl policycoreutils-python-utils
 ```
 
-> **Note:** On minimal Enterprise Linux installations, `libicu` is not installed by default and is required by .NET for internationalization and IDN/RegionInfo validation.
+> **Note:** On minimal Enterprise Linux installations, `libicu` is not installed by default and is required by .NET for internationalisation and IDN/RegionInfo validation.
 
 **Ubuntu 26.04 LTS (`x86_64` or `aarch64`):**
 
@@ -159,10 +159,10 @@ You can complete initial setup either through the browser (`/setup` and `/admin`
 # 1. Optional: inspect legacy settings.xml and import <Defaults> without guessing AD accounts
 sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --inspect-legacy-settings static/settings.xml.example --import-defaults'
 
-# 2. Bootstrap the initial Administrator account (locks /setup afterward)
+# 2. Bootstrap the initial Administrator account (locks /setup afterwards)
 sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --bootstrap-admin admin "<StrongAdminPassword>" "*"'
 
-# 3. Initialize a Root CA and Subordinate Issuing Intermediate CA
+# 3. Initialise a Root CA and Subordinate Issuing Intermediate CA
 sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --init-ca "Contoso Root CA" "root-ca.contoso.com" RSA-4096 3650 "http://pki.contoso.com/ca.crl" "http://pki.contoso.com/ca.crt"'
 sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --init-ca "Contoso Issuing Intermediate CA" "issuing-ca.contoso.com" ECDSA-384 1825 "http://pki.contoso.com/ca.crl" "http://pki.contoso.com/ca.crt" --subordinate'
 ```
@@ -208,18 +208,18 @@ Returned permissions are authoritative. CertRobo enforces supported DNS NameCons
 
 #### Optional Microsoft AD CS CES Connector
 
-The pending-request view can optionally submit the same local CSR to Microsoft **Certificate Enrollment Web Service (CES)** using HTTPS and [MS-WSTEP]. It does not use LDAP, domain membership, GPO, `/certsrv` page scraping, or Windows-only enrollment APIs.
+The pending-request view can optionally submit the same local CSR to Microsoft **Certificate Enrollment Web Service (CES)** using HTTPS and [MS-WSTEP]. It does not use LDAP, domain membership, GPO, `/certsrv` page scraping, or Windows-only enrolment APIs.
 
 Configure the direct `service.svc/CES` HTTPS endpoint, certificate template name, bounded timeout, and one authentication mode:
 
-* **Username/password**: sent as a WS-Security UsernameToken (`PasswordText`) inside the SOAP 1.2 request, not HTTP Basic authentication. The account needs only the CA/template enrollment permissions required by your policy.
+* **Username/password**: sent as a WS-Security UsernameToken (`PasswordText`) inside the SOAP 1.2 request, not HTTP Basic authentication. The account needs only the CA/template enrolment permissions required by your policy.
 * **TLS client certificate**: optional; configure a matching certificate/private key accepted by the CES endpoint.
 
 Connector passwords/client private keys are encrypted with the persisted ASP.NET Core Data Protection key ring. `CERTROBO_ADCS_CES_PASSWORD` may supply a runtime-only username/password secret instead. For an internally issued CES HTTPS certificate, configure the internal self-signed Root CA and any required intermediates as **Custom Server TLS Trust**. Hostname and chain validation remain mandatory; there is no skip-validation option and redirects are refused.
 
 The AD CS certificate template should:
 
-* be published on the target Enterprise CA and permit the connector account to enroll;
+* be published on the target Enterprise CA and permit the connector account to enrol;
 * use **Supply in the request** for the subject when the submitted PKCS #10 subject is authoritative;
 * issue a subordinate CA certificate with `BasicConstraints CA=true`, `keyCertSign`, and `cRLSign`;
 * set a path-length compatible with CertRobo's requested role; and
@@ -355,7 +355,7 @@ sudo systemctl reload nginx.service
    * `tls-server-rsa-4096` (RSA 4096, `digitalSignature` + `keyEncipherment`, `serverAuth` + `clientAuth`)
 
 2. **Domain Policy Rules**
-   * Wildcard pattern `*.contoso.com` authorizes any subdomain of `contoso.com` (including wildcard certificates like `*.contoso.com`) as well as the apex domain `contoso.com`.
+   * Wildcard pattern `*.contoso.com` authorises any subdomain of `contoso.com` (including wildcard certificates like `*.contoso.com`) as well as the apex domain `contoso.com`.
    * A bare domain like `contoso.com` matches only that exact apex domain.
    * A single `*` allows all valid multi-label DNS domains.
 
@@ -371,7 +371,7 @@ sudo systemctl reload nginx.service
      ```bash
      sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --backup /var/lib/certrobo/backups/certrobo-backup.zip'
      ```
-   * **Optional Root CA PKCS#12 in Administrator State Backup (`/admin` UI):** In **Administration → Settings and maintenance → Consistent State Backup**, an authenticated Administrator can explicitly opt in to including a portable PKCS#12 bundle (`ca-pkcs12/root-ca-<id>-<name>.p12`) for a selected locally managed Root CA inside the state backup ZIP. When enabled, CertRobo requires CA key custody to be unlocked, encrypts the PKCS#12 private key and certificate bags using `PBES2-PBKDF2-HMAC-SHA256` with `AES-256-CBC` and a PKCS#12 `HMAC-SHA256` integrity MAC (100,000 iterations), and protects it with a freshly generated 7-word passphrase sampled independently and uniformly with replacement from the EFF long wordlist (`Resources/Passphrases/eff_large_wordlist.txt`, CC BY 4.0 Electronic Frontier Foundation) separated by `-`. The generated passphrase is displayed once in the UI for separate storage and is never logged, persisted, or written inside the ZIP. It protects only the extra `.p12` artifact and does **not** replace the CA storage passphrase required to unlock or restore `ca/*.p8.enc`. The CLI `--backup` command always produces an ordinary state backup without the optional PKCS#12 artifact.
+   * **Optional Root CA PKCS#12 in Administrator State Backup (`/admin` UI):** In **Administration → Settings and maintenance → Consistent State Backup**, an authenticated Administrator can explicitly opt in to including a portable PKCS#12 bundle (`ca-pkcs12/root-ca-<id>-<name>.p12`) for a selected locally managed Root CA inside the state backup ZIP. When enabled, CertRobo requires CA key custody to be unlocked, encrypts the PKCS#12 private key and certificate bags using `PBES2-PBKDF2-HMAC-SHA256` with `AES-256-CBC` and a PKCS#12 `HMAC-SHA256` integrity MAC (100,000 iterations), and protects it with a freshly generated 7-word passphrase sampled independently and uniformly with replacement from the EFF long wordlist (`Resources/Passphrases/eff_large_wordlist.txt`, CC BY 4.0 Electronic Frontier Foundation) separated by `-`. The generated passphrase is displayed once in the UI for separate storage and is never logged, persisted, or written inside the ZIP. It protects only the extra `.p12` artefact and does **not** replace the CA storage passphrase required to unlock or restore `ca/*.p8.enc`. The CLI `--backup` command always produces an ordinary state backup without the optional PKCS#12 artefact.
    * Before restoring, stop CertRobo and any other processes that access its data. Restore the corresponding passphrase and configuration securely, then restore the archive and restart the service. Test recovery on a separate system before relying on the backup.
      ```bash
      sudo systemctl stop certrobo.service
@@ -390,7 +390,7 @@ sudo systemctl reload nginx.service
          echo "ERROR: Pre-migration backup failed; aborting CA key custody migration." >&2
          false
      else
-         # 2. Inspect current custody status (a nonzero exit is expected before mixed-passphrase keys are re-protected)
+         # 2. Inspect current custody status (a non-zero exit is expected before mixed-passphrase keys are re-protected)
          if ! sudo -u certrobo sh -c 'set -e; set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --verify-ca-custody'; then
              echo "Pre-migration custody mismatch confirmed; proceeding with key re-protection." >&2
          fi
@@ -405,9 +405,9 @@ sudo systemctl reload nginx.service
          fi
      fi
      ```
-     Do **not** delete `/etc/certrobo/legacy-ca.pass` or retire your independent offline copy of the legacy passphrase(s) until `--reprotect-ca-keys` and `--verify-ca-custody` have both exited `0`, `certrobo.service` has started cleanly, and active issuance and CRL refresh have been verified. Note that file deletion utilities (such as `rm` or `shred`) do not guarantee physical erasure on SSDs, copy-on-write filesystems, or journaled/networked storage.
+     Do **not** delete `/etc/certrobo/legacy-ca.pass` or retire your independent offline copy of the legacy passphrase(s) until `--reprotect-ca-keys` and `--verify-ca-custody` have both exited `0`, `certrobo.service` has started cleanly, and active issuance and CRL refresh have been verified. Note that file deletion utilities (such as `rm` or `shred`) do not guarantee physical erasure on SSDs, copy-on-write filesystems, or journalled/networked storage.
 
-5. **Issuer-Specific Publication and Export Behavior**
+5. **Issuer-Specific Publication and Export Behaviour**
    * Set `CertRobo__PublicBaseUrl` to the externally reachable plain-HTTP PKI origin. New authorities using default publication paths then receive stable issuer URLs such as `http://pki.contoso.com/authorities/3/issuer.crt` (DER AIA certificate) and `http://pki.contoso.com/authorities/3/ca.crl`. `/ca.crt`, `/ca.p7b`, `/issuer.crt`, `/ca.crl`, and `/ca.crl.pem` remain compatibility aliases for the active issuer; `/rootca.crt` returns only the trust anchor.
    * Historical issuer chains and CRLs remain available by authority ID after rollover. Each issued record retains its actual `CaAuthorityId` and chain, so later downloads do not silently switch to the current issuer.
    * Export ZIPs include leaf PEM, leaf-only PKCS #12 and PKCS #7, full-chain PKCS #12/P7B, a TLS server-chain PEM containing the leaf plus intermediate CA(s), and a separate `rootca.crt` trust anchor. A self-signed root is not inserted into the TLS server-chain file. Leaf `.p12` and `-chained.p12` files inside the export ZIP remain passwordless for convenience and include an empty-password PKCS #12 integrity MAC (`HMAC-SHA1` with `PBES2-PBKDF2-HMAC-SHA256` `AES-256-CBC` bags) to detect accidental container corruption (verified with .NET `X509CertificateLoader` and OpenSSL `3.x`; this MAC does not encrypt or provide confidentiality for the private key because the empty password is public).
@@ -416,8 +416,8 @@ sudo systemctl reload nginx.service
 
 6. **Disposable AD CS CES Integration Test Procedure**
    * This repository's automated tests validate WSTEP envelopes/parsing and issued, pending, denied, authentication, TLS, transport, ambiguous-submission, restart, retrieval, and manual-fallback states using disposable HTTPS handlers. They do not prove interoperability with a real CES deployment.
-   * On an explicitly authorized disposable Windows Server Enterprise CA:
-     1. Publish a subordinate-CA template as described above and grant a non-privileged test account Enroll permission.
+   * On an explicitly authorised disposable Windows Server Enterprise CA:
+     1. Publish a subordinate-CA template as described above and grant a non-privileged test account Enrol permission.
      2. Install/configure CES with Username/Password authentication and a valid HTTPS Server Authentication certificate.
      3. Trust the HTTPS issuing chain in CertRobo via **Custom Server TLS Trust** if it is private.
      4. Generate a pending Issuing CA request in CertRobo, configure the exact `https://.../service.svc/CES` URL and template name, and submit.
