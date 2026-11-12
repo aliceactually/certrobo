@@ -207,7 +207,7 @@
             setTheme(newTheme);
         }
 
-        function initializeTheme() {
+        function initialiseTheme() {
             const savedTheme = localStorage.getItem(THEME_KEY);
             if (savedTheme) {
                 applyTheme(savedTheme);
@@ -216,8 +216,8 @@
             }
         }
 
-        // Initialize theme immediately (script is at end of body, DOM is ready)
-        initializeTheme();
+        // Initialise theme immediately (script is at end of body, DOM is ready)
+        initialiseTheme();
 
         // Set up theme toggle button
         document.getElementById('themeToggle')?.addEventListener('click', toggleTheme);

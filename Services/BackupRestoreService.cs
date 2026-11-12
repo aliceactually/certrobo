@@ -17,8 +17,8 @@ public sealed record StateBackupWithRootCaPkcs12Result(
 
 /// <summary>
 /// Provides consistent online backup and restore of the SQLite database, encrypted CA signing key(s),
-/// and ASP.NET Core DataProtection key ring, plus optional Administrator-authorized inclusion of a
-/// Diceware-protected Root CA PKCS#12 artifact inside the state backup archive.
+/// and ASP.NET Core DataProtection key ring, plus optional Administrator-authorised inclusion of a
+/// Diceware-protected Root CA PKCS#12 artefact inside the state backup archive.
 /// </summary>
 public sealed class BackupRestoreService(
     IDbContextFactory<CertRoboDbContext> dbFactory,
@@ -81,7 +81,7 @@ public sealed class BackupRestoreService(
             throw new UnauthorizedAccessException("Administrator authentication is required to export a Root CA PKCS#12 in the state backup.");
         }
 
-        await VerifyAdministratorAuthorizationAsync(requestingUserId, expectedSecurityStamp, cancellationToken);
+        await VerifyAdministratorAuthorisationAsync(requestingUserId, expectedSecurityStamp, cancellationToken);
 
         string tempStagingDir = CreatePrivateStagingDirectory();
         string tempSnapshotDb = Path.Combine(tempStagingDir, "certrobo.db");
@@ -165,7 +165,7 @@ public sealed class BackupRestoreService(
         }
     }
 
-    private async Task VerifyAdministratorAuthorizationAsync(
+    private async Task VerifyAdministratorAuthorisationAsync(
         string requestingUserId,
         string? expectedSecurityStamp,
         CancellationToken cancellationToken)

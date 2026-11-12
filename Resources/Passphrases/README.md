@@ -12,5 +12,5 @@ It contains 7,776 lines, each with a five-die code and a word.
 
 `EffDicewarePassphraseGenerator` samples seven words independently and uniformly
 with replacement using `RandomNumberGenerator.GetInt32` (`~90.4` bits of entropy)
-and joins them with `-` to protect opt-in Root CA PKCS#12 artifacts included in
+and joins them with `-` to protect opt-in Root CA PKCS#12 artefacts included in
 administrator state backups.

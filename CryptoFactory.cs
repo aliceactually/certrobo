@@ -206,7 +206,7 @@ public class PkcsBuilder
             cn = "certificate";
         }
 
-        string normalizedLeafPem = NormalizePemEnding(ExportCertificateToPem(cert));
+        string normalisedLeafPem = NormalisePemEnding(ExportCertificateToPem(cert));
 
         // Separate intermediate CA(s) from the self-signed trust anchor root CA so TLS server-chain files
         // (-chained.crt / -chained.pem) carry leaf + intermediate(s) without indiscriminately inserting the trust root,
@@ -223,10 +223,10 @@ public class PkcsBuilder
         StringBuilder tlsChainPemBuilder = new();
         foreach (X509Certificate issuerCert in tlsServerChainIssuers)
         {
-            tlsChainPemBuilder.Append(NormalizePemEnding(ExportCertificateToPem(issuerCert)));
+            tlsChainPemBuilder.Append(NormalisePemEnding(ExportCertificateToPem(issuerCert)));
         }
-        string normalizedTlsChainIssuersPem = tlsChainPemBuilder.ToString();
-        string normalizedRootAnchorPem = NormalizePemEnding(ExportCertificateToPem(trustAnchorRootCert));
+        string normalisedTlsChainIssuersPem = tlsChainPemBuilder.ToString();
+        string normalisedRootAnchorPem = NormalisePemEnding(ExportCertificateToPem(trustAnchorRootCert));
 
         using MemoryStream output = new();
         using (ZipOutputStream zipStream = new(output))
@@ -235,7 +235,7 @@ public class PkcsBuilder
 
             // Base64 leaf
             zipStream.PutNextEntry(new ZipEntry(cn + ".crt"));
-            zipStream.Write(Encoding.ASCII.GetBytes(normalizedLeafPem));
+            zipStream.Write(Encoding.ASCII.GetBytes(normalisedLeafPem));
 
             // PKCS #7 leaf (.p7b)
             byte[] leafP7b = BuildPkcs7Der([cert]);
@@ -246,20 +246,20 @@ public class PkcsBuilder
             {
                 // TLS server chain: leaf + intermediate(s), excluding the self-signed trust anchor.
                 zipStream.PutNextEntry(new ZipEntry(cn + "-chained.crt"));
-                zipStream.Write(Encoding.ASCII.GetBytes(normalizedLeafPem));
-                if (!string.IsNullOrEmpty(normalizedTlsChainIssuersPem))
+                zipStream.Write(Encoding.ASCII.GetBytes(normalisedLeafPem));
+                if (!string.IsNullOrEmpty(normalisedTlsChainIssuersPem))
                 {
-                    zipStream.Write(Encoding.ASCII.GetBytes(normalizedTlsChainIssuersPem));
+                    zipStream.Write(Encoding.ASCII.GetBytes(normalisedTlsChainIssuersPem));
                 }
 
                 // Separate trust root certificate
                 zipStream.PutNextEntry(new ZipEntry("rootca.crt"));
-                zipStream.Write(Encoding.ASCII.GetBytes(normalizedRootAnchorPem));
+                zipStream.Write(Encoding.ASCII.GetBytes(normalisedRootAnchorPem));
 
                 if (tlsServerChainIssuers.Count > 0)
                 {
                     zipStream.PutNextEntry(new ZipEntry("ca-chain.crt"));
-                    zipStream.Write(Encoding.ASCII.GetBytes(normalizedTlsChainIssuersPem));
+                    zipStream.Write(Encoding.ASCII.GetBytes(normalisedTlsChainIssuersPem));
                 }
 
                 // PKCS #7 chained (.p7b): leaf + intermediate(s) + root
@@ -277,24 +277,24 @@ public class PkcsBuilder
                 {
                     if (CertKeyCheck(certificate, privateKey))
                     {
-                        string normalizedKeyPem = NormalizePemEnding(privateKey);
+                        string normalisedKeyPem = NormalisePemEnding(privateKey);
 
                         zipStream.PutNextEntry(new ZipEntry(cn + ".key"));
-                        zipStream.Write(Encoding.ASCII.GetBytes(normalizedKeyPem));
+                        zipStream.Write(Encoding.ASCII.GetBytes(normalisedKeyPem));
 
                         zipStream.PutNextEntry(new ZipEntry(cn + ".pem"));
-                        zipStream.Write(Encoding.ASCII.GetBytes(normalizedLeafPem));
-                        zipStream.Write(Encoding.ASCII.GetBytes(normalizedKeyPem));
+                        zipStream.Write(Encoding.ASCII.GetBytes(normalisedLeafPem));
+                        zipStream.Write(Encoding.ASCII.GetBytes(normalisedKeyPem));
 
                         if (chainValid)
                         {
                             zipStream.PutNextEntry(new ZipEntry(cn + "-chained.pem"));
-                            zipStream.Write(Encoding.ASCII.GetBytes(normalizedLeafPem));
-                            if (!string.IsNullOrEmpty(normalizedTlsChainIssuersPem))
+                            zipStream.Write(Encoding.ASCII.GetBytes(normalisedLeafPem));
+                            if (!string.IsNullOrEmpty(normalisedTlsChainIssuersPem))
                             {
-                                zipStream.Write(Encoding.ASCII.GetBytes(normalizedTlsChainIssuersPem));
+                                zipStream.Write(Encoding.ASCII.GetBytes(normalisedTlsChainIssuersPem));
                             }
-                            zipStream.Write(Encoding.ASCII.GetBytes(normalizedKeyPem));
+                            zipStream.Write(Encoding.ASCII.GetBytes(normalisedKeyPem));
                         }
 
                         // PKCS #12 leaf (passwordless with empty-password PKCS#12 integrity MAC for corruption detection;
@@ -464,7 +464,7 @@ public class PkcsBuilder
         return string.Empty;
     }
 
-    private static string NormalizePemEnding(string pem)
+    private static string NormalisePemEnding(string pem)
     {
         return pem.EndsWith('\n') ? pem : pem + "\n";
     }
@@ -555,8 +555,8 @@ public class CryptoFactory
         string countryCode,
         string stateOrProvinceName,
         string localityName,
-        string organization,
-        string organizationalUnit,
+        string organisation,
+        string organisationalUnit,
         string emailAddress)
     {
         IDictionary<DerObjectIdentifier, string> values = new Dictionary<DerObjectIdentifier, string>
@@ -565,8 +565,8 @@ public class CryptoFactory
             [X509Name.C] = countryCode,
             [X509Name.ST] = stateOrProvinceName,
             [X509Name.L] = localityName,
-            [X509Name.O] = organization,
-            [X509Name.OU] = organizationalUnit,
+            [X509Name.O] = organisation,
+            [X509Name.OU] = organisationalUnit,
             [X509Name.E] = emailAddress
         };
         IList<DerObjectIdentifier> keys =

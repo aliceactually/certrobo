@@ -760,7 +760,7 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
     }
 
     [Fact]
-    public async Task ReviewFix_EquivalentSerialEncodings_SignPadding_LeadingZeros_AndPreExistingDuplicates_ConvergeAndExposeConflicts()
+    public async Task ReviewFix_EquivalentSerialEncodings_SignPadding_LeadingZeroes_AndPreExistingDuplicates_ConvergeAndExposeConflicts()
     {
         const string secret = "Disposable-Test-Secret-Only!2026";
         string dbPath = Path.Combine(_tempRoot, "leading-zero.db");
@@ -1547,7 +1547,7 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
         Assert.True(retryAfterContextFault[0].Succeeded, retryAfterContextFault[0].ErrorMessage);
         Assert.True(CrlContainsSerial(retryAfterContextFault[0].PublishedCrl!.CrlDer, leaf2.Record!.SerialNumberHex, CrlReason.AffiliationChanged));
 
-        // 3. Cancellation semantics during post-save publication: OperationCanceledException is propagated while still signaling worker
+        // 3. Cancellation semantics during post-save publication: OperationCanceledException is propagated while still signalling worker
         await service.WaitForCrlRefreshSignalAsync(TimeSpan.FromMilliseconds(50));
         using CancellationTokenSource cts = new();
         service.CrlPublicationFaultInjector = _ =>
@@ -1776,7 +1776,7 @@ public sealed class CaCrlLifecycleRegressionTests : IDisposable
             Assert.Null(leafAfterRollback.RevokedByUserName);
         }
 
-        // 3. Drop trigger and verify pre-commit cancellation rolls back cleanly without signaling,
+        // 3. Drop trigger and verify pre-commit cancellation rolls back cleanly without signalling,
         //    whereas post-commit cancellation preserves the committed seed and signals the worker
         using (IServiceScope dropScope = sp.CreateScope())
         {

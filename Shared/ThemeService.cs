@@ -16,16 +16,16 @@ namespace CertRobo.Shared
             _jsRuntime = jsRuntime;
         }
 
-        public async Task InitializeThemeAsync()
+        public async Task InitialiseThemeAsync()
         {
             try
             {
-                _currentTheme = await _jsRuntime.InvokeAsync<string>("theme.initialize");
+                _currentTheme = await _jsRuntime.InvokeAsync<string>("theme.initialise");
                 NotifyThemeChanged();
             }
             catch (JSException ex)
             {
-                Console.WriteLine($"Error initializing theme: {ex.Message}");
+                Console.WriteLine($"Error initialising theme: {ex.Message}");
             }
         }
 

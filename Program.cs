@@ -138,7 +138,7 @@ builder.Services.AddHostedService<CrlRefreshBackgroundService>();
 
 var app = builder.Build();
 
-// Handle CLI --restore before initializing an empty SQLite file over the target path
+// Handle CLI --restore before initialising an empty SQLite file over the target path
 int restoreFlagIdx = Array.IndexOf(args, "--restore");
 if (restoreFlagIdx >= 0)
 {
@@ -277,7 +277,7 @@ using (IServiceScope scope = app.Services.CreateScope())
         return;
     }
 
-    // Handle CLI CA initialization:
+    // Handle CLI CA initialisation:
     // dotnet run -- --init-ca <caName> <commonName> <keySpec:RSA-4096|RSA-2048|ECDSA-384|ECDSA-256> <validityDays> [<cdpUrl>] [<aiaUrl>] [--subordinate]
     int initCaIdx = Array.IndexOf(args, "--init-ca");
     if (initCaIdx >= 0)
@@ -335,12 +335,12 @@ using (IServiceScope scope = app.Services.CreateScope())
                 parentAuthority: parent,
                 parentPassphrase: passphrase);
 
-            Console.WriteLine($"Initialized and activated {(created.IsIntermediate ? "Intermediate" : "Root")} CA '{created.Name}' (SKI={created.SubjectKeyIdentifierHex}).");
+            Console.WriteLine($"Initialised and activated {(created.IsIntermediate ? "Intermediate" : "Root")} CA '{created.Name}' (SKI={created.SubjectKeyIdentifierHex}).");
             return;
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"CA initialization failed: {ex.Message}");
+            Console.Error.WriteLine($"CA initialisation failed: {ex.Message}");
             Environment.ExitCode = 1;
             return;
         }
@@ -385,7 +385,7 @@ using (IServiceScope scope = app.Services.CreateScope())
         SubjectDefaultsConfig defaults = await accountService.GetSubjectDefaultsAsync();
         try
         {
-            PendingCaEnrollmentRecord pending = await caService.CreatePendingCaEnrollmentAsync(
+            PendingCaEnrolmentRecord pending = await caService.CreatePendingCaEnrolmentAsync(
                 caName,
                 commonName,
                 defaults.Country,
@@ -430,7 +430,7 @@ using (IServiceScope scope = app.Services.CreateScope())
             : null;
 
         CertificateAuthorityService caService = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
-        PendingCaEnrollmentRecord? pending = await caService.GetActivePendingEnrollmentAsync();
+        PendingCaEnrolmentRecord? pending = await caService.GetActivePendingEnrolmentAsync();
         if (pending == null)
         {
             Console.Error.WriteLine("No active pending external CA enrolment request was found.");
@@ -476,7 +476,7 @@ using (IServiceScope scope = app.Services.CreateScope())
 
         try
         {
-            CaAuthorityRecord activated = await caService.ActivatePendingCaEnrollmentAsync(pending.Id);
+            CaAuthorityRecord activated = await caService.ActivatePendingCaEnrolmentAsync(pending.Id);
             Console.WriteLine($"Validated and activated external Issuing CA '{activated.Name}' (SKI={activated.SubjectKeyIdentifierHex}).");
             return;
         }
@@ -501,15 +501,15 @@ using (IServiceScope scope = app.Services.CreateScope())
             string status = auth.CanDecryptWithEffectivePassphrase ? "OK" : $"FAILED ({auth.FailureReason})";
             Console.WriteLine($"CA #{auth.CaAuthorityId} '{auth.CaName}' (Active={auth.IsActive}, MaintainCrl={auth.RequiresCrlMaintenance}): {status}");
         }
-        if (report.PendingEnrollment != null)
+        if (report.PendingEnrolment != null)
         {
-            string pStatus = report.PendingEnrollment.CanDecryptWithEffectivePassphrase
+            string pStatus = report.PendingEnrolment.CanDecryptWithEffectivePassphrase
                 ? "OK"
-                : $"FAILED ({report.PendingEnrollment.FailureReason})";
-            Console.WriteLine($"Pending CA #{report.PendingEnrollment.PendingEnrollmentId} '{report.PendingEnrollment.CaName}': {pStatus}");
+                : $"FAILED ({report.PendingEnrolment.FailureReason})";
+            Console.WriteLine($"Pending CA #{report.PendingEnrolment.PendingEnrolmentId} '{report.PendingEnrolment.CaName}': {pStatus}");
         }
 
-        bool hasStoredKeys = report.Authorities.Count > 0 || report.PendingEnrollment != null;
+        bool hasStoredKeys = report.Authorities.Count > 0 || report.PendingEnrolment != null;
         if (!report.IsCustodyHealthy || (hasStoredKeys && !report.HasEffectivePassphrase))
         {
             Console.Error.WriteLine("CA key custody check failed: one or more stored CA keys cannot be unlocked with the current custody secret.");
@@ -784,7 +784,7 @@ using (IServiceScope scope = app.Services.CreateScope())
         }
 
         IssuedCertificateRecord? record = null;
-        if (CertificateAuthorityService.TryNormalizePositiveSerialHex(selector, out var targetBi, out string canonicalHex, out _))
+        if (CertificateAuthorityService.TryNormalisePositiveSerialHex(selector, out var targetBi, out string canonicalHex, out _))
         {
             List<IssuedCertificateRecord> candidates = await db.IssuedCertificates
                 .AsNoTracking()
@@ -793,7 +793,7 @@ using (IServiceScope scope = app.Services.CreateScope())
                 .ToListAsync();
             record = candidates.FirstOrDefault(c =>
                 string.Equals(c.SerialNumberHex, canonicalHex, StringComparison.OrdinalIgnoreCase)
-                || (CertificateAuthorityService.TryNormalizePositiveSerialHex(c.SerialNumberHex, out var cBi, out _, out _)
+                || (CertificateAuthorityService.TryNormalisePositiveSerialHex(c.SerialNumberHex, out var cBi, out _, out _)
                     && cBi.Equals(targetBi)));
         }
 

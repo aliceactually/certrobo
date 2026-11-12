@@ -56,7 +56,7 @@
                     </NotAuthorized>
                 </AuthorizeView>
 
-                @if (_initialized)
+                @if (_initialised)
                 {
                     <button type="button"
                             class="theme-toggle"
@@ -76,7 +76,7 @@
 </div>
 
 @code {
-    private bool _initialized;
+    private bool _initialised;
 
     [CascadingParameter(Name = "AntiforgeryToken")]
     public string? AntiforgeryToken { get; set; }
@@ -88,16 +88,16 @@
     {
         if (firstRender)
         {
-            await ThemeService.InitializeThemeAsync();
+            await ThemeService.InitialiseThemeAsync();
             ThemeService.OnThemeChanged += StateHasChanged;
-            _initialized = true;
+            _initialised = true;
             StateHasChanged();
         }
     }
 
     private async Task ToggleTheme()
     {
-        if (_initialized)
+        if (_initialised)
         {
             await ThemeService.ToggleThemeAsync();
         }
