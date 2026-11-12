@@ -201,7 +201,7 @@ public sealed class Pkcs12AndBackupCustodyTests : IDisposable
             CertificateKeyFamily.Ecdsa, 256, 1825, storageSecret,
             parentAuthority: rootCa, parentPassphrase: storageSecret, pathLengthConstraint: 0);
 
-        // 1. Authorization checks: anonymous, non-admin Issuer, stale security stamp, or disabled account are rejected
+        // 1. Authorisation checks: anonymous, non-admin Issuer, stale security stamp, or disabled account are rejected
         await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
             backupService.CreateConsistentBackupWithRootCaPkcs12Async(dbPath, dpDir, null, rootCa.Id));
         await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>

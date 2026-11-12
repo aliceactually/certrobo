@@ -191,7 +191,7 @@ public sealed class ParserSafetyRegressionTests
         {
             await using ServiceProvider sp = BuildDisposableServices(tempRoot);
             CertificateAuthorityService caService = sp.GetRequiredService<CertificateAuthorityService>();
-            PendingCaEnrollmentRecord pending = await caService.CreatePendingCaEnrollmentAsync(
+            PendingCaEnrolmentRecord pending = await caService.CreatePendingCaEnrolmentAsync(
                 "CES Size Test CA",
                 "ces-size.contoso.com",
                 "US", "WA", "Redmond", "Contoso", "PKI",
@@ -448,7 +448,7 @@ public sealed class ParserSafetyRegressionTests
                     {
                         await using ServiceProvider sp = BuildDisposableServices(tempRoot);
                         CertificateAuthorityService caService = sp.GetRequiredService<CertificateAuthorityService>();
-                        PendingCaEnrollmentRecord pending = await caService.CreatePendingCaEnrollmentAsync(
+                        PendingCaEnrolmentRecord pending = await caService.CreatePendingCaEnrolmentAsync(
                             "Child CES CA",
                             "child-ces.contoso.com",
                             "US", "WA", "Redmond", "Contoso", "PKI",

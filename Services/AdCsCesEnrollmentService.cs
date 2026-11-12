@@ -33,7 +33,7 @@ public sealed record AdCsCesOperationResult(
     string? UpstreamRequestId = null,
     string? UpstreamErrorCode = null,
     string? DispositionMessage = null,
-    PendingCaEnrollmentRecord? UpdatedRecord = null);
+    PendingCaEnrolmentRecord? UpdatedRecord = null);
 
 public sealed record AdCsCesTransportOptions(
     Uri EndpointUri,
@@ -129,7 +129,7 @@ public sealed class AdCsCesEnrollmentService
     {
         string trimmedEndpoint = (endpointUrl ?? string.Empty).Trim();
         string trimmedTemplate = (certificateTemplate ?? string.Empty).Trim();
-        string normalizedAuthMode = string.Equals(authenticationMode, "ClientCertificate", StringComparison.OrdinalIgnoreCase)
+        string normalisedAuthMode = string.Equals(authenticationMode, "ClientCertificate", StringComparison.OrdinalIgnoreCase)
             ? "ClientCertificate"
             : "UsernamePassword";
 
@@ -207,7 +207,7 @@ public sealed class AdCsCesEnrollmentService
         existing.IsEnabled = isEnabled;
         existing.EndpointUrl = trimmedEndpoint;
         existing.CertificateTemplate = trimmedTemplate;
-        existing.AuthenticationMode = normalizedAuthMode;
+        existing.AuthenticationMode = normalisedAuthMode;
         existing.Username = (username ?? string.Empty).Trim();
         existing.ClientCertificatePem = (clientCertificatePem ?? string.Empty).Trim();
         existing.CustomServerTlsTrustPem = (customServerTlsTrustPem ?? string.Empty).Trim();
@@ -233,7 +233,7 @@ public sealed class AdCsCesEnrollmentService
             existing.ProtectedClientPrivateKeyPem = _credentialProtector.Protect(newClientPrivateKeyPem.Trim());
         }
 
-        if (normalizedAuthMode == "ClientCertificate" && isEnabled)
+        if (normalisedAuthMode == "ClientCertificate" && isEnabled)
         {
             if (string.IsNullOrWhiteSpace(existing.ClientCertificatePem) || string.IsNullOrWhiteSpace(existing.ProtectedClientPrivateKeyPem))
             {
@@ -252,12 +252,12 @@ public sealed class AdCsCesEnrollmentService
     }
 
     /// <summary>
-    /// Submits a pending CA enrollment CSR to Microsoft AD CS CES via [MS-WSTEP] RequestSecurityToken (Issue).
+    /// Submits a pending CA enrolment CSR to Microsoft AD CS CES via [MS-WSTEP] RequestSecurityToken (Issue).
     /// Prevents blind resubmission when a prior attempt resulted in SubmissionUncertain or AwaitingApproval
     /// unless forceResubmit is explicitly true.
     /// </summary>
-    public async Task<AdCsCesOperationResult> SubmitPendingEnrollmentAsync(
-        int pendingEnrollmentId,
+    public async Task<AdCsCesOperationResult> SubmitPendingEnrolmentAsync(
+        int pendingEnrolmentId,
         string? oneTimePasswordOverride = null,
         string? templateOverride = null,
         bool forceResubmit = false,
@@ -266,8 +266,8 @@ public sealed class AdCsCesEnrollmentService
         await CesSubmissionLock.WaitAsync(cancellationToken);
         try
         {
-            return await SubmitPendingEnrollmentCoreAsync(
-                pendingEnrollmentId,
+            return await SubmitPendingEnrolmentCoreAsync(
+                pendingEnrolmentId,
                 oneTimePasswordOverride,
                 templateOverride,
                 forceResubmit,
@@ -279,8 +279,8 @@ public sealed class AdCsCesEnrollmentService
         }
     }
 
-    private async Task<AdCsCesOperationResult> SubmitPendingEnrollmentCoreAsync(
-        int pendingEnrollmentId,
+    private async Task<AdCsCesOperationResult> SubmitPendingEnrolmentCoreAsync(
+        int pendingEnrolmentId,
         string? oneTimePasswordOverride = null,
         string? templateOverride = null,
         bool forceResubmit = false,
@@ -317,15 +317,15 @@ public sealed class AdCsCesEnrollmentService
         }
 
         await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
-        PendingCaEnrollmentRecord? pending = await db.PendingCaEnrollments
-            .FirstOrDefaultAsync(p => p.Id == pendingEnrollmentId, cancellationToken);
+        PendingCaEnrolmentRecord? pending = await db.PendingCaEnrolments
+            .FirstOrDefaultAsync(p => p.Id == pendingEnrolmentId, cancellationToken);
 
         if (pending == null)
         {
             return new(false, AdCsCesOutcomeKind.ValidationFailure, "Pending CA enrolment request was not found.");
         }
 
-        if (pending.Status == PendingCaEnrollmentStatus.Activated || pending.Status == PendingCaEnrollmentStatus.Cancelled)
+        if (pending.Status == PendingCaEnrolmentStatus.Activated || pending.Status == PendingCaEnrolmentStatus.Cancelled)
         {
             return new(false, AdCsCesOutcomeKind.ValidationFailure, $"Pending CA enrolment request is already in state '{pending.Status}'.");
         }
@@ -341,7 +341,7 @@ public sealed class AdCsCesEnrollmentService
                 pending);
         }
 
-        if (pending.Status == PendingCaEnrollmentStatus.SubmissionUncertain && !forceResubmit)
+        if (pending.Status == PendingCaEnrolmentStatus.SubmissionUncertain && !forceResubmit)
         {
             return new(
                 false,
@@ -353,7 +353,7 @@ public sealed class AdCsCesEnrollmentService
                 pending);
         }
 
-        if (pending.Status == PendingCaEnrollmentStatus.AwaitingApproval && !forceResubmit)
+        if (pending.Status == PendingCaEnrolmentStatus.AwaitingApproval && !forceResubmit)
         {
             return new(
                 false,
@@ -388,7 +388,7 @@ public sealed class AdCsCesEnrollmentService
         // Persist a crash-safe uncertain state before transmission. A definitive response or
         // pre-send transport failure will replace it; process/network loss after send will not
         // leave the request looking safe to resubmit.
-        pending.Status = PendingCaEnrollmentStatus.SubmissionUncertain;
+        pending.Status = PendingCaEnrolmentStatus.SubmissionUncertain;
         pending.LastOutcomeCategory = "Submitting";
         pending.StatusDetailMessage =
             $"Submitting to AD CS CES (MessageID {messageId}). If the process stops before a response is recorded, reconcile with the parent CA before retrying.";
@@ -409,7 +409,7 @@ public sealed class AdCsCesEnrollmentService
     /// Queries the status of a pending (or uncertain) AD CS CES request using [MS-WSTEP] QueryTokenStatus and wstep:RequestID.
     /// </summary>
     public async Task<AdCsCesOperationResult> QueryPendingStatusAsync(
-        int pendingEnrollmentId,
+        int pendingEnrolmentId,
         string? explicitRequestId = null,
         string? oneTimePasswordOverride = null,
         CancellationToken cancellationToken = default)
@@ -433,8 +433,8 @@ public sealed class AdCsCesEnrollmentService
         }
 
         await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
-        PendingCaEnrollmentRecord? pending = await db.PendingCaEnrollments
-            .FirstOrDefaultAsync(p => p.Id == pendingEnrollmentId, cancellationToken);
+        PendingCaEnrolmentRecord? pending = await db.PendingCaEnrolments
+            .FirstOrDefaultAsync(p => p.Id == pendingEnrolmentId, cancellationToken);
 
         if (pending == null)
         {
@@ -471,9 +471,9 @@ public sealed class AdCsCesEnrollmentService
         pending.UpstreamRequestId = requestIdToQuery;
         pending.LastMessageId = messageId;
         pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
-        if (pending.Status == PendingCaEnrollmentStatus.AwaitingSubmission)
+        if (pending.Status == PendingCaEnrolmentStatus.AwaitingSubmission)
         {
-            pending.Status = PendingCaEnrollmentStatus.SubmissionUncertain;
+            pending.Status = PendingCaEnrolmentStatus.SubmissionUncertain;
         }
         await db.SaveChangesAsync(cancellationToken);
 
@@ -490,7 +490,7 @@ public sealed class AdCsCesEnrollmentService
 
     private async Task<AdCsCesOperationResult> SendAndProcessWstepRequestAsync(
         CertRoboDbContext db,
-        PendingCaEnrollmentRecord pending,
+        PendingCaEnrolmentRecord pending,
         AdCsCesConnectorConfig config,
         Uri endpointUri,
         string? clientPrivateKeyPem,
@@ -535,7 +535,7 @@ public sealed class AdCsCesEnrollmentService
         }
         catch (AuthenticationException ex)
         {
-            string msg = $"TLS certificate validation failed when connecting to AD CS CES endpoint '{endpointUri.Host}': {SanitizeDiagnosticMessage(ex.Message)}";
+            string msg = $"TLS certificate validation failed when connecting to AD CS CES endpoint '{endpointUri.Host}': {SanitiseDiagnosticMessage(ex.Message)}";
             SetFailureStatusForOperation(pending, isInitialIssueSubmission);
             pending.LastOutcomeCategory = "TlsOrTrustFailure";
             pending.StatusDetailMessage = msg;
@@ -545,7 +545,7 @@ public sealed class AdCsCesEnrollmentService
         }
         catch (HttpRequestException ex) when (ex.InnerException is AuthenticationException authEx)
         {
-            string msg = $"TLS certificate validation failed when connecting to AD CS CES endpoint '{endpointUri.Host}': {SanitizeDiagnosticMessage(authEx.Message)}";
+            string msg = $"TLS certificate validation failed when connecting to AD CS CES endpoint '{endpointUri.Host}': {SanitiseDiagnosticMessage(authEx.Message)}";
             SetFailureStatusForOperation(pending, isInitialIssueSubmission);
             pending.LastOutcomeCategory = "TlsOrTrustFailure";
             pending.StatusDetailMessage = msg;
@@ -555,7 +555,7 @@ public sealed class AdCsCesEnrollmentService
         }
         catch (HttpRequestException ex) when (IsPreSendConnectionError(ex, content.WasWrittenToStream))
         {
-            string msg = $"Could not connect to AD CS CES endpoint '{endpointUri}': {SanitizeDiagnosticMessage(ex.Message)}";
+            string msg = $"Could not connect to AD CS CES endpoint '{endpointUri}': {SanitiseDiagnosticMessage(ex.Message)}";
             SetFailureStatusForOperation(pending, isInitialIssueSubmission);
             pending.LastOutcomeCategory = "TransportFailure";
             pending.StatusDetailMessage = msg;
@@ -570,7 +570,7 @@ public sealed class AdCsCesEnrollmentService
                 string uncertainMsg =
                     $"AD CS CES submission timed out after {timeout.TotalSeconds:0}s following request transmission (MessageID {pending.LastMessageId}). " +
                     "The parent CA may have accepted the request. Check the parent CA for a Request ID and reconcile with 'Query Status by Request ID', or complete manually.";
-                pending.Status = PendingCaEnrollmentStatus.SubmissionUncertain;
+                pending.Status = PendingCaEnrolmentStatus.SubmissionUncertain;
                 pending.LastOutcomeCategory = "SubmissionUncertain";
                 pending.StatusDetailMessage = uncertainMsg;
                 pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
@@ -590,9 +590,9 @@ public sealed class AdCsCesEnrollmentService
             if (isInitialIssueSubmission && content.WasWrittenToStream)
             {
                 string uncertainMsg =
-                    $"Network connection dropped after sending the enrolment request to AD CS CES ({SanitizeDiagnosticMessage(ex.Message)}). " +
+                    $"Network connection dropped after sending the enrolment request to AD CS CES ({SanitiseDiagnosticMessage(ex.Message)}). " +
                     "The parent CA may have accepted the request. Reconcile using the Request ID from the parent CA or complete manually.";
-                pending.Status = PendingCaEnrollmentStatus.SubmissionUncertain;
+                pending.Status = PendingCaEnrolmentStatus.SubmissionUncertain;
                 pending.LastOutcomeCategory = "SubmissionUncertain";
                 pending.StatusDetailMessage = uncertainMsg;
                 pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
@@ -600,7 +600,7 @@ public sealed class AdCsCesEnrollmentService
                 return new(false, AdCsCesOutcomeKind.SubmissionUncertain, uncertainMsg, pending.UpstreamRequestId, null, null, pending);
             }
 
-            string errMsg = $"Transport error communicating with AD CS CES: {SanitizeDiagnosticMessage(ex.Message)}";
+            string errMsg = $"Transport error communicating with AD CS CES: {SanitiseDiagnosticMessage(ex.Message)}";
             SetFailureStatusForOperation(pending, isInitialIssueSubmission);
             pending.LastOutcomeCategory = "TransportFailure";
             pending.StatusDetailMessage = errMsg;
@@ -660,7 +660,7 @@ public sealed class AdCsCesEnrollmentService
                 string gwMsg =
                     $"AD CS CES returned HTTP {statusCode} ({response.StatusCode}) after receiving the request. " +
                     "Whether the parent CA recorded the request is uncertain. Check the parent CA for a Request ID before resubmitting.";
-                pending.Status = PendingCaEnrollmentStatus.SubmissionUncertain;
+                pending.Status = PendingCaEnrolmentStatus.SubmissionUncertain;
                 pending.LastOutcomeCategory = "SubmissionUncertain";
                 pending.StatusDetailMessage = gwMsg;
                 pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
@@ -681,7 +681,7 @@ public sealed class AdCsCesEnrollmentService
 
     private async Task<AdCsCesOperationResult> ParseAndApplyWstepXmlResponseAsync(
         CertRoboDbContext db,
-        PendingCaEnrollmentRecord pending,
+        PendingCaEnrolmentRecord pending,
         AdCsCesConnectorConfig config,
         HttpStatusCode httpStatus,
         string xmlBody,
@@ -896,7 +896,7 @@ public sealed class AdCsCesEnrollmentService
                     }
                     catch (Exception ex)
                     {
-                        tokenParseErrors.Add(SanitizeDiagnosticMessage(ex.Message));
+                        tokenParseErrors.Add(SanitiseDiagnosticMessage(ex.Message));
                     }
                 }
             }
@@ -906,7 +906,7 @@ public sealed class AdCsCesEnrollmentService
             if (extractedCerts.Count > 0)
             {
                 // Issued! Combine extracted certificates with configured DefaultParentChainTrustPem and validate via shared validator
-                PendingCaEnrollmentStatus statusBeforeValidation = pending.Status;
+                PendingCaEnrolmentStatus statusBeforeValidation = pending.Status;
                 StringBuilder returnedBundlePem = new();
                 foreach (X509Certificate2 c in extractedCerts)
                 {
@@ -924,7 +924,7 @@ public sealed class AdCsCesEnrollmentService
                     passphraseOverride: null,
                     cancellationToken: cancellationToken);
 
-                PendingCaEnrollmentRecord? refreshed = await _caService.GetPendingEnrollmentByIdAsync(pending.Id, cancellationToken);
+                PendingCaEnrolmentRecord? refreshed = await _caService.GetPendingEnrolmentByIdAsync(pending.Id, cancellationToken);
 
                 if (validation.IsValid && refreshed != null)
                 {
@@ -934,14 +934,14 @@ public sealed class AdCsCesEnrollmentService
 
                     await UpdatePendingStatusMetadataAsync(
                         pending.Id,
-                        PendingCaEnrollmentStatus.ReadyForActivation,
+                        PendingCaEnrolmentStatus.ReadyForActivation,
                         "Issued",
                         successMsg,
                         requestId,
                         null,
                         cancellationToken);
 
-                    refreshed = await _caService.GetPendingEnrollmentByIdAsync(pending.Id, cancellationToken);
+                    refreshed = await _caService.GetPendingEnrolmentByIdAsync(pending.Id, cancellationToken);
                     return new(
                         true,
                         AdCsCesOutcomeKind.IssuedReadyForActivation,
@@ -962,14 +962,14 @@ public sealed class AdCsCesEnrollmentService
 
                     await UpdatePendingStatusMetadataAsync(
                         pending.Id,
-                        PendingCaEnrollmentStatus.Failed,
+                        PendingCaEnrolmentStatus.Failed,
                         "IssuedAwaitingChain",
                         partialMsg,
                         requestId,
                         null,
                         cancellationToken);
 
-                    refreshed = await _caService.GetPendingEnrollmentByIdAsync(pending.Id, cancellationToken);
+                    refreshed = await _caService.GetPendingEnrolmentByIdAsync(pending.Id, cancellationToken);
                     return new(
                         false,
                         AdCsCesOutcomeKind.IssuedAwaitingChainAnchor,
@@ -983,11 +983,11 @@ public sealed class AdCsCesEnrollmentService
                 string invalidCertMsg =
                     $"AD CS CES returned a certificate (Request ID #{requestId ?? "n/a"}), but it failed CA validation: {validation.ErrorMessage}";
 
-                PendingCaEnrollmentStatus preservedStatus = isInitialIssueSubmission
-                    ? PendingCaEnrollmentStatus.SubmissionUncertain
-                    : (statusBeforeValidation is PendingCaEnrollmentStatus.AwaitingApproval or PendingCaEnrollmentStatus.SubmissionUncertain
+                PendingCaEnrolmentStatus preservedStatus = isInitialIssueSubmission
+                    ? PendingCaEnrolmentStatus.SubmissionUncertain
+                    : (statusBeforeValidation is PendingCaEnrolmentStatus.AwaitingApproval or PendingCaEnrolmentStatus.SubmissionUncertain
                         ? statusBeforeValidation
-                        : PendingCaEnrollmentStatus.SubmissionUncertain);
+                        : PendingCaEnrolmentStatus.SubmissionUncertain);
 
                 await UpdatePendingStatusMetadataAsync(
                     pending.Id,
@@ -998,7 +998,7 @@ public sealed class AdCsCesEnrollmentService
                     null,
                     cancellationToken);
 
-                refreshed = await _caService.GetPendingEnrollmentByIdAsync(pending.Id, cancellationToken);
+                refreshed = await _caService.GetPendingEnrolmentByIdAsync(pending.Id, cancellationToken);
                 return new(
                     false,
                     AdCsCesOutcomeKind.ValidationFailure,
@@ -1043,7 +1043,7 @@ public sealed class AdCsCesEnrollmentService
                     ? $"Request #{requestId} is pending approval on the parent AD CS CA (Disposition: '{disposition ?? "Taken Under Submission"}'). Approve the request on the parent CA and click 'Check Pending Status', or upload the signed certificate manually."
                     : $"Request was pended by the parent AD CS CA (Disposition: '{disposition ?? "Taken Under Submission"}'), but no Request ID was returned. Obtain the Request ID or signed certificate from the parent CA administrator to complete enrolment.";
 
-                pending.Status = PendingCaEnrollmentStatus.AwaitingApproval;
+                pending.Status = PendingCaEnrolmentStatus.AwaitingApproval;
                 pending.LastOutcomeCategory = "Pending";
                 pending.StatusDetailMessage = pendingMsg;
                 pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
@@ -1078,7 +1078,7 @@ public sealed class AdCsCesEnrollmentService
 
     private async Task<AdCsCesOperationResult> HandleWstepSoapFaultAsync(
         CertRoboDbContext db,
-        PendingCaEnrollmentRecord pending,
+        PendingCaEnrolmentRecord pending,
         XElement faultEl,
         bool isInitialIssueSubmission,
         CancellationToken cancellationToken)
@@ -1124,7 +1124,7 @@ public sealed class AdCsCesEnrollmentService
 
         if (isAuthFault)
         {
-            string authFaultMsg = $"AD CS CES authentication failed: {SanitizeDiagnosticMessage(faultReason)}"
+            string authFaultMsg = $"AD CS CES authentication failed: {SanitiseDiagnosticMessage(faultReason)}"
                 + (!string.IsNullOrWhiteSpace(errorCode) ? $" (ErrorCode: {errorCode})" : "");
             SetFailureStatusForOperation(pending, isInitialIssueSubmission);
             pending.LastOutcomeCategory = "AuthenticationFailure";
@@ -1159,7 +1159,7 @@ public sealed class AdCsCesEnrollmentService
             string pendingMsg = !string.IsNullOrWhiteSpace(pending.UpstreamRequestId)
                 ? $"Request #{pending.UpstreamRequestId} is pending approval on the parent AD CS CA."
                 : "The parent AD CS CA reports that the request is pending, but no Request ID was returned. Obtain the Request ID from the CA administrator or complete enrolment manually.";
-            pending.Status = PendingCaEnrollmentStatus.AwaitingApproval;
+            pending.Status = PendingCaEnrolmentStatus.AwaitingApproval;
             pending.LastOutcomeCategory = "Pending";
             pending.StatusDetailMessage = pendingMsg;
             pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
@@ -1177,11 +1177,11 @@ public sealed class AdCsCesEnrollmentService
 
         if (isDenied)
         {
-            string deniedMsg = $"Parent AD CS CA denied the certificate request: {SanitizeDiagnosticMessage(faultReason)}"
+            string deniedMsg = $"Parent AD CS CA denied the certificate request: {SanitiseDiagnosticMessage(faultReason)}"
                 + (!string.IsNullOrWhiteSpace(pending.UpstreamRequestId) ? $" (Request ID #{pending.UpstreamRequestId})" : "")
                 + (!string.IsNullOrWhiteSpace(errorCode) ? $" [ErrorCode: {errorCode}]" : "");
 
-            pending.Status = PendingCaEnrollmentStatus.Failed;
+            pending.Status = PendingCaEnrolmentStatus.Failed;
             pending.LastOutcomeCategory = "Denied";
             pending.StatusDetailMessage = deniedMsg;
             pending.LastCheckedAtUtc = DateTimeOffset.UtcNow;
@@ -1197,7 +1197,7 @@ public sealed class AdCsCesEnrollmentService
                 pending);
         }
 
-        string genericFaultMsg = $"AD CS CES returned a SOAP fault: {SanitizeDiagnosticMessage(faultReason)}"
+        string genericFaultMsg = $"AD CS CES returned a SOAP fault: {SanitiseDiagnosticMessage(faultReason)}"
             + (!string.IsNullOrWhiteSpace(errorCode) ? $" [ErrorCode: {errorCode}]" : "");
 
         AdCsCesOutcomeKind faultOutcomeKind = ApplyAmbiguousPostSendOrQueryFailure(
@@ -1219,19 +1219,19 @@ public sealed class AdCsCesEnrollmentService
     }
 
     private static void SetFailureStatusForOperation(
-        PendingCaEnrollmentRecord pending,
+        PendingCaEnrolmentRecord pending,
         bool isInitialIssueSubmission)
     {
         // Used only for pre-send transport/TLS failures or definitive authentication rejections.
         // A failed status query does not change the parent CA's pending request.
         if (isInitialIssueSubmission)
         {
-            pending.Status = PendingCaEnrollmentStatus.Failed;
+            pending.Status = PendingCaEnrolmentStatus.Failed;
         }
     }
 
     private static AdCsCesOutcomeKind ApplyAmbiguousPostSendOrQueryFailure(
-        PendingCaEnrollmentRecord pending,
+        PendingCaEnrolmentRecord pending,
         bool isInitialIssueSubmission,
         string queryFailureCategory,
         AdCsCesOutcomeKind queryFailureKind,
@@ -1242,16 +1242,16 @@ public sealed class AdCsCesEnrollmentService
 
         if (isInitialIssueSubmission)
         {
-            pending.Status = PendingCaEnrollmentStatus.SubmissionUncertain;
+            pending.Status = PendingCaEnrolmentStatus.SubmissionUncertain;
             pending.LastOutcomeCategory = "SubmissionUncertain";
             return AdCsCesOutcomeKind.SubmissionUncertain;
         }
 
         // For status queries, preserve AwaitingApproval or SubmissionUncertain so an unreadable
         // or failed query response never makes an outstanding request appear safe to resubmit.
-        if (pending.Status is not (PendingCaEnrollmentStatus.AwaitingApproval or PendingCaEnrollmentStatus.SubmissionUncertain))
+        if (pending.Status is not (PendingCaEnrolmentStatus.AwaitingApproval or PendingCaEnrolmentStatus.SubmissionUncertain))
         {
-            pending.Status = PendingCaEnrollmentStatus.SubmissionUncertain;
+            pending.Status = PendingCaEnrolmentStatus.SubmissionUncertain;
         }
         pending.LastOutcomeCategory = queryFailureCategory;
         return queryFailureKind;
@@ -1259,7 +1259,7 @@ public sealed class AdCsCesEnrollmentService
 
     private async Task UpdatePendingStatusMetadataAsync(
         int pendingId,
-        PendingCaEnrollmentStatus status,
+        PendingCaEnrolmentStatus status,
         string outcomeCategory,
         string detailMessage,
         string? requestId,
@@ -1267,7 +1267,7 @@ public sealed class AdCsCesEnrollmentService
         CancellationToken cancellationToken)
     {
         await using CertRoboDbContext db = await _dbFactory.CreateDbContextAsync(cancellationToken);
-        PendingCaEnrollmentRecord? rec = await db.PendingCaEnrollments
+        PendingCaEnrolmentRecord? rec = await db.PendingCaEnrolments
             .FirstOrDefaultAsync(p => p.Id == pendingId, cancellationToken);
 
         if (rec != null)
@@ -1662,7 +1662,7 @@ public sealed class AdCsCesEnrollmentService
 
     private static bool IsPreSendConnectionError(HttpRequestException ex, bool wasWrittenToStream)
     {
-        // Once serialization has begun, a connection failure can occur after CES accepted the
+        // Once serialisation has begun, a connection failure can occur after CES accepted the
         // request, so it must be treated as uncertain rather than safe to retry automatically.
         return !wasWrittenToStream;
     }
@@ -1706,7 +1706,7 @@ public sealed class AdCsCesEnrollmentService
         return (false, await boundedContent.ReadAsStringAsync(cancellationToken));
     }
 
-    private static string SanitizeDiagnosticMessage(string message)
+    private static string SanitiseDiagnosticMessage(string message)
     {
         if (string.IsNullOrWhiteSpace(message))
         {

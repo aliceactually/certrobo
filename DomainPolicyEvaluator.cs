@@ -12,7 +12,7 @@ using System.Text.RegularExpressions;
 namespace CertRobo;
 
 /// <summary>
-/// Evaluates domain authorization patterns and extracts/validates CSR identities.
+/// Evaluates domain authorisation patterns and extracts/validates CSR identities.
 /// Preserves existing CertRobo domain pattern semantics where '*.contoso.com' matches
 /// subdomains (including wildcard certificates like '*.contoso.com') AND the apex 'contoso.com'.
 /// </summary>
@@ -25,8 +25,8 @@ public static class DomainPolicyEvaluator
             return false;
         }
 
-        string canonicalDomain = CanonicalizeDomainPatternOrIdentity(domain);
-        string canonicalPattern = CanonicalizeDomainPatternOrIdentity(pattern);
+        string canonicalDomain = CanonicaliseDomainPatternOrIdentity(domain);
+        string canonicalPattern = CanonicaliseDomainPatternOrIdentity(pattern);
         if (string.IsNullOrEmpty(canonicalDomain) || string.IsNullOrEmpty(canonicalPattern))
         {
             return false;
@@ -47,7 +47,7 @@ public static class DomainPolicyEvaluator
         return canonicalDomain.Equals(canonicalPattern, StringComparison.OrdinalIgnoreCase);
     }
 
-    public static string CanonicalizeDomainPatternOrIdentity(string input)
+    public static string CanonicaliseDomainPatternOrIdentity(string input)
     {
         if (string.IsNullOrWhiteSpace(input))
         {

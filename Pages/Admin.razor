@@ -120,7 +120,7 @@
                 {
                     <div class="alert alert-warning mb-3" role="status">
                         <h4 class="h5 mb-1">No active Issuing Certificate Authority is configured yet</h4>
-                        @if (pendingEnrollment == null)
+                        @if (pendingEnrolment == null)
                         {
                             <p class="mb-2">Choose one of the three provisioning paths below: generate a self-signed root CA, import an existing issuing CA, or request an issuing CA certificate from an external parent CA.</p>
                             <div class="d-flex flex-wrap gap-2">
@@ -286,10 +286,10 @@
                                 @(caProvisionMode == CaProvisionMode.Import ? "Hide Import CA Form" : "Import Existing Issuing CA...")
                             </button>
                             <button type="button"
-                                    class="btn btn-sm @(caProvisionMode == CaProvisionMode.RequestExternal || pendingEnrollment != null ? "btn-primary" : "btn-outline-secondary")"
+                                    class="btn btn-sm @(caProvisionMode == CaProvisionMode.RequestExternal || pendingEnrolment != null ? "btn-primary" : "btn-outline-secondary")"
                                     aria-expanded="@(caProvisionMode == CaProvisionMode.RequestExternal ? "true" : "false")"
                                     @onclick="() => ToggleCaProvisionMode(CaProvisionMode.RequestExternal)">
-                                @(pendingEnrollment != null ? "Review Pending External CA Request..." : (caProvisionMode == CaProvisionMode.RequestExternal ? "Hide External CA Request Form" : "Request Issuing CA from External CA..."))
+                                @(pendingEnrolment != null ? "Review Pending External CA Request..." : (caProvisionMode == CaProvisionMode.RequestExternal ? "Hide External CA Request Form" : "Request Issuing CA from External CA..."))
                             </button>
                         </div>
                     </div>
@@ -297,28 +297,28 @@
             </RadzenCard>
 
             <!-- PENDING EXTERNAL CA ENROLMENT VIEW (Unified Manual + Optional AD CS CES View) -->
-            @if (pendingEnrollment != null)
+            @if (pendingEnrolment != null)
             {
                 <RadzenCard class="mb-4">
                     <div class="section-card-header">
                         <div>
                             <h3 class="d-flex flex-wrap align-items-center gap-2">
-                                <span>Pending External Issuing CA Enrolment: @pendingEnrollment.CaName</span>
-                                @switch (pendingEnrollment.Status)
+                                <span>Pending External Issuing CA Enrolment: @pendingEnrolment.CaName</span>
+                                @switch (pendingEnrolment.Status)
                                 {
-                                    case PendingCaEnrollmentStatus.AwaitingSubmission:
+                                    case PendingCaEnrolmentStatus.AwaitingSubmission:
                                         <span class="badge bg-info text-dark">Awaiting Submission</span>
                                         break;
-                                    case PendingCaEnrollmentStatus.SubmissionUncertain:
+                                    case PendingCaEnrolmentStatus.SubmissionUncertain:
                                         <span class="badge bg-warning text-dark">Submission Outcome Uncertain</span>
                                         break;
-                                    case PendingCaEnrollmentStatus.AwaitingApproval:
+                                    case PendingCaEnrolmentStatus.AwaitingApproval:
                                         <span class="badge bg-primary">Awaiting Parent CA Approval</span>
                                         break;
-                                    case PendingCaEnrollmentStatus.ReadyForActivation:
+                                    case PendingCaEnrolmentStatus.ReadyForActivation:
                                         <span class="badge bg-success">Ready for Activation</span>
                                         break;
-                                    case PendingCaEnrollmentStatus.Failed:
+                                    case PendingCaEnrolmentStatus.Failed:
                                         <span class="badge bg-danger">Failed — Attention Required</span>
                                         break;
                                 }
@@ -338,19 +338,19 @@
                             <button type="button" class="btn btn-sm btn-outline-primary" @onclick="DownloadPendingCsrClick">
                                 Download PKCS #10 CSR (.csr)
                             </button>
-                            <button type="button" class="btn btn-sm btn-outline-danger" @onclick="CancelPendingEnrollmentClick">
+                            <button type="button" class="btn btn-sm btn-outline-danger" @onclick="CancelPendingEnrolmentClick">
                                 Cancel Pending Request
                             </button>
                         </div>
                     </div>
 
-                    @if (!string.IsNullOrWhiteSpace(pendingEnrollment.StatusDetailMessage))
+                    @if (!string.IsNullOrWhiteSpace(pendingEnrolment.StatusDetailMessage))
                     {
-                        <div class="alert @(pendingEnrollment.Status == PendingCaEnrollmentStatus.ReadyForActivation ? "alert-success" : (pendingEnrollment.Status == PendingCaEnrollmentStatus.Failed || pendingEnrollment.Status == PendingCaEnrollmentStatus.SubmissionUncertain ? "alert-warning" : "alert-info")) mb-3" role="status">
-                            <strong>Status:</strong> @pendingEnrollment.StatusDetailMessage
-                            @if (!string.IsNullOrWhiteSpace(pendingEnrollment.UpstreamRequestId))
+                        <div class="alert @(pendingEnrolment.Status == PendingCaEnrolmentStatus.ReadyForActivation ? "alert-success" : (pendingEnrolment.Status == PendingCaEnrolmentStatus.Failed || pendingEnrolment.Status == PendingCaEnrolmentStatus.SubmissionUncertain ? "alert-warning" : "alert-info")) mb-3" role="status">
+                            <strong>Status:</strong> @pendingEnrolment.StatusDetailMessage
+                            @if (!string.IsNullOrWhiteSpace(pendingEnrolment.UpstreamRequestId))
                             {
-                                <div class="small mt-1">Upstream AD CS Request ID: <code>@pendingEnrollment.UpstreamRequestId</code></div>
+                                <div class="small mt-1">Upstream AD CS Request ID: <code>@pendingEnrolment.UpstreamRequestId</code></div>
                             }
                         </div>
                     }
@@ -358,23 +358,23 @@
                     <div class="ca-summary-grid">
                         <div class="ca-stat-box">
                             <div class="ca-stat-label">Requested Subject DN</div>
-                            <div class="ca-stat-value">@pendingEnrollment.SubjectDistinguishedName</div>
+                            <div class="ca-stat-value">@pendingEnrolment.SubjectDistinguishedName</div>
                         </div>
                         <div class="ca-stat-box">
                             <div class="ca-stat-label">Key &amp; Requested PathLen</div>
                             <div class="ca-stat-value">
-                                @pendingEnrollment.KeyAlgorithm @pendingEnrollment.KeySizeBits
+                                @pendingEnrolment.KeyAlgorithm @pendingEnrolment.KeySizeBits
                                 &middot;
-                                @(pendingEnrollment.RequestedPathLengthConstraint.HasValue ? $"pathLen={pendingEnrollment.RequestedPathLengthConstraint.Value}" : "unconstrained")
+                                @(pendingEnrolment.RequestedPathLengthConstraint.HasValue ? $"pathLen={pendingEnrolment.RequestedPathLengthConstraint.Value}" : "unconstrained")
                             </div>
                         </div>
                         <div class="ca-stat-box">
                             <div class="ca-stat-label">Subject Key Identifier (SKI)</div>
-                            <div class="ca-stat-value"><code>@pendingEnrollment.SubjectKeyIdentifierHex</code></div>
+                            <div class="ca-stat-value"><code>@pendingEnrolment.SubjectKeyIdentifierHex</code></div>
                         </div>
                         <div class="ca-stat-box">
                             <div class="ca-stat-label">Leaf CDP &amp; AIA URLs</div>
-                            <div class="ca-stat-value small">CDP: @pendingEnrollment.CrlDistributionPointUrl<br />AIA: @pendingEnrollment.AuthorityIssuerCertUrl</div>
+                            <div class="ca-stat-value small">CDP: @pendingEnrolment.CrlDistributionPointUrl<br />AIA: @pendingEnrolment.AuthorityIssuerCertUrl</div>
                         </div>
                     </div>
 
@@ -383,11 +383,11 @@
                         <textarea id="pending-ca-csr-pem"
                                   class="form-control monospace-input"
                                   rows="4"
-                                  readonly>@pendingEnrollment.CsrPem</textarea>
+                                  readonly>@pendingEnrolment.CsrPem</textarea>
                     </div>
 
                     <!-- Validation & Activation Summary Panel (when ReadyForActivation) -->
-                    @if (pendingActivationSummary != null && pendingEnrollment.Status == PendingCaEnrollmentStatus.ReadyForActivation)
+                    @if (pendingActivationSummary != null && pendingEnrolment.Status == PendingCaEnrolmentStatus.ReadyForActivation)
                     {
                         <div class="operation-panel mb-4 border-success">
                             <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
@@ -560,7 +560,7 @@
                                         </div>
                                     }
 
-                                    @if (pendingEnrollment.Status == PendingCaEnrollmentStatus.SubmissionUncertain)
+                                    @if (pendingEnrolment.Status == PendingCaEnrolmentStatus.SubmissionUncertain)
                                     {
                                         <div class="alert alert-warning small mb-3">
                                             <strong>Uncertain Submission Outcome:</strong> The previous WSTEP submission timed out or was interrupted after sending. To avoid duplicate CA requests, reconcile with the Request ID from the parent CA or upload the signed certificate manually.
@@ -581,7 +581,7 @@
                                     </div>
 
                                     <div class="d-flex flex-wrap justify-content-end gap-2 pt-2 border-top">
-                                        @if (pendingEnrollment.Status == PendingCaEnrollmentStatus.SubmissionUncertain)
+                                        @if (pendingEnrolment.Status == PendingCaEnrolmentStatus.SubmissionUncertain)
                                         {
                                             <button type="button" class="btn btn-sm btn-outline-warning" @onclick="() => SubmitToCesClick(forceResubmit: true)">
                                                 Force Resubmit CSR to AD CS CES
@@ -591,9 +591,9 @@
                                         {
                                             <RadzenButton Text="Submit CSR to AD CS CES"
                                                           Click="@(() => SubmitToCesClick(forceResubmit: false))"
-                                                          Disabled="@(pendingEnrollment.Status == PendingCaEnrollmentStatus.AwaitingApproval
-                                                              || pendingEnrollment.Status == PendingCaEnrollmentStatus.ReadyForActivation
-                                                              || !string.IsNullOrWhiteSpace(pendingEnrollment.ReceivedIssuerCertificatePem))" />
+                                                          Disabled="@(pendingEnrolment.Status == PendingCaEnrolmentStatus.AwaitingApproval
+                                                              || pendingEnrolment.Status == PendingCaEnrolmentStatus.ReadyForActivation
+                                                              || !string.IsNullOrWhiteSpace(pendingEnrolment.ReceivedIssuerCertificatePem))" />
                                         }
                                     </div>
                                 }
@@ -891,7 +891,7 @@
                 </RadzenCard>
             }
 
-            @if (caProvisionMode == CaProvisionMode.RequestExternal && pendingEnrollment == null)
+            @if (caProvisionMode == CaProvisionMode.RequestExternal && pendingEnrolment == null)
             {
                 <RadzenCard class="mb-4" style="max-width: 920px;">
                     <div class="section-card-header">
@@ -1481,13 +1481,13 @@
                         @if (localRootAuthorities.Count == 0)
                         {
                             <div class="alert alert-warning small py-2 mb-2" role="alert">
-                                <strong>Unavailable:</strong> No locally held Root CA private key is present on this instance (only an externally signed Intermediate CA or no Root CA is configured). Uncheck this option to download an ordinary state backup.
+                                <strong>Unavailable:</strong> No locally held Root CA private key is present on this instance (only an externally signed Intermediate CA or no Root CA is configured). Untick this option to download an ordinary state backup.
                             </div>
                         }
                         else if (custodyReport is { HasEffectivePassphrase: false })
                         {
                             <div class="alert alert-warning small py-2 mb-2" role="alert">
-                                <strong>CA Key Custody Locked:</strong> The Root CA private key cannot be exported into a PKCS#12 while CA key custody is locked. Unlock the CA signing key first, or uncheck this option to download an ordinary state backup.
+                                <strong>CA Key Custody Locked:</strong> The Root CA private key cannot be exported into a PKCS#12 while CA key custody is locked. Unlock the CA signing key first, or untick this option to download an ordinary state backup.
                             </div>
                         }
                         <div class="row g-2 align-items-end mt-1">
@@ -1662,7 +1662,7 @@
 
     private CaAuthorityRecord? activeCa;
     private CaKeyCustodyReport? custodyReport;
-    private PendingCaEnrollmentRecord? pendingEnrollment;
+    private PendingCaEnrolmentRecord? pendingEnrolment;
     private CaActivationPreviewSummary? pendingActivationSummary;
     private AdCsCesConnectorConfig cesConfig = new();
     private IReadOnlyList<UserSummaryDto> users = [];
@@ -1778,7 +1778,7 @@
     protected override async Task OnInitializedAsync()
     {
         await ReloadAllAsync();
-        if (pendingEnrollment != null)
+        if (pendingEnrolment != null)
         {
             caProvisionMode = CaProvisionMode.RequestExternal;
         }
@@ -1868,11 +1868,11 @@
             selectedBackupRootCaId = (localRootAuthorities.FirstOrDefault(a => a.IsActive) ?? localRootAuthorities[0]).Id;
         }
         custodyReport = await CaService.InspectKeyCustodyAsync();
-        pendingEnrollment = await CaService.GetActivePendingEnrollmentAsync();
-        pendingActivationSummary = CertificateAuthorityService.DeserializeActivationSummary(pendingEnrollment);
-        if (pendingEnrollment != null && !string.IsNullOrWhiteSpace(pendingEnrollment.UpstreamRequestId))
+        pendingEnrolment = await CaService.GetActivePendingEnrolmentAsync();
+        pendingActivationSummary = CertificateAuthorityService.DeserialiseActivationSummary(pendingEnrolment);
+        if (pendingEnrolment != null && !string.IsNullOrWhiteSpace(pendingEnrolment.UpstreamRequestId))
         {
-            cesQueryRequestId = pendingEnrollment.UpstreamRequestId;
+            cesQueryRequestId = pendingEnrolment.UpstreamRequestId;
         }
         if (CesService != null)
         {
@@ -1938,7 +1938,7 @@
             {
                 if (selectedBackupRootCaId <= 0)
                 {
-                    Notify(Radzen.NotificationSeverity.Error, "Backup Error", "No locally managed Root CA is available to include as a PKCS#12 artifact.");
+                    Notify(Radzen.NotificationSeverity.Error, "Backup Error", "No locally managed Root CA is available to include as a PKCS#12 artefact.");
                     return;
                 }
 
@@ -2414,7 +2414,7 @@
                 ? externalCaPassphrase
                 : (CaService.ResolveEffectivePassphrase() ?? string.Empty);
 
-            PendingCaEnrollmentRecord created = await CaService.CreatePendingCaEnrollmentAsync(
+            PendingCaEnrolmentRecord created = await CaService.CreatePendingCaEnrolmentAsync(
                 externalCaName,
                 externalCaCommonName,
                 defaults.Country,
@@ -2445,14 +2445,14 @@
 
     private async Task DownloadPendingCsrClick()
     {
-        if (pendingEnrollment == null)
+        if (pendingEnrolment == null)
         {
             return;
         }
 
         try
         {
-            var csrDownload = await CaService.GetPendingCaCsrForDownloadAsync(pendingEnrollment.Id);
+            var csrDownload = await CaService.GetPendingCaCsrForDownloadAsync(pendingEnrolment.Id);
             if (csrDownload == null)
             {
                 Notify(Radzen.NotificationSeverity.Error, "Download Error", "Pending CSR was not found.");
@@ -2506,7 +2506,7 @@
 
     private async Task ValidateManualBundleClick()
     {
-        if (pendingEnrollment == null)
+        if (pendingEnrolment == null)
         {
             return;
         }
@@ -2514,7 +2514,7 @@
         try
         {
             CaBundleValidationResult result = await CaService.ValidateAndStageSignedCaBundleAsync(
-                pendingEnrollment.Id,
+                pendingEnrolment.Id,
                 manualSignedCertFileBytes,
                 manualSignedCertText,
                 manualChainCertFileBytes,
@@ -2544,7 +2544,7 @@
 
     private async Task ActivatePendingCaClick()
     {
-        if (pendingEnrollment == null)
+        if (pendingEnrolment == null)
         {
             return;
         }
@@ -2554,15 +2554,15 @@
             bool confirmed = await JS.InvokeAsync<bool>(
                 "confirm",
                 activeCa == null
-                    ? $"Activate Issuing CA '{pendingEnrollment.CaName}' and enable certificate issuance?"
-                    : $"Replace active Issuing CA '{activeCa.Name}' with '{pendingEnrollment.CaName}'? The previous CA and its historical records will be retained.");
+                    ? $"Activate Issuing CA '{pendingEnrolment.CaName}' and enable certificate issuance?"
+                    : $"Replace active Issuing CA '{activeCa.Name}' with '{pendingEnrolment.CaName}'? The previous CA and its historical records will be retained.");
             if (!confirmed)
             {
                 return;
             }
 
-            CaAuthorityRecord activated = await CaService.ActivatePendingCaEnrollmentAsync(
-                pendingEnrollment.Id,
+            CaAuthorityRecord activated = await CaService.ActivatePendingCaEnrolmentAsync(
+                pendingEnrolment.Id,
                 string.IsNullOrWhiteSpace(pendingOperationPassphrase) ? null : pendingOperationPassphrase);
 
             pendingOperationPassphrase = "";
@@ -2577,22 +2577,22 @@
         }
     }
 
-    private async Task CancelPendingEnrollmentClick()
+    private async Task CancelPendingEnrolmentClick()
     {
-        if (pendingEnrollment == null)
+        if (pendingEnrolment == null)
         {
             return;
         }
 
         bool confirmed = await JS.InvokeAsync<bool>(
             "confirm",
-            $"Cancel pending request '{pendingEnrollment.CaName}' and permanently delete its unactivated private key?");
+            $"Cancel pending request '{pendingEnrolment.CaName}' and permanently delete its unactivated private key?");
         if (!confirmed)
         {
             return;
         }
 
-        var (ok, err) = await CaService.CancelPendingCaEnrollmentAsync(pendingEnrollment.Id);
+        var (ok, err) = await CaService.CancelPendingCaEnrolmentAsync(pendingEnrolment.Id);
         if (!ok)
         {
             Notify(Radzen.NotificationSeverity.Error, "Cancel Error", err ?? "Failed to cancel pending request.");
@@ -2647,13 +2647,13 @@
 
     private async Task SubmitToCesClick(bool forceResubmit)
     {
-        if (pendingEnrollment == null || CesService == null)
+        if (pendingEnrolment == null || CesService == null)
         {
             return;
         }
 
-        AdCsCesOperationResult result = await CesService.SubmitPendingEnrollmentAsync(
-            pendingEnrollment.Id,
+        AdCsCesOperationResult result = await CesService.SubmitPendingEnrolmentAsync(
+            pendingEnrolment.Id,
             string.IsNullOrWhiteSpace(cesOneTimePassword) ? null : cesOneTimePassword,
             templateOverride: null,
             forceResubmit: forceResubmit);
@@ -2675,13 +2675,13 @@
 
     private async Task QueryCesPendingStatusClick()
     {
-        if (pendingEnrollment == null || CesService == null)
+        if (pendingEnrolment == null || CesService == null)
         {
             return;
         }
 
         AdCsCesOperationResult result = await CesService.QueryPendingStatusAsync(
-            pendingEnrollment.Id,
+            pendingEnrolment.Id,
             string.IsNullOrWhiteSpace(cesQueryRequestId) ? null : cesQueryRequestId,
             string.IsNullOrWhiteSpace(cesOneTimePassword) ? null : cesOneTimePassword);
 

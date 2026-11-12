@@ -41,7 +41,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
         CertificateAuthorityService caService = _services.GetRequiredService<CertificateAuthorityService>();
         BackupRestoreService backupService = _services.GetRequiredService<BackupRestoreService>();
 
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync(caService, passphrase);
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync(caService, passphrase);
         Assert.True(File.Exists(pending.EncryptedPrivateKeyPath));
 
         var firstDownload = await caService.GetPendingCaCsrForDownloadAsync(pending.Id);
@@ -55,7 +55,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
         _services.Dispose();
         _services = BuildServices(_dbPath, _caDir, _dpDir);
         caService = _services.GetRequiredService<CertificateAuthorityService>();
-        PendingCaEnrollmentRecord? resumed = await caService.GetActivePendingEnrollmentAsync();
+        PendingCaEnrolmentRecord? resumed = await caService.GetActivePendingEnrolmentAsync();
         Assert.NotNull(resumed);
         Assert.Equal(pending.Id, resumed.Id);
         Assert.Equal(pending.CsrPem, resumed.CsrPem);
@@ -77,9 +77,9 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
         BackupRestoreService.RestoreBackupArchive(backup, restoredDb, restoredCa, restoredDp);
         _services = BuildServices(restoredDb, restoredCa, restoredDp);
 
-        PendingCaEnrollmentRecord? restoredPending = await _services
+        PendingCaEnrolmentRecord? restoredPending = await _services
             .GetRequiredService<CertificateAuthorityService>()
-            .GetActivePendingEnrollmentAsync();
+            .GetActivePendingEnrolmentAsync();
         Assert.NotNull(restoredPending);
         Assert.Equal(
             Path.Combine(restoredCa, Path.GetFileName(pending.EncryptedPrivateKeyPath)),
@@ -127,7 +127,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
         Assert.True(oldIssued.Succeeded, oldIssued.ErrorMessage);
         Assert.Equal(oldCa.Id, oldIssued.Record!.CaAuthorityId);
 
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync(caService, passphrase);
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync(caService, passphrase);
         Assert.Equal(oldCa.Id, (await caService.GetActiveAuthorityAsync())!.Id);
 
         using TestCaRoot externalRoot = TestCaRoot.Create(
@@ -168,7 +168,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
         Assert.True(duringPending.Succeeded, duringPending.ErrorMessage);
         Assert.Equal(oldCa.Id, duringPending.Record!.CaAuthorityId);
 
-        CaAuthorityRecord replacement = await caService.ActivatePendingCaEnrollmentAsync(pending.Id);
+        CaAuthorityRecord replacement = await caService.ActivatePendingCaEnrolmentAsync(pending.Id);
         Assert.NotEqual(oldCa.Id, replacement.Id);
         Assert.True(replacement.IsActive);
         Assert.Equal($"/authorities/{replacement.Id}/ca.crl", replacement.CrlDistributionPointUrl);
@@ -262,7 +262,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
             365,
             passphrase);
 
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync(caService, passphrase);
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync(caService, passphrase);
         using TestCaRoot externalRoot = TestCaRoot.Create("CN=External Root,O=Tests,C=US", 1);
 
         // Sign a different CSR: public key correspondence must fail.
@@ -293,14 +293,14 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
         Assert.Contains("match", failed.ErrorMessage, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(oldCa.Id, (await caService.GetActiveAuthorityAsync())!.Id);
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => caService.ActivatePendingCaEnrollmentAsync(pending.Id));
+            () => caService.ActivatePendingCaEnrolmentAsync(pending.Id));
 
         string pendingKeyPath = pending.EncryptedPrivateKeyPath;
-        var (cancelled, cancelError) = await caService.CancelPendingCaEnrollmentAsync(pending.Id);
+        var (cancelled, cancelError) = await caService.CancelPendingCaEnrolmentAsync(pending.Id);
         Assert.True(cancelled, cancelError);
         Assert.False(File.Exists(pendingKeyPath));
         Assert.Equal(oldCa.Id, (await caService.GetActiveAuthorityAsync())!.Id);
-        Assert.Null(await caService.GetActivePendingEnrollmentAsync());
+        Assert.Null(await caService.GetActivePendingEnrolmentAsync());
     }
 
     [Fact]
@@ -310,7 +310,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
         CertificateAuthorityService caService = _services.GetRequiredService<CertificateAuthorityService>();
 
         // Non-CA response
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync(caService, passphrase);
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync(caService, passphrase);
         using TestCaRoot root = TestCaRoot.Create("CN=Validation Root,O=Tests,C=US", 2);
         using X509Certificate2 nonCa = SignPendingCa(
             pending.CsrPem,
@@ -321,7 +321,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
             pending.Id, null, nonCa.ExportCertificatePem(), null, root.Certificate.ExportCertificatePem());
         Assert.False(nonCaResult.IsValid);
         Assert.Contains("not a valid CA", nonCaResult.ErrorMessage);
-        await caService.CancelPendingCaEnrollmentAsync(pending.Id);
+        await caService.CancelPendingCaEnrolmentAsync(pending.Id);
 
         // CA certificate without CrlSign
         pending = await CreatePendingAsync(caService, passphrase);
@@ -334,7 +334,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
             pending.Id, null, noCrlSign.ExportCertificatePem(), null, root.Certificate.ExportCertificatePem());
         Assert.False(noCrlResult.IsValid);
         Assert.Contains("CrlSign", noCrlResult.ErrorMessage);
-        await caService.CancelPendingCaEnrollmentAsync(pending.Id);
+        await caService.CancelPendingCaEnrolmentAsync(pending.Id);
 
         // Not-yet-valid and expired responses
         pending = await CreatePendingAsync(caService, passphrase);
@@ -349,7 +349,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
             pending.Id, null, future.ExportCertificatePem(), null, root.Certificate.ExportCertificatePem());
         Assert.False(futureResult.IsValid);
         Assert.Contains("not yet valid", futureResult.ErrorMessage);
-        await caService.CancelPendingCaEnrollmentAsync(pending.Id);
+        await caService.CancelPendingCaEnrolmentAsync(pending.Id);
 
         pending = await CreatePendingAsync(caService, passphrase);
         using X509Certificate2 expired = SignPendingCa(
@@ -363,9 +363,9 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
             pending.Id, null, expired.ExportCertificatePem(), null, root.Certificate.ExportCertificatePem());
         Assert.False(expiredResult.IsValid);
         Assert.Contains("expired", expiredResult.ErrorMessage);
-        await caService.CancelPendingCaEnrollmentAsync(pending.Id);
+        await caService.CancelPendingCaEnrolmentAsync(pending.Id);
 
-        // Parent pathLen=0 cannot authorize another issuing intermediate.
+        // Parent pathLen=0 cannot authorise another issuing intermediate.
         pending = await CreatePendingAsync(caService, passphrase);
         using TestCaRoot pathZeroRoot = TestCaRoot.Create("CN=Path Zero Root,O=Tests,C=US", 0);
         using X509Certificate2 pathViolation = SignPendingCa(
@@ -377,7 +377,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
             pending.Id, null, pathViolation.ExportCertificatePem(), null, pathZeroRoot.Certificate.ExportCertificatePem());
         Assert.False(pathResult.IsValid);
         Assert.Contains("pathLenConstraint", pathResult.ErrorMessage);
-        await caService.CancelPendingCaEnrollmentAsync(pending.Id);
+        await caService.CancelPendingCaEnrolmentAsync(pending.Id);
 
         // Unsupported critical restriction on the returned Issuing CA.
         pending = await CreatePendingAsync(caService, passphrase);
@@ -397,7 +397,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
             pending.Id, null, unknownCritical.ExportCertificatePem(), null, root.Certificate.ExportCertificatePem());
         Assert.False(criticalResult.IsValid);
         Assert.Contains("unsupported critical extension", criticalResult.ErrorMessage, StringComparison.OrdinalIgnoreCase);
-        await caService.CancelPendingCaEnrollmentAsync(pending.Id);
+        await caService.CancelPendingCaEnrolmentAsync(pending.Id);
 
         // Issuer name equality is not accepted as proof: a certificate signed by another key must fail.
         pending = await CreatePendingAsync(caService, passphrase);
@@ -424,7 +424,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
     }
 
     [Fact]
-    public async Task IssuanceHonorsDnsNameAndEkuConstraintsFromExternalChain()
+    public async Task IssuanceHonoursDnsNameAndEkuConstraintsFromExternalChain()
     {
         const string passphrase = "ConstraintVaultPass!2026";
         CertificateAuthorityService caService = _services.GetRequiredService<CertificateAuthorityService>();
@@ -451,7 +451,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
                 new X509EnhancedKeyUsageExtension(serverOnlyEku, critical: false)
             ]);
 
-        PendingCaEnrollmentRecord pending = await CreatePendingAsync(caService, passphrase);
+        PendingCaEnrolmentRecord pending = await CreatePendingAsync(caService, passphrase);
         using X509Certificate2 signedCa = SignPendingCa(
             pending.CsrPem,
             constrainedRoot,
@@ -466,7 +466,7 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
         Assert.True(staged.IsValid, staged.ErrorMessage);
         Assert.Contains(CertificateProfiles.ServerAuthOid, staged.Summary!.EffectivePermittedEkuOids);
         Assert.Contains(".contoso.com", staged.Summary.PermittedDnsSubtrees);
-        await caService.ActivatePendingCaEnrollmentAsync(pending.Id);
+        await caService.ActivatePendingCaEnrolmentAsync(pending.Id);
 
         CryptoFactory crypto = new();
         KeyPair allowedKey = crypto.KeyGen(256);
@@ -506,11 +506,11 @@ public sealed class ExternalCaEnrollmentTests : IDisposable
         Assert.Contains("excluded NameConstraints", excluded.ErrorMessage);
     }
 
-    private async Task<PendingCaEnrollmentRecord> CreatePendingAsync(
+    private async Task<PendingCaEnrolmentRecord> CreatePendingAsync(
         CertificateAuthorityService caService,
         string passphrase)
     {
-        return await caService.CreatePendingCaEnrollmentAsync(
+        return await caService.CreatePendingCaEnrolmentAsync(
             "External Issuing CA",
             "external-issuing.contoso.com",
             "US",

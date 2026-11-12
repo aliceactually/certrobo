@@ -20,13 +20,13 @@
     {
         <div class="row mb-3">
             <div class="col" style="max-width: 1248px;">
-                @if (pendingCaEnrollment != null)
+                @if (pendingCaEnrolment != null)
                 {
                     <div class="alert alert-info" role="status">
                         <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-1">
                             <h4 class="h5 mb-0">
-                                Pending Issuing CA Enrolment: @pendingCaEnrollment.CaName
-                                <span class="badge bg-primary ms-2">@FormatPendingStatusLabel(pendingCaEnrollment.Status)</span>
+                                Pending Issuing CA Enrolment: @pendingCaEnrolment.CaName
+                                <span class="badge bg-primary ms-2">@FormatPendingStatusLabel(pendingCaEnrolment.Status)</span>
                             </h4>
                             <AuthorizeView Roles="@AppRoles.Administrator">
                                 <div class="d-flex flex-wrap gap-2">
@@ -36,11 +36,11 @@
                             </AuthorizeView>
                         </div>
                         <p class="mb-1 small">
-                            Leaf certificate issuance is unavailable until the pending Issuing CA (<code>@pendingCaEnrollment.SubjectDistinguishedName</code>, @pendingCaEnrollment.KeyAlgorithm @pendingCaEnrollment.KeySizeBits) is signed by its parent CA, validated, and activated.
+                            Leaf certificate issuance is unavailable until the pending Issuing CA (<code>@pendingCaEnrolment.SubjectDistinguishedName</code>, @pendingCaEnrolment.KeyAlgorithm @pendingCaEnrolment.KeySizeBits) is signed by its parent CA, validated, and activated.
                         </p>
-                        @if (!string.IsNullOrWhiteSpace(pendingCaEnrollment.StatusDetailMessage))
+                        @if (!string.IsNullOrWhiteSpace(pendingCaEnrolment.StatusDetailMessage))
                         {
-                            <div class="small text-muted-theme">@pendingCaEnrollment.StatusDetailMessage</div>
+                            <div class="small text-muted-theme">@pendingCaEnrolment.StatusDetailMessage</div>
                         }
                     </div>
                 }
@@ -234,21 +234,21 @@
     private string certificate = "";
     private string? lastIssuedChainPem = null;
     private CaAuthorityRecord? activeCa;
-    private PendingCaEnrollmentRecord? pendingCaEnrollment;
+    private PendingCaEnrolmentRecord? pendingCaEnrolment;
 
     protected override async Task OnInitializedAsync()
     {
         activeCa = await CaService.GetActiveAuthorityAsync();
-        pendingCaEnrollment = await CaService.GetActivePendingEnrollmentAsync();
+        pendingCaEnrolment = await CaService.GetActivePendingEnrolmentAsync();
     }
 
-    private static string FormatPendingStatusLabel(PendingCaEnrollmentStatus status) => status switch
+    private static string FormatPendingStatusLabel(PendingCaEnrolmentStatus status) => status switch
     {
-        PendingCaEnrollmentStatus.AwaitingSubmission => "Awaiting Submission",
-        PendingCaEnrollmentStatus.SubmissionUncertain => "Submission Outcome Uncertain",
-        PendingCaEnrollmentStatus.AwaitingApproval => "Awaiting Parent CA Approval",
-        PendingCaEnrollmentStatus.ReadyForActivation => "Ready for Activation",
-        PendingCaEnrollmentStatus.Failed => "Attention Required",
+        PendingCaEnrolmentStatus.AwaitingSubmission => "Awaiting Submission",
+        PendingCaEnrolmentStatus.SubmissionUncertain => "Submission Outcome Uncertain",
+        PendingCaEnrolmentStatus.AwaitingApproval => "Awaiting Parent CA Approval",
+        PendingCaEnrolmentStatus.ReadyForActivation => "Ready for Activation",
+        PendingCaEnrolmentStatus.Failed => "Attention Required",
         _ => status.ToString()
     };
 

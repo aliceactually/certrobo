@@ -30,7 +30,7 @@ public sealed record PolicyEvaluationResult(
 /// <summary>
 /// Server-side policy and CSR validation boundary.
 /// Verifies user account status, SecurityStamp/roles, CSR signature, key type/size,
-/// requested extensions/SAN types, and domain authorization rules.
+/// requested extensions/SAN types, and domain authorisation rules.
 /// </summary>
 public sealed class IssuancePolicyService(
     UserManager<ApplicationUser> userManager,
@@ -411,7 +411,7 @@ public sealed class IssuancePolicyService(
 
         string canonicalCn = string.IsNullOrEmpty(commonName)
             ? canonicalNames[0]
-            : DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(commonName);
+            : DomainPolicyEvaluator.CanonicaliseDomainPatternOrIdentity(commonName);
 
         return (true, null, new ValidatedCsrRequest(
             decoded,
@@ -424,7 +424,7 @@ public sealed class IssuancePolicyService(
 
     public static bool IsValidRequestedDnsIdentity(string rawName, out string canonical)
     {
-        canonical = DomainPolicyEvaluator.CanonicalizeDomainPatternOrIdentity(rawName);
+        canonical = DomainPolicyEvaluator.CanonicaliseDomainPatternOrIdentity(rawName);
         if (string.IsNullOrEmpty(canonical) || canonical == "*")
         {
             return false;
