@@ -165,6 +165,38 @@ public sealed class Pkcs12AndBackupCustodyTests : IDisposable
     }
 
     [Fact]
+    public void OfficialWordlistIntegrity_AcceptsLfAndCrLfButRejectsOtherChanges()
+    {
+        string path = Path.Combine(AppContext.BaseDirectory, "Resources", "Passphrases", "eff_large_wordlist.txt");
+        string lf = File.ReadAllText(path).Replace("\r\n", "\n", StringComparison.Ordinal);
+        int firstNewline = lf.IndexOf('\n');
+        Assert.True(firstNewline > 0);
+        string mixed = lf.Insert(firstNewline, "\r");
+
+        foreach (string wordlist in new[] { lf, lf.Replace("\n", "\r\n", StringComparison.Ordinal), mixed })
+        {
+            IReadOnlyList<string> words = EffDicewarePassphraseGenerator.ParseAndValidateWordlistBytes(
+                Encoding.UTF8.GetBytes(wordlist), "test");
+            Assert.Equal(EffDicewarePassphraseGenerator.ExpectedWordCount, words.Count);
+            Assert.Equal("abacus", words[0]);
+            Assert.Equal("zoom", words[^1]);
+        }
+
+        foreach (string wordlist in new[]
+        {
+            lf.Replace("11111\tabacus", "11111\tabacux", StringComparison.Ordinal),
+            lf.Replace("11111\tabacus", "11111 abacus", StringComparison.Ordinal),
+            lf[..^1],
+            lf.Remove(firstNewline, 1).Insert(firstNewline, "\r")
+        })
+        {
+            InvalidOperationException error = Assert.Throws<InvalidOperationException>(() =>
+                EffDicewarePassphraseGenerator.ParseAndValidateWordlistBytes(Encoding.UTF8.GetBytes(wordlist), "test"));
+            Assert.Contains("SHA-256 integrity verification", error.Message);
+        }
+    }
+
+    [Fact]
     public async Task StateBackupWithRootCaPkcs12_EnforcesAdminAuth_HandlesLockedAndUnlockedCustody_PreservesOrdinaryBackupRestore_AndVerifiesWithOpenSslAndDotNet()
     {
         const string storageSecret = "StateBackupStorageCustody!2026";

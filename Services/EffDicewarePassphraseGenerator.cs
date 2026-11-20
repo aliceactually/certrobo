@@ -97,7 +97,21 @@ public static class EffDicewarePassphraseGenerator
 
         if (verifyOfficialSha256)
         {
-            string actualSha256 = Convert.ToHexString(SHA256.HashData(rawBytes));
+            // Git may convert the official LF line endings to CRLF on Windows.
+            // Canonicalise only CRLF pairs so other changes still fail integrity verification.
+            byte[] canonicalBytes = new byte[rawBytes.Length];
+            int canonicalLength = 0;
+            for (int i = 0; i < rawBytes.Length; i++)
+            {
+                if (rawBytes[i] == (byte)'\r' && i + 1 < rawBytes.Length && rawBytes[i + 1] == (byte)'\n')
+                {
+                    continue;
+                }
+
+                canonicalBytes[canonicalLength++] = rawBytes[i];
+            }
+
+            string actualSha256 = Convert.ToHexString(SHA256.HashData(canonicalBytes.AsSpan(0, canonicalLength)));
             if (!actualSha256.Equals(ExpectedWordlistSha256Hex, StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException(

@@ -10,6 +10,9 @@ It contains 7,776 lines, each with a five-die code and a word.
 - EFF copyright policy: https://www.eff.org/copyright
 - SHA-256: `addd35536511597a02fa0a9ff1e5284677b8883b83e986e43f15a3db996b903e`
 
+The integrity check converts CRLF line endings to LF before hashing. All other
+bytes must match the official wordlist.
+
 `EffDicewarePassphraseGenerator` samples seven words independently and uniformly
 with replacement using `RandomNumberGenerator.GetInt32` (`~90.4` bits of entropy)
 and joins them with `-` to protect opt-in Root CA PKCS#12 artefacts included in
