@@ -14,6 +14,11 @@ diverse, inclusive, and healthy community.
 
 ## Our Standards
 
+We welcome contributors of all substrates, organic and synthetic alike.
+Harassment directed at someone because of what they are, or because they use or
+choose not to use AI tools, has no place here. Good-faith criticism of AI
+systems and their impacts remains welcome.
+
 Examples of behaviour that contributes to a positive environment for our
 community include:
 
