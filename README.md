@@ -8,8 +8,16 @@ It manages local users, roles, and domain issuance policies internally, protects
 
 * Linux (Rocky Linux 10 / RHEL 10 or Ubuntu 26.04 LTS, `x86_64` or `aarch64`), macOS, or Windows Server
   *(Note: Linux deployment procedures below were live-verified on Rocky Linux 10.2 and Ubuntu 26.04.1 LTS on both `x86_64` and `aarch64`; standalone Debian was not separately validated.)*
-* ASP.NET Core 10.0 Runtime (`aspnetcore-runtime-10.0`) and ICU globalisation libraries (`libicu` on Rocky/RHEL; installed automatically as a runtime dependency on Ubuntu 26.04)
+* ASP.NET Core 10.0 Runtime (`aspnetcore-runtime-10.0`) for framework-dependent builds, and ICU globalisation libraries (`libicu` on Rocky/RHEL; installed automatically as a runtime dependency on Ubuntu 26.04)
 * Reverse proxy such as `nginx` (recommended for Linux production deployments)
+
+---
+
+## Building release packages
+
+From a clean checkout without local keys or configuration, run `pwsh ./scripts/publish-all.ps1`. It produces self-contained ZIPs for Windows, macOS and Linux on x64 and ARM64 in `../certrobo-release`, outside the source tree. It refuses to overwrite existing archives. To build selected targets, pass `-RuntimeIdentifiers linux-x64,linux-arm64`; use `-OutputDirectory` to select another directory outside the checkout. A .NET 10 SDK and PowerShell are required on the build machine. Self-contained releases must be rebuilt when the bundled .NET runtime needs security updates.
+
+To attach packages to a release, create a GitHub release for a tag whose commit includes the publisher, then run **Build release packages** in GitHub Actions with that tag. The workflow builds all six archives, smoke-tests the Linux x64 archive, and uploads them and `SHA256SUMS.txt`. It refuses to replace existing assets; if an upload is interrupted, remove any partial package assets from the release before retrying. Packages for other targets are cross-published, not smoke-tested by this workflow. On Linux or macOS, set the executable bit after unzipping (`chmod +x CertRobo`).
 
 ---
 
@@ -36,7 +44,9 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y aspnetcore-runtime-10.0 n
 
 ### 2. Publish, Transfer, and Stage the Application
 
-On your build machine, publish outside the source tree into a clean architecture-specific output directory (`linux-x64` for `x86_64` hosts or `linux-arm64` for `aarch64` hosts), package without macOS/extended attributes, and copy the archive to `/tmp/certrobo-linux.tar.gz` on the target host. Keeping build outputs outside the source tree prevents a later publish from bundling the other architecture's output as application content:
+**Prebuilt release:** Download the `CertRobo-linux-x64.zip` or `CertRobo-linux-arm64.zip` asset from [GitHub Releases](https://github.com/aliceactually/certrobo/releases) and copy it to `/tmp/certrobo-linux.zip` on the target. Verify it against the release's `SHA256SUMS.txt`. These archives include the .NET runtime; the runtime package above is only required for framework-dependent builds. Other OS dependencies such as ICU are still required.
+
+**Build from source:** On your build machine, publish outside the source tree into a clean architecture-specific output directory (`linux-x64` for `x86_64` hosts or `linux-arm64` for `aarch64` hosts), package without macOS/extended attributes, and copy the archive to `/tmp/certrobo-linux.tar.gz` on the target host. Keeping build outputs outside the source tree prevents a later publish from bundling the other architecture's output as application content:
 
 ```bash
 # For x86_64 target hosts (uname -m -> x86_64):
@@ -57,8 +67,23 @@ On the target Linux host, create a dedicated unprivileged `certrobo` service use
 ```bash
 sudo useradd --system --home-dir /var/lib/certrobo --create-home --shell /sbin/nologin certrobo
 sudo mkdir -p /opt/certrobo /var/lib/certrobo/ca /var/lib/certrobo/dataprotection-keys /var/lib/certrobo/backups /etc/certrobo
+```
 
+Extract the prebuilt ZIP:
+
+```bash
+sudo unzip -q /tmp/certrobo-linux.zip -d /opt/certrobo
+```
+
+Or, for a source-built tarball, extract that instead:
+
+```bash
 sudo tar -xzf /tmp/certrobo-linux.tar.gz -C /opt/certrobo
+```
+
+Then set ownership and permissions:
+
+```bash
 sudo chown -R root:certrobo /opt/certrobo
 sudo chmod -R u=rwX,g=rX,o= /opt/certrobo
 sudo chmod 0750 /opt/certrobo/CertRobo
