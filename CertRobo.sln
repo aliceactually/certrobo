@@ -9,6 +9,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Tests", "Tests", "{0AB3BF05
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CertRobo.Tests", "Tests\CertRobo.Tests\CertRobo.Tests.csproj", "{DEA447ED-613F-4248-9946-9EB991FB7D82}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CertRobo.ParserSafetyChild", "Tests\CertRobo.ParserSafetyChild\CertRobo.ParserSafetyChild.csproj", "{8E362E3D-465B-4499-8CBA-0BEFA635E453}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -43,12 +45,25 @@ Global
 		{DEA447ED-613F-4248-9946-9EB991FB7D82}.Release|x64.Build.0 = Release|Any CPU
 		{DEA447ED-613F-4248-9946-9EB991FB7D82}.Release|x86.ActiveCfg = Release|Any CPU
 		{DEA447ED-613F-4248-9946-9EB991FB7D82}.Release|x86.Build.0 = Release|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Debug|x64.Build.0 = Debug|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Debug|x86.Build.0 = Debug|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Release|x64.ActiveCfg = Release|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Release|x64.Build.0 = Release|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Release|x86.ActiveCfg = Release|Any CPU
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{DEA447ED-613F-4248-9946-9EB991FB7D82} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
+		{8E362E3D-465B-4499-8CBA-0BEFA635E453} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {AD0BC111-7FD8-4622-AE84-4A2128E4470F}

@@ -10,6 +10,7 @@ It manages local users, roles, and domain issuance policies internally, protects
   *(Note: Linux deployment procedures below were live-verified on Rocky Linux 10.2 and Ubuntu 26.04.1 LTS on both `x86_64` and `aarch64`; standalone Debian was not separately validated.)*
 * ASP.NET Core 10.0 Runtime (`aspnetcore-runtime-10.0`) and ICU globalisation libraries (`libicu` on Rocky/RHEL; installed automatically as a runtime dependency on Ubuntu 26.04)
 * Reverse proxy such as `nginx` (recommended for Linux production deployments)
+* Windows requires OpenSSL be included in the user's PATH for unit tests to complete, CertRobo has been tested with Shining ight OpenSSL (https://slproweb.com/products/Win32OpenSSL.html) on Windows Server 2025.
 
 ---
 
