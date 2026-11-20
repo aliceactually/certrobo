@@ -1,0 +1,66 @@
+name: Build release packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub release tag containing this workflow and publisher
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: certrobo-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Check release and existing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,assets > "$RUNNER_TEMP/release.json"
+          python3 - <<'PY'
+          import json, os
+          with open(os.path.join(os.environ['RUNNER_TEMP'], 'release.json'), encoding='utf-8') as f:
+              release = json.load(f)
+          if release['tagName'] != os.environ['RELEASE_TAG']:
+              raise SystemExit('Release tag does not match the selected tag')
+          rids = ('win-x64', 'win-arm64', 'osx-x64', 'osx-arm64', 'linux-x64', 'linux-arm64')
+          names = {f'CertRobo-{rid}.zip' for rid in rids} | {'SHA256SUMS.txt'}
+          existing = names.intersection(asset['name'] for asset in release['assets'])
+          if existing:
+              raise SystemExit('Release already has package assets: ' + ', '.join(sorted(existing)))
+          PY
+      - name: Build packages
+        shell: pwsh
+        run: ./scripts/publish-all.ps1 -OutputDirectory "$env:RUNNER_TEMP/certrobo-release"
+      - name: Smoke test the Linux x64 package
+        run: python3 scripts/smoke-release.py "$RUNNER_TEMP/certrobo-release/CertRobo-linux-x64.zip"
+      - name: Create checksums and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/certrobo-release"
+          sha256sum CertRobo-*.zip > SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" CertRobo-*.zip SHA256SUMS.txt
