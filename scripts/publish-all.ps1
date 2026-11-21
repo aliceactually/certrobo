@@ -6,7 +6,9 @@ param(
     [string[]] $RuntimeIdentifiers = @(
         'win-x64', 'win-arm64', 'osx-x64', 'osx-arm64', 'linux-x64', 'linux-arm64'
     ),
-    [string] $OutputDirectory = (Join-Path (Join-Path (Split-Path $PSScriptRoot -Parent) '..') 'certrobo-release')
+    [string] $OutputDirectory = (Join-Path (Join-Path (Split-Path $PSScriptRoot -Parent) '..') 'certrobo-release'),
+    [ValidateSet('Optimal', 'Fastest', 'NoCompression')]
+    [string] $CompressionLevel = 'Optimal'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,13 +53,13 @@ try {
             if (-not (Test-Path -LiteralPath (Join-Path $publish $path))) { throw "Missing $path in $rid output." }
         }
         $stagedArchive = Join-Path $tempRoot "CertRobo-$rid.zip"
-        Write-Host "Compressing $rid..."
+        Write-Host "Compressing $rid ($CompressionLevel)..."
         $compressionTimer = [Diagnostics.Stopwatch]::StartNew()
         # Stream the directory through .NET rather than Compress-Archive's
         # PowerShell byte-copy loop. Keep the existing compression level and
         # put the publish contents directly at the archive root.
         [IO.Compression.ZipFile]::CreateFromDirectory(
-            $publish, $stagedArchive, [IO.Compression.CompressionLevel]::Optimal, $false
+            $publish, $stagedArchive, [IO.Compression.CompressionLevel] $CompressionLevel, $false
         )
         $compressionTimer.Stop()
         Write-Host ("Compressed {0} in {1:N1}s ({2:N1} MiB)." -f $rid,
