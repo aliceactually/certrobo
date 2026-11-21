@@ -1,15 +1,27 @@
 #!/usr/bin/env pwsh
 # Adapted from CloudTransformer's multi-platform publish script. CertRobo's web
 # assets and configuration must travel alongside the self-contained executable.
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string[]] $RuntimeIdentifiers = @(
         'win-x64', 'win-arm64', 'osx-x64', 'osx-arm64', 'linux-x64', 'linux-arm64'
     ),
-    [string] $OutputDirectory = (Join-Path (Join-Path (Split-Path $PSScriptRoot -Parent) '..') 'certrobo-release')
+    [string] $OutputDirectory = (Join-Path (Join-Path (Split-Path $PSScriptRoot -Parent) '..') 'certrobo-release'),
+    [ValidateSet('Optimal', 'Fastest', 'NoCompression')]
+    [string] $CompressionLevel = 'Optimal',
+    [Alias('f')]
+    [switch] $Force,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]] $AdditionalArguments
 )
 
 $ErrorActionPreference = 'Stop'
+# PowerShell does not bind GNU-style double-dash switches to parameters.
+foreach ($argument in $AdditionalArguments) {
+    if ($argument -ne '--force') { throw "Unknown argument: $argument" }
+    $Force = $true
+}
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 $projectDirectory = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 $comparison = if ($IsWindows -or $env:OS -eq 'Windows_NT') {
@@ -33,7 +45,12 @@ if (($RuntimeIdentifiers | Select-Object -Unique).Count -ne $RuntimeIdentifiers.
 New-Item -ItemType Directory -Path $output -Force | Out-Null
 foreach ($rid in $RuntimeIdentifiers) {
     $archive = Join-Path $output "CertRobo-$rid.zip"
-    if (Test-Path -LiteralPath $archive) { throw "Archive already exists: $archive" }
+    if (Test-Path -LiteralPath $archive) {
+        if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "Archive destination is not a file: $archive"
+        }
+        if (-not $Force) { throw "Archive already exists: $archive. Use -Force to replace it." }
+    }
 }
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("certrobo-publish-" + [guid]::NewGuid().ToString('N'))
@@ -50,8 +67,18 @@ try {
             if (-not (Test-Path -LiteralPath (Join-Path $publish $path))) { throw "Missing $path in $rid output." }
         }
         $stagedArchive = Join-Path $tempRoot "CertRobo-$rid.zip"
-        Compress-Archive -Path (Join-Path $publish '*') -DestinationPath $stagedArchive -CompressionLevel Optimal
-        Move-Item -LiteralPath $stagedArchive -Destination (Join-Path $output "CertRobo-$rid.zip")
+        Write-Host "Compressing $rid ($CompressionLevel)..."
+        $compressionTimer = [Diagnostics.Stopwatch]::StartNew()
+        # Stream the directory through .NET rather than Compress-Archive's
+        # PowerShell byte-copy loop. Keep the existing compression level and
+        # put the publish contents directly at the archive root.
+        [IO.Compression.ZipFile]::CreateFromDirectory(
+            $publish, $stagedArchive, [IO.Compression.CompressionLevel] $CompressionLevel, $false
+        )
+        $compressionTimer.Stop()
+        Write-Host ("Compressed {0} in {1:N1}s ({2:N1} MiB)." -f $rid,
+            $compressionTimer.Elapsed.TotalSeconds, (([IO.FileInfo]$stagedArchive).Length / 1MB))
+        Move-Item -LiteralPath $stagedArchive -Destination (Join-Path $output "CertRobo-$rid.zip") -Force:$Force
     }
 } finally {
     if (Test-Path -LiteralPath $tempRoot) { Remove-Item -LiteralPath $tempRoot -Recurse -Force }
