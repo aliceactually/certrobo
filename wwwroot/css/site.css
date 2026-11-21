@@ -181,6 +181,15 @@ textarea:focus-visible,
     color: var(--text-color) !important;
 }
 
+/* Alerts keep their own foreground/background contrast in either theme.
+   Override card and page heading colours, including Radzen text styles. */
+:root .alert :is(h1, h2, h3, h4, h5, h6,
+           .h1, .h2, .h3, .h4, .h5, .h6,
+           .rz-text, .rz-text-subtitle1, .rz-text-subtitle2,
+           .rz-text-body1, .rz-text-body2) {
+    color: inherit !important;
+}
+
 /* Form inputs & selects */
 .rz-textbox,
 .rz-textarea,
