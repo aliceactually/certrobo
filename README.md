@@ -177,9 +177,174 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now certrobo.service
 ```
 
-### 5. Bootstrap Initial Administrator and CA Hierarchy
+### 5. Configure the HTTPS Frontend and Host Firewall
 
-You can complete initial setup either through the browser (`/setup` and `/admin`) or headlessly via the CLI as the `certrobo` user:
+The worked example uses **Nginx on the same host as CertRobo**, terminating TLS on TCP 443 and forwarding to Kestrel at `http://127.0.0.1:5000`. Keep the loopback-only `ASPNETCORE_URLS` setting from step 3; port 5000 does not need an inbound firewall rule. Replace **every** `pki.contoso.com` below with the DNS name clients will use, and point that name at the frontend before browsing to it.
+
+Interactive HTTP requests redirect to HTTPS. Keep the public certificate and CRL download URLs reachable over plain HTTP on TCP 80 when they are used as AIA/CDP URLs: relying parties may need those downloads before they can validate a TLS connection. The Nginx example deliberately exempts those paths from the redirect. Set `CertRobo__PublicBaseUrl` to the stable HTTP publication address, as in step 3; that is separate from the HTTPS portal address. Issued certificates retain their embedded publication URLs.
+
+#### Create a Temporary Self-Signed Frontend Certificate
+
+This certificate protects the **web frontend**, and is separate from CertRobo's CA signing identity. It lets the browser-based setup work before the CA exists. If you already have a suitable server certificate, install its leaf/intermediate chain and matching private key at the paths below instead and skip generation.
+
+On a fresh installation, generate a 30-day certificate with a DNS Subject Alternative Name:
+
+```bash
+sudo install -d -o root -g root -m 0755 /etc/pki/nginx
+sudo install -d -o root -g root -m 0700 /etc/pki/nginx/private
+sudo sh -c '
+  set -eu
+  test ! -e /etc/pki/nginx/private/server.key
+  test ! -e /etc/pki/nginx/server.crt
+  umask 077
+  openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 30 \
+    -keyout /etc/pki/nginx/private/server.key \
+    -out /etc/pki/nginx/server.crt \
+    -subj "/CN=pki.contoso.com" \
+    -addext "subjectAltName=DNS:pki.contoso.com" \
+    -addext "basicConstraints=critical,CA:FALSE" \
+    -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+    -addext "extendedKeyUsage=serverAuth"
+'
+sudo chmod 0644 /etc/pki/nginx/server.crt
+sudo openssl x509 -in /etc/pki/nginx/server.crt -noout -sha256 -fingerprint -dates
+```
+
+The browser will initially report an untrusted certificate. Compare its SHA-256 fingerprint with the value read directly on the server before accepting an exception for initial setup. Replace the temporary certificate with one trusted by your clients after CA setup (step 7), or use an existing trusted CA. A self-signed certificate encrypts the connection but does not establish server identity unless you verify or explicitly trust it. If a browser's existing HSTS policy prevents an exception, install the verified certificate in the client's trust store for bootstrap or use a certificate already trusted by that client.
+
+#### Configure Nginx
+
+Nginx allows only one `default_server` listener per IP/port pair. Resolve conflicts with the stock site before adding the configuration below:
+
+* **On Rocky Linux 10 / RHEL 10:** `/etc/nginx/nginx.conf` ships with a built-in `server { listen 80; listen [::]:80; ... }` block inside `http {}`. On a dedicated CertRobo host, comment out or remove that complete default `server` block, preserving the surrounding `http` block and its includes, so `/etc/nginx/conf.d/certrobo.conf` can bind `listen 80 default_server;`.
+* **On Ubuntu 26.04 LTS:** `/etc/nginx/nginx.conf` includes both `/etc/nginx/conf.d/*.conf` and `/etc/nginx/sites-enabled/*`. On a dedicated CertRobo host, remove the stock `/etc/nginx/sites-enabled/default` symlink (`sudo rm -f /etc/nginx/sites-enabled/default`)—or, if the host serves other virtual hosts, remove `default_server` from the competing site configuration—before testing Nginx.
+
+Create `/etc/nginx/conf.d/certrobo.conf` (compatible with both Rocky Linux 10 and Ubuntu 26.04 LTS OpenSSL builds):
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name pki.contoso.com;
+
+    # Keep public CA downloads reachable over HTTP for AIA/CDP clients.
+    location ~ ^/(ca\.crt|ca\.p7b|issuer\.crt|rootca\.crt|ca\.crl|ca\.crl\.pem|authorities/[0-9]+/(ca\.(crt|p7b|crl|crl\.pem)|issuer\.crt))$ {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # CertRobo currently applies HTTPS redirection globally. Report the
+        # terminated scheme as HTTPS only for this public-download exception
+        # so the backend does not redirect these HTTP AIA/CDP requests.
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # Redirect interactive portal traffic to HTTPS
+    location / {
+        return 301 https://pki.contoso.com$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    http2 on;
+    server_name pki.contoso.com;
+
+    ssl_certificate     /etc/pki/nginx/server.crt;
+    ssl_certificate_key /etc/pki/nginx/private/server.key;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+}
+```
+
+Test and start/reload Nginx:
+
+```bash
+# Rocky Linux 10 / RHEL 10 only (relabel TLS certificate files for SELinux):
+sudo restorecon -Rv /etc/pki/nginx /etc/nginx
+
+# Both Rocky Linux 10 and Ubuntu 26.04 LTS:
+sudo nginx -t
+sudo systemctl enable --now nginx.service
+sudo systemctl reload nginx.service
+```
+
+#### Open HTTP and HTTPS in firewalld, If Active
+
+Check whether firewalld is installed and running:
+
+```bash
+command -v firewall-cmd
+sudo firewall-cmd --state
+sudo firewall-cmd --get-active-zones
+```
+
+If the command is absent or the daemon is inactive, skip these firewalld commands and configure the firewall that actually manages the host (for example, UFW on Ubuntu). Do not enable a different firewall as part of this procedure. Also allow TCP 80/443 through any upstream firewall or security group that separates clients from the frontend.
+
+Choose the zone that applies to the client-facing interface or source network; `public` below is an example, not a required zone. Add only the HTTP and HTTPS services, both at runtime and permanently, without reloading unrelated rules:
+
+```bash
+CERTROBO_FIREWALL_ZONE=public  # Replace with the applicable zone from above.
+sudo firewall-cmd --zone="$CERTROBO_FIREWALL_ZONE" --add-service=http
+sudo firewall-cmd --zone="$CERTROBO_FIREWALL_ZONE" --add-service=https
+sudo firewall-cmd --permanent --zone="$CERTROBO_FIREWALL_ZONE" --add-service=http
+sudo firewall-cmd --permanent --zone="$CERTROBO_FIREWALL_ZONE" --add-service=https
+sudo firewall-cmd --zone="$CERTROBO_FIREWALL_ZONE" --list-services
+sudo firewall-cmd --permanent --zone="$CERTROBO_FIREWALL_ZONE" --list-services
+```
+
+#### Verify the Frontend Before Browser Setup
+
+From another client, confirm that HTTP redirects to the canonical HTTPS hostname, the HTTPS certificate is the expected one, and `/setup` loads. Once a CA exists, also confirm that its public issuer/CRL URLs respond over HTTP **without** a redirect. A not-yet-initialised CA may return an error for those downloads until setup is complete.
+
+```bash
+curl -I http://pki.contoso.com/
+# Copy only the public server.crt to the client first for this bootstrap check.
+curl --cacert ./server.crt -o /dev/null -w '%{http_code}\n' https://pki.contoso.com/setup
+# After CA setup (use the actual URLs embedded in issued certificates):
+curl -I http://pki.contoso.com/issuer.crt
+curl -I http://pki.contoso.com/ca.crl
+```
+
+If HTTPS returns 502, check `systemctl status certrobo nginx`, `journalctl -u certrobo`, and Nginx's error log; on SELinux hosts also check the `httpd_can_network_connect` boolean from step 4 and the certificate labels. If the portal loads but repeatedly disconnects, check the WebSocket upgrade headers and proxy timeouts in the HTTPS server block. Do not open port 5000 to work around a proxy error.
+
+#### Other Frontends
+
+HAProxy can provide the same arrangement: TLS termination, a portal redirect with HTTP exceptions for public CA downloads, WebSocket support, and correct forwarded scheme/client-address headers. Adapt its configuration to your environment rather than combining it with the Nginx example.
+
+Kestrel can also serve HTTPS directly using an explicitly configured server certificate. That is an alternative deployment layout, not a reverse proxy: it requires certificate/private-key access for the application account, listener/privileged-port configuration, and deliberate handling of HTTP CA downloads alongside portal redirects. Simply changing `ASPNETCORE_URLS` to an HTTPS URL does not provision a certificate. The Nginx procedure above keeps those frontend concerns separate from the unprivileged application service.
+
+References: [firewalld runtime/permanent configuration](https://firewalld.org/documentation/configuration/runtime-versus-permanent.html), [firewall-cmd options](https://firewalld.org/documentation/man-pages/firewall-cmd.html), [Nginx WebSocket proxying](https://nginx.org/en/docs/http/websocket.html), and [ASP.NET Core proxy configuration](https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/proxy-load-balancer?view=aspnetcore-10.0).
+
+### 6. Bootstrap Initial Administrator and CA Hierarchy
+
+With the HTTPS frontend running, open `https://pki.contoso.com/setup`, create the initial administrator, then use `/admin` to configure the CA hierarchy. Use your own hostname throughout this guide.
+
+Alternatively, complete setup headlessly via the CLI as the `certrobo` user:
 
 ```bash
 # 1. Optional: inspect legacy settings.xml and import <Defaults> without guessing AD accounts
@@ -193,7 +358,7 @@ sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /
 sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --init-ca "Contoso Issuing Intermediate CA" "issuing-ca.contoso.com" ECDSA-384 1825 "http://pki.contoso.com/ca.crl" "http://pki.contoso.com/ca.crt" --subordinate'
 ```
 
-### 5A. Externally Signed Issuing CA
+### 6A. Externally Signed Issuing CA
 
 CertRobo can generate and retain an encrypted Issuing CA key locally while an external parent CA signs its PKCS #10 request. This supports initial setup and replacement; during replacement, the current CA continues issuing until the validated replacement is explicitly activated.
 
@@ -255,9 +420,9 @@ CES outcomes are persisted as issued, pending approval, denied, authentication f
 
 Manual completion remains available whenever CES is disabled, unavailable, denied, or cannot retrieve a pending request.
 
-### 6. Issue Portal TLS Certificate and Configure Nginx (`:80` AIA/CDP + `:443` Portal)
+### 7. Replace the Temporary Frontend Certificate
 
-Per RFC 5280, relying parties fetching AIA (`/issuer.crt` or `/authorities/{id}/issuer.crt`) and CDP (`/ca.crl` or `/authorities/{id}/ca.crl`) must be able to reach those endpoints over plain HTTP (`:80`) without being redirected to HTTPS, while all interactive portal traffic (`/`, `/login`, `/admin`, `/_blazor`) is served over HTTPS (`:443`) with WebSocket upgrade support.
+Once CertRobo has a working issuing CA, use it to issue a TLS certificate for the frontend, or obtain one from another CA trusted by the clients. For an external CA, install the returned leaf/intermediate chain at `/etc/pki/nginx/server.crt` with its matching key at `/etc/pki/nginx/private/server.key`, then validate and reload Nginx as below. Do not replace the application CA signing key or import the temporary frontend certificate as a CA.
 
 Issue the Nginx TLS server certificate and TLS server chain (`--issue-csr <user> <csrPath> <outCertPath> [<outTlsServerChainPath>]` writes the leaf plus intermediate CA(s) without the self-signed Root CA to `<outTlsServerChainPath>`; pass `--root-out <path>` or `--fullchain-out <path>` if you also want the Root CA or complete chain written out, or use `--export-issued <serialHex> <outCertPath> [<outTlsServerChainPath>]` to recover outputs for an already-issued certificate):
 
@@ -265,8 +430,7 @@ Issue the Nginx TLS server certificate and TLS server chain (`--issue-csr <user>
 sudo mkdir -p /etc/pki/nginx/private
 sudo chmod 0700 /etc/pki/nginx/private
 
-sudo openssl ecparam -name prime256v1 -genkey -noout -out /etc/pki/nginx/private/server.key
-sudo chmod 0600 /etc/pki/nginx/private/server.key
+# Reuse the frontend key created in step 5; do not overwrite it.
 sudo openssl req -new -key /etc/pki/nginx/private/server.key \
   -subj '/C=US/ST=Washington/L=Redmond/O=Contoso Corporation/OU=IT/CN=pki.contoso.com' \
   -addext 'subjectAltName=DNS:pki.contoso.com' \
@@ -274,8 +438,11 @@ sudo openssl req -new -key /etc/pki/nginx/private/server.key \
 sudo chmod 0644 /tmp/host-tls.csr
 
 sudo -u certrobo sh -c 'set -a && . /etc/certrobo/certrobo.env && set +a && cd /opt/certrobo && ./CertRobo --issue-csr admin /tmp/host-tls.csr /tmp/host-leaf.crt /tmp/host-tlschain.crt --root-out /tmp/host-rootca.crt'
-sudo cp /tmp/host-tlschain.crt /etc/pki/nginx/server.crt
-sudo chmod 0644 /etc/pki/nginx/server.crt
+sudo install -o root -g root -m 0644 /tmp/host-tlschain.crt /etc/pki/nginx/server.crt.new
+sudo mv /etc/pki/nginx/server.crt.new /etc/pki/nginx/server.crt
+# Rocky Linux / RHEL only:
+# sudo restorecon -Rv /etc/pki/nginx
+sudo nginx -t && sudo systemctl reload nginx.service
 sudo rm -f /tmp/host-tls.csr /tmp/host-leaf.crt /tmp/host-tlschain.crt
 ```
 
@@ -293,82 +460,8 @@ sudo update-ca-certificates
 sudo rm -f /tmp/host-rootca.crt
 ```
 
-#### Resolve Default Port 80 `default_server` Conflicts Before Adding `certrobo.conf`
 
-Nginx allows only one `default_server` listener per IP/port pair:
-* **On Rocky Linux 10 / RHEL 10:** `/etc/nginx/nginx.conf` ships with a built-in `server { listen 80; listen [::]:80; ... }` block inside `http {}`. On a dedicated CertRobo host, comment out or remove that built-in `server { ... }` block (`sudo sed -i '/^    server {/,/^    }/s/^/#/' /etc/nginx/nginx.conf`) so `/etc/nginx/conf.d/certrobo.conf` can bind `listen 80 default_server;`.
-* **On Ubuntu 26.04 LTS:** `/etc/nginx/nginx.conf` includes both `/etc/nginx/conf.d/*.conf` and `/etc/nginx/sites-enabled/*`. On a dedicated CertRobo host, remove the stock `/etc/nginx/sites-enabled/default` symlink (`sudo rm -f /etc/nginx/sites-enabled/default`)—or, if the host serves other virtual hosts, remove `default_server` from the competing site configuration—before testing Nginx.
-
-Create `/etc/nginx/conf.d/certrobo.conf` (compatible with both Rocky Linux 10 and Ubuntu 26.04 LTS OpenSSL builds):
-
-```nginx
-map $http_upgrade $connection_upgrade {
-    default upgrade;
-    ''      close;
-}
-
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
-
-    # Serve public CA chain and CRL endpoints over plain HTTP (RFC 5280)
-    location ~ ^/(ca\.crt|ca\.p7b|issuer\.crt|rootca\.crt|ca\.crl|ca\.crl\.pem|authorities/[0-9]+/(ca\.(crt|p7b|crl|crl\.pem)|issuer\.crt))$ {
-        proxy_pass http://127.0.0.1:5000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-    }
-
-    # Redirect interactive portal traffic to HTTPS
-    location / {
-        return 301 https://$host$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl default_server;
-    listen [::]:443 ssl default_server;
-    http2 on;
-    server_name _;
-
-    ssl_certificate     /etc/pki/nginx/server.crt;
-    ssl_certificate_key /etc/pki/nginx/private/server.key;
-    ssl_session_cache   shared:SSL:10m;
-    ssl_session_timeout 10m;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
-    ssl_prefer_server_ciphers off;
-
-    location / {
-        proxy_pass http://127.0.0.1:5000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        proxy_buffering off;
-    }
-}
-```
-
-Test and start/reload Nginx:
-
-```bash
-# Rocky Linux 10 / RHEL 10 only (relabel TLS certificate files for SELinux):
-sudo restorecon -Rv /etc/pki/nginx /etc/nginx
-
-# Both Rocky Linux 10 and Ubuntu 26.04 LTS:
-sudo nginx -t
-sudo systemctl enable --now nginx.service
-sudo systemctl reload nginx.service
-```
+Installing a root on the server does not distribute trust to browsers or other clients. Distribute the CA trust anchor through your normal client-management process, remove any temporary trust installed for bootstrap, and arrange renewal before the frontend certificate expires. Replacing or renewing this Nginx certificate requires a validated Nginx reload, not a CertRobo service restart.
 
 ---
 
