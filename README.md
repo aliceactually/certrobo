@@ -187,7 +187,7 @@ Interactive HTTP requests redirect to HTTPS. Keep the public certificate and CRL
 
 This certificate protects the **web frontend**, and is separate from CertRobo's CA signing identity. It lets the browser-based setup work before the CA exists. If you already have a suitable server certificate, install its leaf/intermediate chain and matching private key at the paths below instead and skip generation.
 
-On a fresh installation, generate a 30-day certificate with a DNS Subject Alternative Name:
+On a fresh installation, generate a 30-day certificate with a DNS Subject Alternative Name. Use RSA 4096 so the key can later be reused for a CSR accepted by CertRobo's issuance profiles (RSA 2048 or 4096):
 
 ```bash
 sudo install -d -o root -g root -m 0755 /etc/pki/nginx
@@ -197,7 +197,7 @@ sudo sh -c '
   test ! -e /etc/pki/nginx/private/server.key
   test ! -e /etc/pki/nginx/server.crt
   umask 077
-  openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 30 \
+  openssl req -x509 -newkey rsa:4096 -sha256 -nodes -days 30 \
     -keyout /etc/pki/nginx/private/server.key \
     -out /etc/pki/nginx/server.crt \
     -subj "/CN=pki.contoso.com" \
