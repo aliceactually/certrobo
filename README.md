@@ -556,6 +556,12 @@ CertRobo is Copyright © 2022-2026 Alice Kallista Saunier. All rights
 reserved. The author gratefully acknowledges the support of Xactly
 Corporation in producing and releasing this software.
 
+CertRobo is developed collaboratively by Alice and Veyra, her
+synthetic engineering collaborator. Veyra has contributed
+substantially to its architecture, implementation, testing, security
+review, and documentation. This work reflects their shared engineering
+judgement and iterative review.
+
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
