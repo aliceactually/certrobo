@@ -366,6 +366,25 @@ public sealed class IssuancePolicyService(
                                         return (false, "CSR requests CA BasicConstraints, which is forbidden for leaf issuance", null);
                                     }
                                 }
+                                else if (X509Extensions.SubjectKeyIdentifier.Equals(extOid))
+                                {
+                                    X509Extension skiExt = extensions.GetExtension(extOid);
+                                    // RFC 5280 section 4.2.1.2 defines SKI as a non-critical
+                                    // OCTET STRING. Devices may include it in their CSRs;
+                                    // the issuer still derives the certificate's SKI from
+                                    // the public key rather than copying this requested value.
+                                    if (skiExt.IsCritical)
+                                    {
+                                        return (false, "CSR Subject Key Identifier must be non-critical", null);
+                                    }
+
+                                    byte[] skiOctets = Asn1OctetString.GetInstance(skiExt.Value).GetOctets();
+                                    if (skiOctets.Length == 0 || skiOctets.Length > MaxCsrDerBytes
+                                        || Asn1OctetString.GetInstance(Asn1Object.FromByteArray(skiOctets)).GetOctets().Length == 0)
+                                    {
+                                        return (false, "CSR contains an invalid Subject Key Identifier", null);
+                                    }
+                                }
                                 else if (X509Extensions.KeyUsage.Equals(extOid) || X509Extensions.ExtendedKeyUsage.Equals(extOid))
                                 {
                                     X509Extension kuOrEkuExt = extensions.GetExtension(extOid);

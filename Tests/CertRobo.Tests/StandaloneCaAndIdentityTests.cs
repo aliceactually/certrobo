@@ -239,6 +239,40 @@ public class StandaloneCaAndIdentityTests : IDisposable
     }
 
     [Fact]
+    public async Task SubjectKeyIdentifierRequest_IsRecomputedDuringIssuance()
+    {
+        using IServiceScope scope = _serviceProvider.CreateScope();
+        AccountManagementService accounts = scope.ServiceProvider.GetRequiredService<AccountManagementService>();
+        CertificateAuthorityService ca = scope.ServiceProvider.GetRequiredService<CertificateAuthorityService>();
+        var (created, error, admin) = await accounts.BootstrapFirstAdminAsync(
+            "admin", "AdminSecret1234", "admin@example.com", "*.example.com");
+        Assert.True(created, error);
+        Assert.NotNull(admin);
+        await ca.CreateSelfSignedOrIntermediateCaAsync(
+            "Example Root", "root.example.com", "US", "Washington", "Redmond",
+            "Example", "PKI", CertificateKeyFamily.Ecdsa, 384, 3650, "CaPassphrase!1234");
+
+        IssuanceOutcome outcome = await ca.IssueCertificateFromCsrAsync(
+            admin.Id, CsrSubjectKeyIdentifierTests.CreateDeviceCsr());
+
+        Assert.True(outcome.Succeeded, outcome.ErrorMessage);
+        using X509Certificate2 cert = X509Certificate2.CreateFromPem(outcome.CertificatePem!);
+        X509SubjectKeyIdentifierExtension ski = cert.Extensions.OfType<X509SubjectKeyIdentifierExtension>().Single();
+        Assert.False(ski.Critical);
+        Assert.Equal(new X509SubjectKeyIdentifierExtension(cert.PublicKey, false).SubjectKeyIdentifier,
+            ski.SubjectKeyIdentifier);
+        Assert.NotEqual(CsrSubjectKeyIdentifierTests.RequestedIdentifier, ski.SubjectKeyIdentifier);
+        Assert.False(cert.Extensions.OfType<X509BasicConstraintsExtension>().Single().CertificateAuthority);
+        Assert.Equal(X509KeyUsageFlags.DigitalSignature,
+            cert.Extensions.OfType<X509KeyUsageExtension>().Single().KeyUsages);
+        Assert.Equal(new[] { CertificateProfiles.ServerAuthOid, CertificateProfiles.ClientAuthOid },
+            cert.Extensions.OfType<X509EnhancedKeyUsageExtension>().Single().EnhancedKeyUsages
+                .Cast<Oid>().Select(oid => oid.Value));
+        Assert.Equal(new[] { "storage.example.com", "node0.example.com", "node1.example.com" },
+            cert.Extensions.OfType<X509SubjectAlternativeNameExtension>().Single().EnumerateDnsNames());
+    }
+
+    [Fact]
     public async Task IntermediateChain_CrossAlgorithmIssuance_Export_ConcurrentSerials_Revocation_And_Restore()
     {
         using IServiceScope scope = _serviceProvider.CreateScope();
